@@ -4,9 +4,10 @@ import type { IncomingMessage } from "http";
 
 import { createLogger } from "../infra/logger";
 import { startDecayTimer, stopDecayTimer } from "../memory/memory_decay";
-import { getMemoryRepository } from "../memory/memory_store";
+import { getMemoryRepository, setMemoryRepository } from "../memory/memory_store";
 import { initDatabase, closeDatabase } from "../storage/database";
 import { initRedis, closeRedis } from "../storage/redis";
+import { getPgMemoryRepository } from "../storage/repositories/pg_memory_repository";
 import { createGateway, startServer, PORT } from "./gateway";
 import { createSession, setDbReady as setSessionDbReady } from "./session";
 import { setDbReady as setPipelineDbReady } from "./pipeline";
@@ -18,9 +19,7 @@ let dbReady = false;
 let redisReady = false;
 
 async function bootstrap() {
-  // Start memory decay timer
-  const decayTimer = startDecayTimer(getMemoryRepository());
-  logger.info("[Memory] Decay timer started");
+  let memoryRepo = getMemoryRepository();
 
   // Optional storage initialization
   if (process.env.DATABASE_URL) {
@@ -29,7 +28,11 @@ async function bootstrap() {
       dbReady = true;
       setSessionDbReady(true);
       setPipelineDbReady(true);
-      logger.info("[Storage] PostgreSQL initialized");
+      // Switch to PostgreSQL-backed memory repository
+      const pgRepo = getPgMemoryRepository("dev");
+      setMemoryRepository(pgRepo);
+      memoryRepo = pgRepo;
+      logger.info("[Storage] PostgreSQL initialized, using PG memory repo");
     } catch (err) {
       logger.warn("[Storage] PostgreSQL init failed (continuing without)", { error: err });
       dbReady = false;
@@ -37,6 +40,10 @@ async function bootstrap() {
   } else {
     logger.info("[Storage] DATABASE_URL not set, using in-memory only");
   }
+
+  // Start memory decay timer (with the selected repository)
+  const decayTimer = startDecayTimer(memoryRepo);
+  logger.info("[Memory] Decay timer started");
 
   if (process.env.REDIS_URL) {
     try {

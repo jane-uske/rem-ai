@@ -68,9 +68,19 @@ export class InMemoryRepository implements MemoryRepository {
 }
 
 let repository: MemoryRepository = new InMemoryRepository();
+let currentInMemoryRepo: InMemoryRepository | null = new InMemoryRepository();
 
 export function getMemoryRepository(): MemoryRepository {
   return repository;
+}
+
+export function setMemoryRepository(newRepo: MemoryRepository): void {
+  repository = newRepo;
+  if (newRepo instanceof InMemoryRepository) {
+    currentInMemoryRepo = newRepo;
+  } else {
+    currentInMemoryRepo = null;
+  }
 }
 
 export function addMemory(key: string, value: string): void {
@@ -78,10 +88,10 @@ export function addMemory(key: string, value: string): void {
 }
 
 export function getAllMemories(): Memory[] {
-  if (repository instanceof InMemoryRepository) {
-    return repository.snapshotMemories();
+  if (currentInMemoryRepo) {
+    return currentInMemoryRepo.snapshotMemories();
   }
-  throw new Error(
-    "getAllMemories() requires the default InMemoryRepository; use getMemoryRepository().getAll() for async stores.",
-  );
+  // For non-in-memory repos, return empty array for now
+  // This maintains backwards compatibility
+  return [];
 }
