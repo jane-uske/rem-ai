@@ -1,0 +1,62 @@
+import { query } from '../database';
+import type { DbMessage } from '../types';
+
+function mapRow(row: Record<string, unknown>): DbMessage {
+  const role = row.role as string;
+  if (role !== 'user' && role !== 'assistant') {
+    throw new Error(`Invalid message role: ${role}`);
+  }
+  return {
+    id: row.id as string,
+    session_id: row.session_id as string,
+    role,
+    content: row.content as string,
+    created_at: row.created_at as Date,
+  };
+}
+
+export async function saveMessage(
+  sessionId: string,
+  role: string,
+  content: string
+): Promise<DbMessage> {
+  try {
+    const res = await query(
+      `INSERT INTO messages (session_id, role, content)
+       VALUES ($1, $2, $3)
+       RETURNING id, session_id, role, content, created_at`,
+      [sessionId, role, content]
+    );
+    const row = res.rows[0] as Record<string, unknown>;
+    return mapRow(row);
+  } catch (e) {
+    console.log('[Storage] saveMessage failed:', e);
+    throw e;
+  }
+}
+
+export async function getSessionMessages(
+  sessionId: string,
+  limit?: number
+): Promise<DbMessage[]> {
+  try {
+    const hasLimit = limit !== undefined && limit > 0;
+    const sql = hasLimit
+      ? `SELECT id, session_id, role, content, created_at
+         FROM messages
+         WHERE session_id = $1
+         ORDER BY created_at ASC
+         LIMIT $2`
+      : `SELECT id, session_id, role, content, created_at
+         FROM messages
+         WHERE session_id = $1
+         ORDER BY created_at ASC`;
+    const res = hasLimit
+      ? await query(sql, [sessionId, limit])
+      : await query(sql, [sessionId]);
+    return res.rows.map((r) => mapRow(r as Record<string, unknown>));
+  } catch (e) {
+    console.log('[Storage] getSessionMessages failed:', e);
+    throw e;
+  }
+}

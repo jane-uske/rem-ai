@@ -1,0 +1,429 @@
+# Rem AI — 系统架构
+
+## 架构总览
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Client Layer                            │
+│         Next.js (web/)  ·  Legacy (public/)                 │
+│  ┌──────────┐ ┌──────────┐ ┌────────┐ ┌────────────────┐   │
+│  │ ChatWindow│ │ InputBar │ │ Avatar │ │VoiceIndicator  │   │
+│  └──────────┘ └──────────┘ └────────┘ └────────────────┘   │
+│       useRemChat (WebSocket)  ·  useAudioBase64Queue        │
+│       pcmCapture (16kHz mono Int16)                         │
+└────────────────────┬────────────────────────────────────────┘
+                     │ WebSocket (ws)
+                     │ text / audio_stream / duplex_start|stop
+                     ▼
+┌────────────────────────────────────────────────────────────────┐
+│                    server/server.ts                             │
+│              Express + WebSocket Gateway                        │
+│  ┌───────────────┐  ┌──────────────┐  ┌─────────────────────┐ │
+│  │ 消息路由       │  │ 会话管理      │  │ InterruptController │ │
+│  │ (type-based)  │  │ (per-conn)   │  │ (abort pipeline)    │ │
+│  └───────┬───────┘  └──────────────┘  └─────────────────────┘ │
+└──────────┼─────────────────────────────────────────────────────┘
+           │
+     ┌─────┼─────────────────────────────────┐
+     │     │                                 │
+     ▼     ▼                                 ▼
+┌─────────────┐                      ┌──────────────┐
+│ Voice Input │                      │ Text Input   │
+│             │                      │              │
+│ VadDetector │──speech_end──►       │              │
+│ SttStream   │──(transcription)─┐   │              │
+└─────────────┘                  │   └──────┬───────┘
+                                 │          │
+                                 ▼          ▼
+                        ┌──────────────────────────┐
+                        │      runPipeline          │
+                        └────────────┬─────────────┘
+                                     │
+              ┌──────────────────────┼──────────────────────┐
+              ▼                      ▼                      ▼
+    ┌──────────────┐      ┌──────────────┐      ┌────────────────┐
+    │ Emotion      │      │ Memory       │      │ Brain Router   │
+    │ Engine       │      │ Agent        │      │                │
+    │              │      │              │      │ ┌────────────┐ │
+    │ updateEmotion│      │ extractMemory│      │ │ Fast Brain │ │
+    │ decayEmotion │      │ retrieveMemory      │ │ (streaming)│ │
+    │              │      │              │      │ └────────────┘ │
+    │ ┌──────────┐ │      │ ┌──────────┐ │      │ ┌────────────┐ │
+    │ │ Emotion  │ │      │ │ Memory   │ │      │ │ Slow Brain │ │
+    │ │ State    │ │      │ │ Store    │ │      │ │(background)│ │
+    │ └──────────┘ │      │ └──────────┘ │      │ └────────────┘ │
+    └──────┬───────┘      └──────┬───────┘      └───────┬────────┘
+           │                     │                      │
+           │              ┌──────┘                      │
+           ▼              ▼                             ▼
+    ┌─────────────────────────────┐        ┌─────────────────────┐
+    │    Prompt Builder           │        │   LLM Client        │
+    │ personality + rules +       │───────►│   (OpenAI compat)   │
+    │ emotion + memory + history  │        │   streamTokens()    │
+    └─────────────────────────────┘        └──────────┬──────────┘
+                                                      │
+                                            streaming tokens
+                                                      │
+                                                      ▼
+                                           ┌─────────────────────┐
+                                           │ SentenceChunker     │
+                                           │ (逐句切分)           │
+                                           └──────────┬──────────┘
+                                                      │
+                                                      ▼
+                                           ┌─────────────────────┐
+                                           │ TTS Service         │
+                                           │ Edge/Piper/OpenAI   │
+                                           └──────────┬──────────┘
+                                                      │
+                                            base64 audio chunks
+                                                      │
+                                                      ▼
+                                                   Client
+                                           (text + audio + emotion)
+```
+
+## 模块详解
+
+### 1. Gateway — `server/server.ts`
+
+系统唯一入口，管理所有 WebSocket 连接并编排完整管线。
+
+| 职责 | 实现 |
+|------|------|
+| HTTP 服务 | Express，静态文件托管 `public/` 和 `avatar/assets/` |
+| WebSocket | ws 库，每连接独立会话（SttStream / VadDetector / InterruptController） |
+| 消息路由 | 按 `type` 字段分发：`chat` / `audio_stream` / `duplex_start` / `duplex_stop` / `audio_chunk` / `audio_end` |
+| 管线编排 | `runPipeline`：情绪更新 → 流式对话 → 逐句 TTS → 推送客户端 |
+| 打断控制 | InterruptController 管理 AbortSignal，支持用户语音/文本打断当前回复 |
+| 管线串行化 | `pipelineChain` Promise 链确保同一连接内管线顺序执行 |
+
+**WebSocket 消息协议：**
+
+```
+// 客户端 → 服务端
+{ type: "chat", content: string }          // 文本消息
+{ type: "duplex_start" }                   // 开始实时语音
+{ type: "audio_stream", data: base64 }     // PCM 音频流
+{ type: "duplex_stop" }                    // 结束实时语音
+{ type: "audio_chunk", data: base64 }      // 旧版 WebM 音频块
+{ type: "audio_end" }                      // 旧版录音结束
+
+// 服务端 → 客户端
+{ type: "emotion", emotion: string }       // 情绪状态更新
+{ type: "chat_chunk", text: string }       // 流式回复 token
+{ type: "chat_end" }                       // 回复完成
+{ type: "voice", data: base64 }            // TTS 音频
+{ type: "interrupt" }                      // 管线被打断
+{ type: "stt_partial", text: string }      // STT 部分识别
+{ type: "stt_final", text: string }        // STT 最终识别
+{ type: "vad_start" }                      // 检测到语音开始
+{ type: "vad_end" }                        // 检测到语音结束
+{ type: "error", message: string }         // 错误
+```
+
+### 2. 双脑系统 — `brains/`
+
+核心对话架构，分为快脑和慢脑协同工作。
+
+**Brain Router (`brain_router.ts`)**
+
+中央调度器，每次用户消息触发：
+1. 更新情绪状态
+2. 提取 + 检索记忆
+3. 获取慢脑上下文（上一轮分析结果）
+4. 调用快脑流式生成回复
+5. 维护对话历史（滑动窗口，最近 10 轮）
+6. 异步触发慢脑后台分析
+
+**Fast Brain (`fast_brain.ts`)**
+
+低延迟路径，直接面向用户：
+- 通过 Prompt Builder 组装完整 prompt
+- 注入慢脑上下文作为"长期观察"
+- 调用 LLM 流式生成
+- 支持 AbortSignal 中断
+
+**Slow Brain (`slow_brain.ts`)**
+
+后台异步分析，不阻塞回复：
+- 维护 `longTermContext` 缓冲区（最多 10 条，去重）
+- 二次记忆提取
+- 对话分析：话题识别、里程碑检测（每 5 轮）、情绪倾向判断
+- 结果在下一轮对话中被快脑消费
+
+### 3. Prompt 构建 — `brain/`
+
+**Personality (`personality.ts`)** — Rem 的核心人设定义
+
+**Character Rules (`character_rules.ts`)** — 说话风格规则（简短、自然、会提问）
+
+**Prompt Builder (`prompt_builder.ts`)** — 组装完整 prompt：
+
+```
+System Prompt:
+├── 人设（personality）
+├── 说话规则（character rules）
+├── 情绪风格（EMOTION_STYLE map）
+├── "用中文回复"
+└── 用户记忆（key-value 列表）
+
+Messages:
+├── [system prompt]
+├── [对话历史 ...]
+└── [用户最新消息]
+```
+
+情绪风格映射（`EMOTION_STYLE`）让 AI 根据当前情绪调整回复语气。
+
+### 4. LLM 客户端 — `llm/qwen_client.ts`
+
+OpenAI 兼容的流式聊天客户端。
+
+| 特性 | 说明 |
+|------|------|
+| 接口 | OpenAI SDK，兼容 LM Studio / Qwen / 任意 OpenAI 兼容 API |
+| 流式输出 | `streamTokens()` 异步生成器，逐 token yield |
+| `<think>` 过滤 | 自动剥离模型的 `<think>...</think>` 推理标签 |
+| 中断支持 | 接受 AbortSignal |
+| 参数 | temperature 0.7, max_tokens 1024 |
+
+### 5. 记忆系统 — `memory/`
+
+**Memory Agent (`memory_agent.ts`)**
+
+从用户消息中通过正则匹配提取结构化信息：
+- 姓名、城市、年龄、职业
+- 偏好（喜欢/不喜欢）
+- 其他模式匹配
+- 慢脑二次提取补充
+
+**Memory Repository (`memory_repository.ts`)**
+
+统一记忆存储接口：
+- `upsert(key, value)` / `getAll()` / `getByKey()` / `delete()` / `touch()` / `getStale()`
+- `InMemoryRepository`（`memory_store.ts`）：进程内默认实现
+- `PostgreSQL 实现`（`storage/repositories/memory_repository.ts`）：持久化 + pgvector 向量语义检索
+
+**Memory Decay (`memory_decay.ts`)**
+
+记忆衰减与遗忘：
+- `decayScore`：重要性 × 访问频率 × 时间衰减
+- `runDecay`：超出上限淘汰低分条目 + 清理极低分条目
+- `startDecayTimer` / `stopDecayTimer`：定时任务
+
+### 6. 情绪系统 — `emotion/`
+
+**Emotion Engine (`emotion_engine.ts`)**
+
+| 功能 | 实现 |
+|------|------|
+| 情绪识别 | 关键词规则：开心词 → happy，疑问词 → curious，难过词 → sad，害羞词 → shy |
+| 标点辅助 | `?` → curious, `!` → happy, 默认 → neutral |
+| 情绪衰减 | `decayEmotion()`：happy→neutral, curious→neutral, shy→neutral, sad→neutral |
+
+**Emotion State (`emotion_state.ts`)**
+
+模块级状态管理：
+- 5 种情绪：`neutral` / `happy` / `curious` / `shy` / `sad`
+- `getEmotion()` / `setEmotion()` + 状态转换日志
+
+```
+              ┌───────────┐
+       ┌─────►│  happy    ├──decay──┐
+       │      └───────────┘         │
+       │                            ▼
+  ┌────┴─────┐              ┌───────────┐
+  │ neutral  │◄──decay──────│   sad     │
+  └────┬─────┘              └───────────┘
+       │                            ▲
+       │      ┌───────────┐         │
+       ├─────►│ curious   ├──decay──┘
+       │      └───────────┘
+       │      ┌───────────┐
+       └─────►│   shy     ├──decay──┘
+              └───────────┘
+```
+
+### 7. 语音输入 — `voice/stt_stream.ts` + `voice/vad_detector.ts`
+
+**SttStream**
+
+| 模式 | 说明 |
+|------|------|
+| 旧版 WebM | `feed(chunk)` + `end()` — 收集 WebM 块后一次性识别 |
+| 双工 PCM | `feedPcm(base64)` + `endPcm()` — 实时 PCM 流，VAD 触发后识别 |
+
+| 后端 | 说明 |
+|------|------|
+| `openai` | Whisper API，临时文件上传 |
+| `whisper-cpp` | 本地 whisper-cli，支持 ffmpeg 重采样 |
+
+**VadDetector**
+
+能量阈值 VAD：
+- 计算 16-bit PCM 帧的 RMS 能量
+- 超过阈值连续 N 帧 → `speech_start` 事件
+- 低于阈值连续 M 帧 → `speech_end` 事件
+- 语音开始时可触发管线打断
+
+### 8. 语音输出 — `voice/tts.ts` + `voice/tts_stream.ts` + `voice/tts_emotion.ts`
+
+**TTS 多后端支持：**
+
+| 后端 | 说明 |
+|------|------|
+| `edge` (默认) | node-edge-tts，微软 Edge 免费语音 |
+| `piper` | 本地 Piper TTS，spawn 子进程生成 WAV |
+| `openai` | OpenAI TTS API |
+
+**流式处理链：**
+
+```
+LLM tokens → SentenceChunker（按 。！？.!? 断句）→ 逐句 TTS → base64 音频 → 客户端
+```
+
+**文本预处理** (`normalizeTtsText`)：剥离 emoji，限制最大字符数，智能在标点处截断。
+
+**情绪语音适配** (`tts_emotion.ts`)：
+- Emotion → EmotionVoiceParams 映射（rate / pitch / lengthScale / speed）
+- Edge TTS：情绪状态 → rate + pitch 参数
+- Piper：情绪状态 → length_scale + noise_scale
+- OpenAI：情绪状态 → speed
+- `synthesize` 支持 emotion 参数透传
+
+### 9. 打断控制 — `voice/interrupt_controller.ts`
+
+管线状态机：`idle` → `generating` → `speaking` → `idle`
+
+| 方法 | 说明 |
+|------|------|
+| `begin()` | 创建新 AbortController，进入 generating |
+| `markSpeaking()` | 转为 speaking 状态 |
+| `finish()` | 回到 idle |
+| `interrupt()` | 调用 abort()，立即回到 idle，发出 interrupted 事件 |
+
+用户在 AI 回复过程中发送新消息或开始说话时，触发 `interrupt()` 终止当前管线。
+
+### 10. 前端 — `web/` (Next.js)
+
+**组件：**
+
+| 组件 | 职责 |
+|------|------|
+| `RemChatApp` | 主布局：头部（连接状态 + 头像 + 语音指示器）+ 聊天窗 + 输入栏 |
+| `ChatWindow` | 消息列表 + 流式回复气泡 + 打字指示器，自动滚动 |
+| `MessageBubble` | 气泡样式（rem / user / error / sys 四种角色） |
+| `InputBar` | 文本输入 + 发送 + 麦克风切换（IME 兼容） |
+| `Avatar` | 情绪驱动 SVG 头像，5 种表情映射 |
+| `VoiceIndicator` | TTS 播放动画（4 条跳动的竖条） |
+
+**核心 Hook：**
+
+`useRemChat` — 管理全部实时状态：
+- WebSocket 连接/重连
+- 消息收发与流式渲染
+- 双工语音录制（pcmCapture → 16kHz Int16 → base64）
+- 音频播放队列（useAudioBase64Queue）
+- 情绪状态同步
+
+### 11. 旧版前端 — `public/`
+
+原生 HTML/CSS/JS 实现，功能基本对应 Next.js 版本但不支持双工语音和打断控制。通过 Express 静态文件托管。
+
+## 全局数据流
+
+一次完整交互（语音输入 → 语音输出）：
+
+```
+1. 用户按住麦克风说话
+   Client ──(duplex_start)──► Server
+   Client ──(audio_stream: PCM base64)──► Server
+
+2. VAD 检测语音活动
+   VadDetector ──(speech_start)──► 打断当前管线（如有）
+   VadDetector ──(speech_end)──► 触发 STT
+
+3. STT 语音转文本
+   SttStream ──(final: text)──► runPipeline
+
+4. 管线执行
+   updateEmotion(text)                    → 更新情绪
+   Client ◄──(emotion)──                  → 推送情绪给客户端
+   extractMemory(text)                    → 提取记忆
+   retrieveMemory()                       → 检索已有记忆
+
+5. 快脑流式回复
+   Brain Router → Fast Brain → Prompt Builder → LLM
+   LLM ──(tokens)──► SentenceChunker
+   Client ◄──(chat_chunk)──              → 逐 token 推送
+
+6. 逐句 TTS
+   SentenceChunker ──(完整句子)──► TTS Service
+   TTS ──(base64 audio)──►
+   Client ◄──(voice)──                   → 推送音频
+
+7. 后台慢脑分析
+   Slow Brain ──(异步)──► 分析对话 + 二次记忆提取
+
+8. 管线结束
+   Client ◄──(chat_end)──
+   decayEmotion()                        → 情绪衰减
+```
+
+### 12. 存储层 — `storage/`
+
+| 模块 | 说明 |
+|------|------|
+| `database.ts` | PostgreSQL 连接池（`pg`），健康检查，query 封装 |
+| `redis.ts` | Redis 客户端（`ioredis`），cacheGet / cacheSet / cacheDel |
+| `schema.sql` | 数据表定义：users / sessions / messages / memories，pgvector 扩展 |
+| `types.ts` | 存储层类型：DbUser / DbSession / DbMessage / DbMemory |
+| `repositories/message_repository.ts` | 消息持久化：saveMessage / getSessionMessages |
+| `repositories/session_repository.ts` | 会话管理：createSession / endSession / getSession |
+| `repositories/memory_repository.ts` | 记忆持久化 + pgvector 语义检索：findSimilarMemories |
+
+### 13. 基础设施 — `infra/`
+
+| 模块 | 说明 |
+|------|------|
+| `auth.ts` | JWT 认证中间件 + generateToken / verifyToken / wsAuthenticateOnce |
+| `rate_limiter.ts` | HTTP 限流（100/min per IP）+ WebSocket 限流（30/10s per conn） |
+| `logger.ts` | pino 结构化日志，开发模式 pretty-print，createLogger(module) |
+| `emotion_logger.ts` | 情绪日志环形缓冲区（1000 条），log / getHistory / getStats |
+
+### 14. 部署 — `Dockerfile` + `docker-compose.yml`
+
+| 组件 | 说明 |
+|------|------|
+| Dockerfile | 多阶段构建：backend-build → frontend-build → production |
+| docker-compose.yml | App + pgvector/pgvector:pg16 + Redis 7 |
+| schema.sql | 数据库自动初始化 |
+
+## 模块集成状态
+
+已完成代码但尚未 wiring 到 `server/server.ts` 主管线的模块：
+
+| 模块 | 集成点 | 说明 |
+|------|--------|------|
+| Storage | `server/server.ts` | initDatabase / initRedis 启动时调用，消息持久化 |
+| Memory Decay | `server/server.ts` | startDecayTimer 启动时调用 |
+| Emotion Logger | `emotion/emotion_engine.ts` | EmotionLogger.log 在状态变化时调用 |
+| Auth | `server/server.ts` | authMiddleware + wsAuthenticateOnce |
+| Rate Limiter | `server/server.ts` | createRateLimiter + createWsRateLimiter |
+| Logger | 全局 | 替换 console.log 为结构化日志 |
+| TTS Emotion | `server/server.ts` | synthesize 调用时传入 emotion 参数 |
+| Avatar Controller | `server/server.ts` | 管线中生成 AvatarFrame 并推送 |
+
+## 当前局限与后续演进
+
+| 领域 | 当前状态 | 演进方向 |
+|------|---------|---------|
+| 记忆存储 | PostgreSQL + pgvector 实现已完成，待 wiring | 集成到主管线，替换内存存储 |
+| 记忆检索 | pgvector 向量语义检索已实现，待 wiring | 集成 findSimilarMemories 到检索流程 |
+| 情绪识别 | 关键词规则 | LLM 辅助识别 + 多维情绪 |
+| 虚拟形象 | Avatar 协议 + 控制器已完成，SVG 表情切换 | Live2D / Three.js + VRM，口型同步（T-032） |
+| TTS 情绪 | 情绪参数映射已实现，待 wiring | 集成到主管线 synthesize 调用 |
+| 语音打断 | 全双工 VAD + 打断控制已实现 | 优化回声消除、VAD 阈值、TTS 分段 |
+| 认证 | JWT 中间件 + 限流已实现，待 wiring | 集成到 server.ts |
+| 部署 | Dockerfile + Docker Compose 已完成 | 生产环境验证 + CI/CD |

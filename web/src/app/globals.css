@@ -1,0 +1,134 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f5f0fa;
+  --foreground: #2c2c3a;
+  --rem-surface: #ffffff;
+  --rem-accent: #9b7ec8;
+  --rem-border: #e8e0f0;
+  --rem-input: #ffffff;
+  --rem-dim: #8888a0;
+  --rem-user-bg: #dce8f8;
+  --rem-user-fg: #2a4060;
+  --rem-error-bg: #fde8eb;
+  --rem-danger: #e06070;
+  --rem-dot-off: #cccccc;
+  --rem-mic-bg: #e8e0f0;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #141018;
+    --foreground: #e8e6f0;
+    --rem-surface: #1e1a26;
+    --rem-accent: #b89fe0;
+    --rem-border: rgba(255, 255, 255, 0.08);
+    --rem-input: #18141c;
+    --rem-dim: #9090a8;
+    --rem-user-bg: #2a3248;
+    --rem-user-fg: #c8d8f0;
+    --rem-error-bg: #3a2028;
+    --rem-danger: #f08090;
+    --rem-dot-off: #555555;
+    --rem-mic-bg: #2a2634;
+  }
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@keyframes remVoice {
+  0%,
+  100% {
+    height: 8px;
+    opacity: 0.45;
+  }
+  50% {
+    height: 28px;
+    opacity: 1;
+  }
+}
+
+@keyframes remPop {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family:
+    var(--font-geist-sans),
+    -apple-system,
+    "Segoe UI",
+    "Noto Sans SC",
+    sans-serif;
+}
+
+.rem-voice-bars[data-active="true"] .rem-voice-bar {
+  background-color: var(--rem-accent);
+}
+
+.rem-voice-bars[data-active="true"] .rem-voice-bar:nth-child(1) {
+  animation: remVoice 0.55s ease-in-out infinite;
+}
+.rem-voice-bars[data-active="true"] .rem-voice-bar:nth-child(2) {
+  animation: remVoice 0.55s ease-in-out 0.1s infinite;
+}
+.rem-voice-bars[data-active="true"] .rem-voice-bar:nth-child(3) {
+  animation: remVoice 0.55s ease-in-out 0.2s infinite;
+}
+.rem-voice-bars[data-active="true"] .rem-voice-bar:nth-child(4) {
+  animation: remVoice 0.55s ease-in-out 0.3s infinite;
+}
+
+.rem-msg-pop {
+  animation: remPop 0.2s ease forwards;
+}
+
+.rem-typing-dot {
+  animation: remTyping 0.6s ease-in-out infinite;
+}
+
+.rem-typing-dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.rem-typing-dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes remTyping {
+  0%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  50% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+}
+
+@keyframes remMicPulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(224, 96, 112, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 0 8px rgba(224, 96, 112, 0);
+  }
+}
+
+.rem-mic-pulse {
+  animation: remMicPulse 1s ease-in-out infinite;
+}
