@@ -7,11 +7,18 @@ import { WebSocketServer, WebSocket } from "ws";
 
 import { chatStream } from "../agents/conversation_agent";
 import { decayEmotion, updateEmotion } from "../emotion/emotion_engine";
+import { getEmotion } from "../emotion/emotion_state";
 import { SttStream } from "../voice/stt_stream";
 import { synthesize, isTtsEnabled } from "../voice/tts_stream";
 import { SentenceChunker } from "../utils/sentence_chunker";
 import { VadDetector } from "../voice/vad_detector";
 import { InterruptController } from "../voice/interrupt_controller";
+import { startDecayTimer, stopDecayTimer } from "../memory/memory_decay";
+import { getMemoryRepository } from "../memory/memory_store";
+
+import { createLogger } from "../infra/logger";
+
+const logger = createLogger("server");
 
 const PORT = 3000;
 
@@ -34,12 +41,28 @@ const handle = nextApp.getRequestHandler();
 async function bootstrap() {
   await nextApp.prepare();
 
+  // Start memory decay timer
+  const decayTimer = startDecayTimer(getMemoryRepository());
+  logger.info("[Memory] Decay timer started");
+
+  // Graceful shutdown
+  process.on("SIGINT", () => {
+    logger.info("[Shutdown] Received SIGINT, cleaning up...");
+    stopDecayTimer(decayTimer);
+    process.exit(0);
+  });
+  process.on("SIGTERM", () => {
+    logger.info("[Shutdown] Received SIGTERM, cleaning up...");
+    stopDecayTimer(decayTimer);
+    process.exit(0);
+  });
+
   const server = http.createServer((req, res) => {
     try {
       const parsedUrl = parse(req.url || "", true);
       void handle(req, res, parsedUrl);
     } catch (err) {
-      console.error("[HTTP]", err);
+      logger.error("[HTTP]", { error: err });
       res.statusCode = 500;
       res.end("Internal Server Error");
     }
@@ -62,7 +85,7 @@ async function bootstrap() {
    * ────────────────────────────────────────────────────── */
 
   wss.on("connection", (ws) => {
-    console.log("[Rem] 新客户端已连接");
+    logger.info("[Rem] 新客户端已连接");
 
     /* ── Shared state ── */
     const stt = new SttStream();
@@ -76,13 +99,13 @@ async function bootstrap() {
     /* ── VAD events ── */
 
     vad.on("speech_start", () => {
-      console.log("[VAD] speech_start");
+      logger.info("[VAD] speech_start");
 
       // If AI is generating / speaking → interrupt
       if (interrupt.active) {
         interrupt.interrupt();
         send(ws, { type: "interrupt" });
-        console.log("[VAD] → interrupted pipeline");
+        logger.info("[VAD] → interrupted pipeline");
       }
 
       // Reset STT buffer and start accumulating
@@ -92,7 +115,7 @@ async function bootstrap() {
     });
 
     vad.on("speech_end", () => {
-      console.log("[VAD] speech_end");
+      logger.info("[VAD] speech_end");
       send(ws, { type: "vad_end" });
 
       // Feed accumulated speech to STT and run pipeline
@@ -107,14 +130,14 @@ async function bootstrap() {
             const text = await stt.endPcm();
             if (!text) return;
             send(ws, { type: "stt_final", content: text });
-            console.log(`[用户·语音] ${text}`);
+            logger.info(`[用户·语音] ${text}`);
             await runPipeline(ws, text, interrupt);
           } catch (err) {
-            console.warn("[STT]", (err as Error).message);
+            logger.warn("[STT]", { error: (err as Error).message });
             send(ws, { type: "error", content: "语音识别失败：" + (err as Error).message });
           }
         })
-        .catch((err) => console.error("[pipeline]", err));
+        .catch((err) => logger.error("[pipeline]", { error: err }));
     });
 
     /* ── Message handler ── */
@@ -137,7 +160,7 @@ async function bootstrap() {
           vad.reset();
           stt.reset();
           speechBuffer = [];
-          console.log(`[Duplex] 已启动 (sampleRate=${rate})`);
+          logger.info(`[Duplex] 已启动 (sampleRate=${rate})`);
           break;
         }
 
@@ -156,16 +179,16 @@ async function bootstrap() {
                   const text = await stt.endPcm();
                   if (!text) return;
                   send(ws, { type: "stt_final", content: text });
-                  console.log(`[用户·语音] ${text}`);
+                  logger.info(`[用户·语音] ${text}`);
                   await runPipeline(ws, text, interrupt);
                 } catch (err) {
-                  console.warn("[STT]", (err as Error).message);
+                  logger.warn("[STT]", { error: (err as Error).message });
                 }
               })
-              .catch((err) => console.error("[pipeline]", err));
+              .catch((err) => logger.error("[pipeline]", { error: err }));
           }
 
-          console.log("[Duplex] 已停止");
+          logger.info("[Duplex] 已停止");
           break;
         }
 
@@ -201,14 +224,14 @@ async function bootstrap() {
                 const text = await stt.end();
                 if (!text) return;
                 send(ws, { type: "stt_final", content: text });
-                console.log(`[用户·语音] ${text}`);
+                logger.info(`[用户·语音] ${text}`);
                 await runPipeline(ws, text, interrupt);
               } catch (err) {
-                console.warn("[STT]", (err as Error).message);
+                logger.warn("[STT]", { error: (err as Error).message });
                 send(ws, { type: "error", content: "语音识别失败：" + (err as Error).message });
               }
             })
-            .catch((err) => console.error("[pipeline]", err));
+            .catch((err) => logger.error("[pipeline]", { error: err }));
           break;
 
         /* ── Text chat ── */
@@ -219,7 +242,7 @@ async function bootstrap() {
             send(ws, { type: "error", content: "消息内容为空" });
             return;
           }
-          console.log(`[用户] ${content}`);
+          logger.info(`[用户] ${content}`);
 
           // Text input also interrupts any running pipeline
           if (interrupt.active) {
@@ -229,7 +252,7 @@ async function bootstrap() {
 
           pipelineChain = pipelineChain
             .then(() => runPipeline(ws, content, interrupt))
-            .catch((err) => console.error("[pipeline]", err));
+            .catch((err) => logger.error("[pipeline]", { error: err }));
           break;
         }
       }
@@ -239,9 +262,9 @@ async function bootstrap() {
       duplexActive = false;
       vad.reset();
       interrupt.interrupt();
-      console.log("[Rem] 客户端已断开");
+      logger.info("[Rem] 客户端已断开");
     });
-    ws.on("error", (err) => console.error("[WebSocket 错误]", err));
+    ws.on("error", (err) => logger.error("[WebSocket 错误]", { error: err }));
   });
 
   /* ──────────────────────────────────────────────────────
@@ -279,7 +302,7 @@ async function bootstrap() {
           ttsChain = ttsChain.then(() => {
             if (signal.aborted) return;
             ic.markSpeaking();
-            return ttsSend(ws, s, signal);
+            return ttsSend(ws, s, signal, replyEmotion);
           });
         }
       }
@@ -289,7 +312,7 @@ async function bootstrap() {
         if (last) {
           ttsChain = ttsChain.then(() => {
             if (signal.aborted) return;
-            return ttsSend(ws, last, signal);
+            return ttsSend(ws, last, signal, replyEmotion);
           });
         }
       } else {
@@ -304,18 +327,18 @@ async function bootstrap() {
       });
 
       if (full) {
-        console.log(`[Rem] ${full}${signal.aborted ? " (interrupted)" : ""} (emotion: ${replyEmotion})`);
+        logger.info(`[Rem] ${full}${signal.aborted ? " (interrupted)" : ""} (emotion: ${replyEmotion})`);
       }
       decayEmotion();
 
       ttsChain.catch((err) => {
         if ((err as Error).name !== "AbortError") {
-          console.warn("[TTS bg]", (err as Error).message);
+          logger.warn("[TTS bg]", { error: (err as Error).message });
         }
       });
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
-        console.error("[错误]", err);
+        logger.error("[错误]", { error: err });
         send(ws, { type: "error", content: "AI 回复生成失败" });
       }
     } finally {
@@ -323,16 +346,16 @@ async function bootstrap() {
     }
   }
 
-  async function ttsSend(ws: WebSocket, sentence: string, signal?: AbortSignal) {
+  async function ttsSend(ws: WebSocket, sentence: string, signal?: AbortSignal, emotion?: string) {
     if (!isTtsEnabled()) return;
     if (signal?.aborted) return;
     try {
-      const audio = await synthesize(sentence, signal);
+      const audio = await synthesize(sentence, signal, emotion as any);
       if (signal?.aborted) return;
       send(ws, { type: "voice", audio: audio.toString("base64") });
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
-        console.warn("[TTS]", (err as Error).message);
+        logger.warn("[TTS]", { error: (err as Error).message });
       }
     }
   }
@@ -344,14 +367,14 @@ async function bootstrap() {
   }
 
   server.listen(PORT, () => {
-    console.log(`[Rem AI] 服务已启动 — http://localhost:${PORT}`);
+    logger.info(`[Rem AI] 服务已启动 — http://localhost:${PORT}`);
     if (dev) {
-      console.log(`[Rem AI] Next.js 开发模式 (目录: ${webDir})`);
+      logger.info(`[Rem AI] Next.js 开发模式 (目录: ${webDir})`);
     }
   });
 }
 
 bootstrap().catch((err) => {
-  console.error("[Rem AI] 启动失败", err);
+  logger.error("[Rem AI] 启动失败", { error: err });
   process.exit(1);
 });

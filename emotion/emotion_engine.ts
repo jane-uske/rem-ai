@@ -1,4 +1,7 @@
 import { Emotion, getEmotion, setEmotion } from "./emotion_state";
+import { EmotionLogger } from "../infra/emotion_logger";
+
+const emotionLogger = new EmotionLogger();
 
 interface EmotionRule {
   emotion: Emotion;
@@ -48,29 +51,42 @@ const RULES: EmotionRule[] = [
 
 export function updateEmotion(userMessage: string): Emotion {
   const msg = userMessage.trim();
-  if (!msg) {
-    setEmotion("neutral");
-    return "neutral";
-  }
+  const fromEmotion = getEmotion();
+  let toEmotion: Emotion = "neutral";
 
-  for (const rule of RULES) {
-    if (rule.keywords.some((kw) => msg.includes(kw))) {
-      setEmotion(rule.emotion);
-      return rule.emotion;
+  if (!msg) {
+    toEmotion = "neutral";
+  } else {
+    let found = false;
+    for (const rule of RULES) {
+      if (rule.keywords.some((kw) => msg.includes(kw))) {
+        toEmotion = rule.emotion;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      if (/[？?]/.test(msg)) {
+        toEmotion = "curious";
+      } else if (/[!！]/.test(msg)) {
+        toEmotion = "happy";
+      } else {
+        toEmotion = "neutral";
+      }
     }
   }
 
-  if (/[？?]/.test(msg)) {
-    setEmotion("curious");
-    return "curious";
-  }
-  if (/[!！]/.test(msg)) {
-    setEmotion("happy");
-    return "happy";
-  }
+  setEmotion(toEmotion);
 
-  setEmotion("neutral");
-  return "neutral";
+  const trigger = userMessage.length > 50 ? userMessage.slice(0, 50) : userMessage;
+  emotionLogger.log({
+    userId: "dev",
+    fromEmotion,
+    toEmotion,
+    trigger,
+  });
+
+  return toEmotion;
 }
 
 const DECAY_MAP: Record<Emotion, Emotion> = {
@@ -90,5 +106,11 @@ export function decayEmotion(): void {
   const next = DECAY_MAP[current];
   if (next !== current) {
     setEmotion(next);
+    emotionLogger.log({
+      userId: "dev",
+      fromEmotion: current,
+      toEmotion: next,
+      trigger: "decay",
+    });
   }
 }
