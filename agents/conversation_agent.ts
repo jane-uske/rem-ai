@@ -1,4 +1,8 @@
-import { routeMessage } from "../brains/brain_router";
+import {
+  routeMessage,
+  type RouteMessageOptions,
+} from "../brains/brain_router";
+import type { RemSessionContext } from "../brains/rem_session_context";
 import type { Emotion } from "../emotion/emotion_state";
 
 export interface Message {
@@ -12,9 +16,11 @@ export interface Message {
  * and Slow Brain (background analysis) in parallel.
  */
 export async function* chatStream(
+  ctx: RemSessionContext,
   message: string,
   emotion: Emotion,
   signal?: AbortSignal,
+  routeOpts?: RouteMessageOptions,
 ): AsyncGenerator<string> {
-  yield* routeMessage(message, emotion, signal);
+  yield* routeMessage(ctx, message, emotion, signal, routeOpts);
 }

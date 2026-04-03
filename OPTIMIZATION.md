@@ -1,6 +1,8 @@
 # Rem AI — 系统架构分析、优化点与提升方案
 
-## 已完成优化 (2026-04-03)
+## 已完成优化
+
+### 简单任务 S1–S10（2026-04-03 ~ 2026-04）
 
 | 任务 | 说明 | Commit |
 |------|------|--------|
@@ -12,6 +14,44 @@
 | S6 | memory_agent.ts 扩展正则规则集 | d44b5e4 |
 | S7 | SentenceChunker 增加字数阈值强制输出 | d44b5e4 |
 | S8 | 丰富 personality.ts 和 character_rules.ts 内容 | d44b5e4 |
+| S9 | 前端「Rem 在想…」等待态（首 token 前） | `web/src/components/ChatWindow.tsx` 等 |
+| S10 | 短句 TTS 内存 LRU 缓存 | `voice/tts.ts` |
+
+### 中等任务 M1–M9（2026-04）
+
+| 任务 | 说明 | 主要文件 |
+|------|------|----------|
+| M1 | 情绪强度 + 惯性：同情绪叠加强度，回复后 `weakenEmotionAfterReply` 再回落 | `emotion/emotion_state.ts`, `emotion/emotion_engine.ts`, `emotion/decay_emotion.ts` |
+| M2 | Slow Brain LLM 提取的 `user_facts` 同步写入 `MemoryRepository` | `brains/slow_brain.ts` |
+| M3 | 对话历史按估算 token 裁剪（`MAX_HISTORY_TOKENS`，默认 2600） | `brains/history_budget.ts`, `brains/brain_router.ts` |
+| M4 | 轻量对话策略提示（关系阶段、情绪轨迹、短句、冷场话题）注入 system 最前段 | `brains/slow_brain_store.ts`（`buildConversationStrategyHints`） |
+| M5 | LLM `complete`/`stream`、TTS `textToSpeech`、STT OpenAI 转写 `withRetry`；whisper-cpp 转写失败时 **一次** 延迟重试 | `utils/retry.ts`, `llm/qwen_client.ts`, `voice/tts.ts`, `voice/stt_stream.ts` |
+| M6 | 慢脑画像 + 策略合并为 `priorityContext`，置于 system 最前 | `brain/prompt_builder.ts`, `brains/fast_brain.ts` |
+| M7 | Edge TTS **连接池**：同 voice/lang/rate/pitch/fmt 复用 WebSocket，仅 SSML 多轮；`edge_tts_pool=0` 关闭 | `voice/tts.ts` |
+| M8 | 可选服务端短填充音：环境变量 `rem_thinking_filler=1` 时与 LLM 并行异步播「嗯」 | `server/pipeline/runner.ts` |
+| M9 | 前端 user/rem 消息 localStorage 持久化（最近 50 条） | `web/src/hooks/useRemChat.ts` |
+
+---
+
+## 体验与 DX（vibe 向）
+
+| 项 | 说明 |
+|----|------|
+| 前端 | `prefers-reduced-motion` 下关闭气泡/打字点/语音条/麦克波动效；「Rem 在想…」条带 `rem-thinking-bubble` 轻呼吸动画 |
+| Hook | 移除未使用的 Legacy `MediaRecorder` 路径，麦克风仅全双工 PCM；导出 `stopVoice` 供需要时显式结束会话 |
+| 脚本 | 根目录 `npm run typecheck` → `tsc --noEmit` |
+| **陪伴** | **沉默搭话**：`REM_SILENCE_NUDGE_MS`（如 45000）开启后，用户久未发消息则串行触发 `runPipeline(..., { silenceNudge: true })`，文案由 `buildSilenceNudgeUserMessage()` 生成；不写 DB user 条、不跑慢脑；历史里 user 占位为「［你主动开口陪对方聊天］」 |
+| **关系感** | `synthesizeContext` 中 **【陪伴阶段提示】**：按熟悉度分三档（初识 / 加深 / 很熟）写说话方式 |
+
+---
+
+## 尚未完成 / 待办（摘录）
+
+| 类别 | 内容 |
+|------|------|
+| **§3 其他** | 全局 per-session 状态（C1）、流式 STT（C3）、**HTTP 限流**：网关 `createServer` 已对非 WebSocket 请求做 IP 桶（100/min），与 `infra/rate_limiter` 中 Express 中间件互补；生产可再调 `JWT` + 反向代理；ServerMessage 更细字段约束等，见下文与 **🔴 复杂任务** |
+| **产品** | 口型同步（TASKS **T-032**）、向量记忆检索与对话历史的深度整合 |
+| **3.15 体验** | 语音结束淡入淡出、断线后 **服务端上下文恢复**（仅本地消息已持久化） |
 
 ---
 
@@ -108,42 +148,13 @@
 
 ### 3.1 全局单例状态 — 无多用户隔离 🔴C
 
-**现状问题：**
+**原问题（已解决）：** 情绪、对话历史、慢脑、正则记忆曾放在进程级单例，多连接会互相污染。
 
-```
-// emotion/emotion_state.ts — 全局变量
-let currentEmotion: Emotion = "neutral";
+**实现（C1 ✅）：** `ConnectionSession` 持有 `RemSessionContext`（`brains/rem_session_context.ts`）：每连接一份 `EmotionRuntime`（`emotion/emotion_runtime.ts`）、`SlowBrainStore` 实例、`PromptMessage[]` 历史、`InMemoryRepository` 会话记忆。`runPipeline` / `routeMessage` / `chatStream` 均传入该上下文。`emotion_state.ts` 仅保留 `Emotion` 类型别名。
 
-// brains/brain_router.ts — 全局数组
-const history: PromptMessage[] = [];
+**说明：** 进程级 `getMemoryRepository()`（如 Postgres）仍用于服务端衰减等全局逻辑；**对话热路径上的检索与正则写入** 使用连接内 `InMemoryRepository`，与「每连接隔离」一致。若需跨会话持久化用户记忆，可后续按 `userId` 作用域或双写。
 
-// brains/slow_brain_store.ts — 全局单例
-const profile: UserProfile = { facts: new Map(), interests: [], ... };
-const relationship: RelationshipState = { familiarity: 0, ... };
-```
-
-情绪状态、对话历史、慢脑状态、用户画像全部是进程级单例。多个用户同时连接会共享同一份状态，互相污染。
-
-**优化方案：**
-
-将所有状态封装为 per-session 实例，由 `ConnectionSession` 持有：
-
-```typescript
-// 新增 SessionContext，作为所有状态的容器
-interface SessionContext {
-  emotion: EmotionManager;       // 替代全局 emotion_state
-  history: PromptMessage[];      // 替代全局 history
-  slowBrainStore: SlowBrainStore; // 替代全局 slow_brain_store
-  memoryRepo: MemoryRepository;   // per-user 记忆
-}
-
-class ConnectionSession {
-  readonly ctx: SessionContext;
-  // ...
-}
-```
-
-**涉及文件：** `emotion/emotion_state.ts`, `brains/brain_router.ts`, `brains/slow_brain_store.ts`, `server/session/index.ts`, `server/pipeline/runner.ts`
+**涉及文件：** `emotion/emotion_runtime.ts`, `emotion/emotion_state.ts`, `brains/rem_session_context.ts`, `brains/brain_router.ts`, `brains/slow_brain_store.ts`, `brains/slow_brain.ts`, `memory/memory_agent.ts`, `agents/conversation_agent.ts`, `server/session/index.ts`, `server/pipeline/runner.ts`
 
 ---
 
@@ -614,6 +625,8 @@ async function withRetry<T>(fn: () => Promise<T>, retries = 2, delay = 500): Pro
 - 使用 localStorage 保存最近 50 条消息
 - 页面加载时恢复
 
+**状态：** Step 2（localStorage）与 Step 1（「Rem 在想…」气泡，**S9**）均已落地。
+
 **涉及文件：** `web/src/hooks/useRemChat.ts`
 
 ---
@@ -632,32 +645,34 @@ async function withRetry<T>(fn: () => Promise<T>, retries = 2, delay = 500): Pro
 | S6 | `memory_agent.ts` 扩展正则规则集 | `memory/memory_agent.ts` | 20 min | ✅ 已完成 |
 | S7 | `SentenceChunker` 增加字数阈值强制输出 | `utils/sentence_chunker.ts` | 10 min | ✅ 已完成 |
 | S8 | 丰富 `personality.ts` 和 `character_rules.ts` 内容 | `brain/personality.ts`, `brain/character_rules.ts` | 15 min | ✅ 已完成 |
-| S9 | 前端增加 "思考中" 状态提示 | `web/src/hooks/useRemChat.ts` | 10 min | ⬜ 待处理 |
-| S10 | TTS 短句缓存 | `voice/tts.ts` | 15 min | ⬜ 待处理 |
+| S9 | 前端增加 "思考中" 状态提示 | `web/src/hooks/useRemChat.ts` | 10 min | ✅ |
+| S10 | TTS 短句缓存 | `voice/tts.ts` | 15 min | ✅ |
 
 ### 🟡 中等任务 (需要上下文理解)
 
-| # | 任务 | 文件 | 预计耗时 |
-|---|------|------|---------|
-| M1 | 情绪引擎增加强度和惯性机制 | `emotion/emotion_engine.ts`, `emotion/emotion_state.ts` | 30 min |
-| M2 | Slow Brain 的 user_facts 同步到 memory_store | `brains/slow_brain.ts`, `memory/memory_store.ts` | 25 min |
-| M3 | 对话历史 token 预算控制 | `brains/brain_router.ts`, `brain/prompt_builder.ts` | 30 min |
-| M4 | 对话策略引擎（追问/分享/换题决策） | `brain/prompt_builder.ts`, `brains/slow_brain_store.ts` | 45 min |
-| M5 | 关键路径重试机制 | `llm/qwen_client.ts`, `voice/tts.ts`, `voice/stt_stream.ts` | 30 min |
-| M6 | Slow Brain 上下文在 prompt 中的位置和格式优化 | `brains/fast_brain.ts`, `brains/slow_brain_store.ts` | 20 min |
-| M7 | Edge TTS 连接复用 | `voice/tts.ts` | 45 min |
-| M8 | 预测性回应（思考音/填充词） | `server/pipeline/runner.ts`, `server/session/index.ts` | 40 min |
-| M9 | 前端消息本地持久化 | `web/src/hooks/useRemChat.ts` | 20 min |
+| # | 任务 | 文件 | 预计耗时 | 状态 |
+|---|------|------|---------|------|
+| M1 | 情绪引擎增加强度和惯性机制 | `emotion/emotion_engine.ts`, `emotion/emotion_state.ts` | 30 min | ✅ |
+| M2 | Slow Brain 的 user_facts 同步到 memory_store | `brains/slow_brain.ts`, `memory/memory_store.ts` | 25 min | ✅ |
+| M3 | 对话历史 token 预算控制 | `brains/brain_router.ts`, `brain/prompt_builder.ts` | 30 min | ✅ |
+| M4 | 对话策略提示（轻量规则，非完整策略引擎） | `brain/prompt_builder.ts`, `brains/slow_brain_store.ts` | 45 min | ✅ 部分* |
+| M5 | 关键路径重试机制 | `llm/qwen_client.ts`, `voice/tts.ts`, `voice/stt_stream.ts` | 30 min | ✅ |
+| M6 | Slow Brain 上下文在 prompt 中的位置和格式优化 | `brains/fast_brain.ts`, `brains/slow_brain_store.ts` | 20 min | ✅ |
+| M7 | Edge TTS 连接复用 | `voice/tts.ts` | 45 min | ✅ |
+| M8 | 预测性回应（思考音/填充词） | `server/pipeline/runner.ts`（可选 env） | 40 min | ✅ 服务端* |
+| M9 | 前端消息本地持久化 | `web/src/hooks/useRemChat.ts` | 20 min | ✅ |
+
+\* **M4**：已实现 `buildConversationStrategyHints`（规则化提示），未实现完整 `ConversationStrategy` 状态机。 **M8**：已实现服务端短「嗯」填充（需 `rem_thinking_filler=1`）；**S9**（前端「Rem 在想…」）已落地。
 
 ### 🔴 复杂任务 (架构级改动)
 
-| # | 任务 | 文件 | 预计耗时 |
-|---|------|------|---------|
-| C1 | 全局状态重构为 per-session 实例 | 8+ 文件，核心架构 | 2-3 hr |
-| C2 | 关系阶段化动态人格系统 | `brain/`, `brains/`, 新增文件 | 2 hr |
-| C3 | 流式 STT 集成 | `voice/stt_stream.ts`, `server/session/index.ts` | 2 hr |
-| C4 | 沉默检测 + 主动话题发起 | `server/session/index.ts`, `brains/`, 新增定时器 | 1.5 hr |
-| C5 | LLM 辅助情绪识别 | `emotion/`, `brains/`, `server/pipeline/` | 2 hr |
+| # | 任务 | 文件 | 预计耗时 | 状态 |
+|---|------|------|---------|------|
+| C1 | 全局状态重构为 per-session 实例 | 见 §3.1 涉及文件 | 2-3 hr | ✅ |
+| C2 | 关系阶段化动态人格系统 | `brain/`, `brains/`, 新增文件 | 2 hr | |
+| C3 | 流式 STT 集成 | `voice/stt_stream.ts`, `server/session/index.ts` | 2 hr | |
+| C4 | 沉默检测 + 主动话题发起 | `server/session/index.ts`, `brains/`, 新增定时器 | 1.5 hr | |
+| C5 | LLM 辅助情绪识别 | `emotion/`, `brains/`, `server/pipeline/` | 2 hr | |
 
 ---
 
@@ -683,9 +698,9 @@ M4 → M8 → S9 → M9 → C2
 
 ### Phase 4：架构升级（规模化）
 ```
-C1 → C3 → C4 → C5 → M5 → M7
+C1 ✅ → C3 → C4 → C5
 ```
-多用户隔离，流式 STT，主动对话，LLM 情绪识别。
+多连接状态隔离（C1），流式 STT，主动对话，LLM 情绪识别。（M5/M7 已陆续落地，见上文「已完成优化」。）
 
 ---
 
@@ -699,5 +714,5 @@ C1 → C3 → C4 → C5 → M5 → M7
 | 情绪识别准确率 | ~60% (关键词) | > 85% (规则+LLM) |
 | 记忆提取覆盖率 | ~30% (7 条正则) | > 70% (规则+LLM) |
 | 用户觉得在和"人"聊天 | 低 | 高 (通过 A/B 测试) |
-| 多用户并发支持 | 1 (全局单例) | N (per-session) |
+| 多连接状态隔离 | `RemSessionContext`（C1） | 无跨连接共享情绪/历史/慢脑 |
 | TTS 缓存命中率 | 0% | > 30% (短句) |

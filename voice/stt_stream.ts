@@ -1,6 +1,7 @@
 import { EventEmitter } from "events";
 import { spawn } from "child_process";
 import OpenAI from "openai";
+import { withRetry } from "../utils/retry";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -114,6 +115,36 @@ export class SttStream extends EventEmitter {
 
   /* ======== Transcription backends ======== */
 
+  /** Only adds language / temperature / prompt when env is set — matches original minimal API body and avoids breaking some OpenAI-compatible providers. */
+  private openAiTranscriptionBody(): {
+    model: string;
+    language?: string;
+    temperature?: number;
+    prompt?: string;
+  } {
+    const prompt = process.env.whisper_prompt || process.env.stt_prompt;
+    const lang = process.env.stt_language || process.env.whisper_lang;
+    const tempRaw = process.env.stt_temperature;
+
+    const body: {
+      model: string;
+      language?: string;
+      temperature?: number;
+      prompt?: string;
+    } = {
+      model: process.env.stt_model || "whisper-1",
+    };
+
+    if (lang) body.language = lang;
+    if (prompt) body.prompt = prompt;
+    if (tempRaw !== undefined && tempRaw !== "") {
+      const t = Math.min(1, Math.max(0, Number(tempRaw)));
+      if (Number.isFinite(t)) body.temperature = t;
+    }
+
+    return body;
+  }
+
   // -- OpenAI, WebM input --
   private async transcribeOpenAIWebm(audio: Buffer): Promise<string> {
     if (!this.client) throw new Error("STT 未配置：请设置 stt_key 和 stt_base_url");
@@ -121,10 +152,14 @@ export class SttStream extends EventEmitter {
     const tmp = tmpPath("webm");
     fs.writeFileSync(tmp, audio);
     try {
-      const res = await this.client.audio.transcriptions.create({
-        model: process.env.stt_model || "whisper-1",
-        file: fs.createReadStream(tmp),
-      });
+      const res = await withRetry(
+        () =>
+          this.client!.audio.transcriptions.create({
+            file: fs.createReadStream(tmp),
+            ...this.openAiTranscriptionBody(),
+          }),
+        { retries: 1 },
+      );
       return res.text;
     } finally {
       fs.unlinkSync(tmp);
@@ -138,10 +173,14 @@ export class SttStream extends EventEmitter {
     const tmp = tmpPath("wav");
     fs.writeFileSync(tmp, wav);
     try {
-      const res = await this.client.audio.transcriptions.create({
-        model: process.env.stt_model || "whisper-1",
-        file: fs.createReadStream(tmp),
-      });
+      const res = await withRetry(
+        () =>
+          this.client!.audio.transcriptions.create({
+            file: fs.createReadStream(tmp),
+            ...this.openAiTranscriptionBody(),
+          }),
+        { retries: 1 },
+      );
       return res.text;
     } finally {
       fs.unlinkSync(tmp);
@@ -225,7 +264,13 @@ export class SttStream extends EventEmitter {
       args.push(...extraArgs.split(/\s+/).filter(Boolean));
     }
 
-    const raw = await run(cmd, args);
+    let raw: string;
+    try {
+      raw = await run(cmd, args);
+    } catch {
+      await new Promise((r) => setTimeout(r, 350));
+      raw = await run(cmd, args);
+    }
 
     return raw
       .replace(/^\[.*?\]\s*/gm, "")

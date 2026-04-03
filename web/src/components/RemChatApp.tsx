@@ -13,7 +13,7 @@ export function RemChatApp() {
     connLabel,
     messages,
     streamingText,
-    typing,
+    thinkingHint,
     waiting,
     inputPlaceholder,
     recording,
@@ -50,7 +50,7 @@ export function RemChatApp() {
       <ChatWindow
         messages={messages}
         streamingText={streamingText}
-        typing={typing}
+        thinkingHint={thinkingHint}
       />
 
       <footer className="shrink-0 border-t border-[var(--rem-border)] bg-[var(--rem-surface)] px-4 py-3">

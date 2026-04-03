@@ -7,6 +7,7 @@ import { WebSocket } from "ws";
 import { randomBytes } from "crypto";
 import { getEmotionVoiceParams, type Emotion } from "./tts_emotion";
 import { createLogger } from "../infra/logger";
+import { withRetry } from "../utils/retry";
 
 const logger = createLogger("tts");
 
@@ -20,6 +21,35 @@ function getProvider(): TtsProvider {
   if (p === "piper") return "piper";
   if (p === "openai") return "openai";
   return "edge";
+}
+
+/** 短句 TTS 内存缓存（S10）：同 provider + 情绪 + 正文命中则跳过合成 */
+const TTS_CACHE_MAX_CHARS = Number(process.env.tts_cache_max_chars ?? 24);
+const TTS_CACHE_MAX_ENTRIES = Number(process.env.tts_cache_max_entries ?? 80);
+const ttsShortAudioCache = new Map<string, Buffer>();
+
+function ttsShortCacheKey(
+  provider: TtsProvider,
+  normalizedText: string,
+  emotion: Emotion | undefined,
+): string {
+  return `${provider}\0${emotion ?? "neutral"}\0${normalizedText}`;
+}
+
+function getTtsShortCache(key: string): Buffer | null {
+  const buf = ttsShortAudioCache.get(key);
+  if (!buf) return null;
+  ttsShortAudioCache.delete(key);
+  ttsShortAudioCache.set(key, buf);
+  return Buffer.from(buf);
+}
+
+function setTtsShortCache(key: string, buf: Buffer): void {
+  if (ttsShortAudioCache.size >= TTS_CACHE_MAX_ENTRIES) {
+    const oldest = ttsShortAudioCache.keys().next().value as string | undefined;
+    if (oldest !== undefined) ttsShortAudioCache.delete(oldest);
+  }
+  ttsShortAudioCache.set(key, Buffer.from(buf));
 }
 
 function getClient(): OpenAI | null {
@@ -39,10 +69,39 @@ function getPiperModel(): string | null {
   return process.env.piper_model || null;
 }
 
+/**
+ * Remove parenthetical stage directions (e.g. 表情、动作) so TTS does not read them aloud.
+ * Full reply text is unchanged upstream — only used at synthesize time.
+ * Set tts_strip_parenthetical=0 to disable. Iterates to peel simple nesting.
+ */
+function stripParentheticalStageDirections(text: string): string {
+  if (process.env.tts_strip_parenthetical === "0") return text;
+  let out = text;
+  let prev = "";
+  while (out !== prev) {
+    prev = out;
+    out = out.replace(/（[^）]*）/g, "");
+    out = out.replace(/\([^)]*\)/g, "");
+  }
+  return out;
+}
+
+/** Remove emoji so TTS does not try to speak names or glitch; chat stream unchanged. */
+function stripEmojiForTts(text: string): string {
+  if (process.env.tts_strip_emoji === "0") return text;
+  return (
+    text
+      // Most pictographic emoji (covers far more than the old 1F300–1FAFF slice)
+      .replace(/\p{Extended_Pictographic}/gu, "")
+      // VS16 / ZWJ often left behind after emoji removal
+      .replace(/\uFE0F/g, "")
+      .replace(/\u200D/g, "")
+  );
+}
+
 function normalizeTtsText(raw: string): string {
   const maxChars = Number(process.env.tts_max_chars || 120);
-  const clean = raw
-    .replace(/[\u{1F300}-\u{1FAFF}]/gu, "")
+  const clean = stripEmojiForTts(stripParentheticalStageDirections(raw))
     .replace(/\s+/g, " ")
     .trim();
 
@@ -109,9 +168,12 @@ async function speakWithOpenAI(
   const voice = process.env.tts_voice || "alloy";
   const { speed } = getEmotionVoiceParams(emotion ?? "neutral");
 
-  const response = await openai.audio.speech.create(
-    { model, voice: voice as "alloy", input: text, speed },
-  );
+  const response = await openai.audio.speech.create({
+    model,
+    voice: voice as "alloy",
+    input: text,
+    speed,
+  });
 
   throwIfAborted(signal);
   const arrayBuffer = await response.arrayBuffer();
@@ -206,12 +268,150 @@ function edgeGecToken(): string {
 function escapeXml(s: string): string {
   return s.replace(/[<>&"']/g, (c) => {
     switch (c) {
-      case "<": return "&lt;";
-      case ">": return "&gt;";
-      case "&": return "&amp;";
-      case '"': return "&quot;";
-      case "'": return "&apos;";
-      default: return c;
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case "&":
+        return "&amp;";
+      case "\u0022":
+        return "&quot;";
+      case "\u0027":
+        return "&apos;";
+      default:
+        return c;
+    }
+  });
+}
+
+/* ── Edge TTS 连接池（M7）：同 voice/lang/rate/pitch/fmt 复用一条 WebSocket ── */
+
+const EDGE_POOL_OFF = process.env.edge_tts_pool === "0";
+const EDGE_POOL_IDLE_MS = Number(process.env.edge_tts_pool_idle_ms ?? 45_000);
+
+type EdgePoolSlot = {
+  ws: WebSocket;
+  lastUsed: number;
+  idleTimer?: ReturnType<typeof setTimeout>;
+};
+
+const edgePoolSlots = new Map<string, EdgePoolSlot>();
+const edgePoolSerial = new Map<string, Promise<unknown>>();
+
+function edgeConnKey(
+  voice: string,
+  lang: string,
+  rate: string,
+  pitch: string,
+  outputFormat: string,
+): string {
+  return `${voice}\0${lang}\0${rate}\0${pitch}\0${outputFormat}`;
+}
+
+function runEdgePooled<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = edgePoolSerial.get(key) ?? Promise.resolve();
+  const p = prev.then(() => fn());
+  edgePoolSerial.set(key, p.then(() => undefined).catch(() => undefined));
+  return p;
+}
+
+function scheduleEdgePoolIdleClose(key: string, slot: EdgePoolSlot): void {
+  if (slot.idleTimer) clearTimeout(slot.idleTimer);
+  slot.idleTimer = setTimeout(() => {
+    const s = edgePoolSlots.get(key);
+    if (!s || s.ws !== slot.ws) return;
+    if (Date.now() - s.lastUsed < EDGE_POOL_IDLE_MS - 500) return;
+    try {
+      s.ws.close();
+    } catch {
+      /* ignore */
+    }
+    edgePoolSlots.delete(key);
+  }, EDGE_POOL_IDLE_MS);
+}
+
+function evictEdgePoolSlot(key: string): void {
+  const s = edgePoolSlots.get(key);
+  if (!s) return;
+  if (s.idleTimer) clearTimeout(s.idleTimer);
+  try {
+    s.ws.close();
+  } catch {
+    /* ignore */
+  }
+  edgePoolSlots.delete(key);
+}
+
+function buildEdgeSsml(
+  text: string,
+  voice: string,
+  lang: string,
+  rate: string,
+  pitch: string,
+): string {
+  const reqId = randomBytes(16).toString("hex");
+  return (
+    `X-RequestId:${reqId}\r\nContent-Type:application/ssml+xml\r\nPath:ssml\r\n\r\n` +
+    `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="${lang}">` +
+    `<voice name="${voice}"><prosody rate="${rate}" pitch="${pitch}">${escapeXml(text)}</prosody></voice></speak>`
+  );
+}
+
+/**
+ * 在已打开的 WebSocket 上仅发送 SSML 并收集一轮音频（连接复用路径）。
+ */
+function edgeCollectOneTurn(
+  ws: WebSocket,
+  send: () => void,
+  signal: AbortSignal | undefined,
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let done = false;
+
+    const finish = (err?: Error) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", abortHandler);
+      ws.off("message", onMessage);
+      ws.off("error", onError);
+      ws.off("close", onClose);
+      if (err) reject(err);
+      else resolve(Buffer.concat(chunks));
+    };
+
+    const timer = setTimeout(() => {
+      finish(new Error(`Edge TTS 超时 (${EDGE_TIMEOUT_MS}ms)`));
+    }, EDGE_TIMEOUT_MS);
+
+    const abortHandler = () => finish(new DOMException("TTS aborted", "AbortError"));
+    if (signal) signal.addEventListener("abort", abortHandler, { once: true });
+
+    const onMessage = (data: Buffer, isBinary: boolean) => {
+      if (done) return;
+      if (isBinary) {
+        const sep = "Path:audio\r\n";
+        const idx = data.indexOf(sep);
+        if (idx >= 0) chunks.push(data.subarray(idx + sep.length));
+      } else if (data.toString().includes("Path:turn.end")) {
+        finish();
+      }
+    };
+
+    const onError = (err: Error) => finish(err);
+    const onClose = () => {
+      if (!done) finish(new Error("Edge TTS WebSocket 意外关闭"));
+    };
+
+    ws.on("message", onMessage);
+    ws.on("error", onError);
+    ws.on("close", onClose);
+
+    try {
+      send();
+    } catch (e) {
+      finish(e instanceof Error ? e : new Error(String(e)));
     }
   });
 }
@@ -297,6 +497,90 @@ function edgeTtsBuffer(
   });
 }
 
+/** 首次握手：config + SSML，成功后 **不关闭** WebSocket，供连接池复用。 */
+function edgeTtsFirstOpenKeepAlive(
+  text: string,
+  voice: string,
+  lang: string,
+  rate: string,
+  pitch: string,
+  outputFormat: string,
+  signal?: AbortSignal,
+): Promise<{ buf: Buffer; ws: WebSocket }> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("TTS aborted", "AbortError"));
+      return;
+    }
+
+    const majorVer = EDGE_CHROMIUM_VER.split(".")[0];
+    const ws = new WebSocket(
+      `wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=${EDGE_TOKEN}&Sec-MS-GEC=${edgeGecToken()}&Sec-MS-GEC-Version=1-${EDGE_CHROMIUM_VER}`,
+      {
+        headers: {
+          Pragma: "no-cache",
+          "Cache-Control": "no-cache",
+          "User-Agent": `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${majorVer}.0.0.0 Safari/537.36 Edg/${majorVer}.0.0.0`,
+          "Accept-Encoding": "gzip, deflate, br",
+          "Accept-Language": "en-US,en;q=0.9",
+          Origin: "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold",
+        },
+      },
+    );
+
+    const chunks: Buffer[] = [];
+    let done = false;
+
+    const finish = (err?: Error) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", abortHandler);
+      if (err) {
+        try {
+          ws.close();
+        } catch {
+          /* ignore */
+        }
+        reject(err);
+      } else {
+        resolve({ buf: Buffer.concat(chunks), ws });
+      }
+    };
+
+    const timer = setTimeout(() => {
+      finish(new Error(`Edge TTS 超时 (${EDGE_TIMEOUT_MS}ms)`));
+    }, EDGE_TIMEOUT_MS);
+
+    const abortHandler = () => finish(new DOMException("TTS aborted", "AbortError"));
+    if (signal) signal.addEventListener("abort", abortHandler, { once: true });
+
+    ws.on("open", () => {
+      ws.send(
+        `Content-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n` +
+          `{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"${outputFormat}"}}}}`,
+      );
+      ws.send(buildEdgeSsml(text, voice, lang, rate, pitch));
+    });
+
+    ws.on("message", (data: Buffer, isBinary: boolean) => {
+      if (done) return;
+      if (isBinary) {
+        const sep = "Path:audio\r\n";
+        const idx = data.indexOf(sep);
+        if (idx >= 0) chunks.push(data.subarray(idx + sep.length));
+      } else if (data.toString().includes("Path:turn.end")) {
+        finish();
+      }
+    });
+
+    ws.on("error", (err: Error) => finish(err));
+    ws.on("close", () => {
+      if (!done) finish(new Error("Edge TTS WebSocket 意外关闭"));
+    });
+  });
+}
+
 async function speakWithEdge(
   text: string,
   signal?: AbortSignal,
@@ -321,7 +605,49 @@ async function speakWithEdge(
     pitch = ev.pitch;
   }
 
-  const buf = await edgeTtsBuffer(text, voice, lang, rate, pitch, fmt, signal);
+  const poolKey = edgeConnKey(voice, lang, rate, pitch, fmt);
+
+  if (EDGE_POOL_OFF) {
+    const buf = await edgeTtsBuffer(text, voice, lang, rate, pitch, fmt, signal);
+    logger.info("edge 合成完成", { duration: Date.now() - t0, text: text.slice(0, 30) });
+    return buf;
+  }
+
+  const buf = await runEdgePooled(poolKey, async () => {
+    const slot = edgePoolSlots.get(poolKey);
+    if (slot?.ws.readyState === WebSocket.OPEN) {
+      try {
+        const out = await edgeCollectOneTurn(
+          slot.ws,
+          () => {
+            slot.ws.send(buildEdgeSsml(text, voice, lang, rate, pitch));
+          },
+          signal,
+        );
+        slot.lastUsed = Date.now();
+        scheduleEdgePoolIdleClose(poolKey, slot);
+        logger.debug("edge TTS 连接复用命中");
+        return out;
+      } catch {
+        evictEdgePoolSlot(poolKey);
+      }
+    }
+
+    const { buf: firstBuf, ws } = await edgeTtsFirstOpenKeepAlive(
+      text,
+      voice,
+      lang,
+      rate,
+      pitch,
+      fmt,
+      signal,
+    );
+    edgePoolSlots.set(poolKey, { ws, lastUsed: Date.now() });
+    const placed = edgePoolSlots.get(poolKey);
+    if (placed) scheduleEdgePoolIdleClose(poolKey, placed);
+    return firstBuf;
+  });
+
   logger.info("edge 合成完成", { duration: Date.now() - t0, text: text.slice(0, 30) });
   return buf;
 }
@@ -341,7 +667,27 @@ export async function textToSpeech(
     throw new Error("TTS_DISABLED");
   }
 
-  if (provider === "edge") return speakWithEdge(ttsText, signal, emotion);
-  if (provider === "piper") return speakWithPiper(ttsText, signal, emotion);
-  return speakWithOpenAI(ttsText, signal, emotion);
+  const shortKey =
+    ttsText.length > 0 && ttsText.length <= TTS_CACHE_MAX_CHARS
+      ? ttsShortCacheKey(provider, ttsText, emotion)
+      : null;
+  if (shortKey) {
+    const hit = getTtsShortCache(shortKey);
+    if (hit) {
+      throwIfAborted(signal);
+      return hit;
+    }
+  }
+
+  const buf = await withRetry(
+    () => {
+      if (provider === "edge") return speakWithEdge(ttsText, signal, emotion);
+      if (provider === "piper") return speakWithPiper(ttsText, signal, emotion);
+      return speakWithOpenAI(ttsText, signal, emotion);
+    },
+    { retries: 1 },
+  );
+
+  if (shortKey) setTtsShortCache(shortKey, buf);
+  return buf;
 }

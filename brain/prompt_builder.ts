@@ -17,6 +17,8 @@ interface BuildPromptInput {
   emotion: Emotion;
   history: PromptMessage[];
   userMessage: string;
+  /** 慢脑画像、对话策略等，置于 system 最前以便模型优先注意 */
+  priorityContext?: string;
 }
 
 const EMOTION_STYLE: Record<Emotion, string> = {
@@ -27,13 +29,25 @@ const EMOTION_STYLE: Record<Emotion, string> = {
   sad: "温柔地安慰对方，语气轻柔、体贴，表达共情。",
 };
 
-function buildSystemPrompt(memory: MemoryEntry[], emotion: Emotion): string {
-  const sections: string[] = [
+function buildSystemPrompt(
+  memory: MemoryEntry[],
+  emotion: Emotion,
+  priorityContext?: string,
+): string {
+  const sections: string[] = [];
+
+  if (priorityContext?.trim()) {
+    sections.push(
+      "【优先参考（请自然融入对话，不要逐条复述）】\n" + priorityContext.trim(),
+    );
+  }
+
+  sections.push(
     buildPersonalityPrompt(),
     buildCharacterRulesPrompt(),
     `当前情绪：${emotion}\n情绪表达风格：${EMOTION_STYLE[emotion]}`,
     "用中文回复。",
-  ];
+  );
 
   if (memory.length > 0) {
     const memoryLines = memory.map((m) => `- ${m.key}：${m.value}`).join("\n");
@@ -48,9 +62,10 @@ export function buildPrompt({
   emotion,
   history,
   userMessage,
+  priorityContext,
 }: BuildPromptInput): PromptMessage[] {
   return [
-    { role: "system", content: buildSystemPrompt(memory, emotion) },
+    { role: "system", content: buildSystemPrompt(memory, emotion, priorityContext) },
     ...history,
     { role: "user", content: userMessage },
   ];

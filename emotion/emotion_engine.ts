@@ -1,4 +1,5 @@
-import { Emotion, getEmotion, setEmotion } from "./emotion_state";
+import type { Emotion } from "./emotion_state";
+import type { EmotionRuntime } from "./emotion_runtime";
 import { EmotionLogger } from "../infra/emotion_logger";
 
 const emotionLogger = new EmotionLogger();
@@ -69,9 +70,9 @@ function getSadIfNegatedHappy(msg: string): Emotion | null {
   return null;
 }
 
-export function updateEmotion(userMessage: string): Emotion {
+export function updateEmotion(userMessage: string, runtime: EmotionRuntime): Emotion {
   const msg = userMessage.trim();
-  const fromEmotion = getEmotion();
+  const fromEmotion = runtime.getEmotion();
   let toEmotion: Emotion = "neutral";
 
   if (!msg) {
@@ -107,11 +108,11 @@ export function updateEmotion(userMessage: string): Emotion {
     }
   }
 
-  setEmotion(toEmotion);
+  runtime.applyEmotionCandidate(toEmotion);
 
   const trigger = userMessage.length > 50 ? userMessage.slice(0, 50) : userMessage;
   emotionLogger.log({
-    userId: "dev",
+    userId: runtime.connId,
     fromEmotion,
     toEmotion,
     trigger,

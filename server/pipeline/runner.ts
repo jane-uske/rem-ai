@@ -1,6 +1,7 @@
 import { WebSocket } from "ws";
 
 import { chatStream } from "../../agents/conversation_agent";
+import type { RemSessionContext } from "../../brains/rem_session_context";
 import { decayEmotion } from "../../emotion/decay_emotion";
 import { updateEmotion } from "../../emotion/emotion_engine";
 import { synthesize, isTtsEnabled } from "../../voice/tts_stream";
@@ -15,19 +16,28 @@ import { send } from "../gateway";
 
 const logger = createLogger("pipeline");
 
+export type RunPipelineOptions = {
+  /** 用户久未说话时的主动搭话：不写入 user 消息、不跑慢脑/记忆 */
+  silenceNudge?: boolean;
+};
+
 export async function runPipeline(
   ws: WebSocket,
   text: string,
   ic: InterruptController,
   avatar: AvatarController,
   sessionId: string | null,
-  connId: string,
+  ctx: RemSessionContext,
+  options?: RunPipelineOptions,
 ): Promise<void> {
+  const connId = ctx.connId;
   const signal = ic.begin();
   const latencyTracer = getLatencyTracer(connId);
 
   try {
-    const replyEmotion = updateEmotion(text);
+    const replyEmotion = options?.silenceNudge
+      ? ctx.emotion.getEmotion()
+      : updateEmotion(text, ctx.emotion);
     send(ws, { type: "emotion", emotion: replyEmotion });
 
     const avatarFrames = avatar.setEmotion(replyEmotion as any);
@@ -35,12 +45,26 @@ export async function runPipeline(
       send(ws, { type: "avatar_frame", frame });
     }
 
-    if (isDbReady() && sessionId) {
+    if (isDbReady() && sessionId && !options?.silenceNudge) {
       try {
         await saveMessage(sessionId, "user", text);
       } catch (err) {
         logger.warn("[Storage] Failed to save user message", { error: err, sessionId });
       }
+    }
+
+    const thinkingFiller =
+      !options?.silenceNudge &&
+      (process.env.rem_thinking_filler === "1" ||
+        process.env.REM_THINKING_FILLER === "1");
+    if (thinkingFiller && isTtsEnabled() && !signal.aborted) {
+      void synthesize("嗯", signal, replyEmotion as any)
+        .then((buf) => {
+          if (!signal.aborted) {
+            send(ws, { type: "voice", audio: buf.toString("base64") });
+          }
+        })
+        .catch(() => {});
     }
 
     // ── Producer-consumer TTS: synthesize sentences as they stream in ──
@@ -111,7 +135,13 @@ export async function runPipeline(
 
     latencyTracer.mark("llm_request_start");
 
-    for await (const token of chatStream(text, replyEmotion, signal)) {
+    for await (const token of chatStream(
+      ctx,
+      text,
+      replyEmotion,
+      signal,
+      options?.silenceNudge ? { systemTriggered: true } : undefined,
+    )) {
       if (signal.aborted) break;
 
       if (!firstTokenReceived) {
@@ -176,7 +206,7 @@ export async function runPipeline(
     // Wait for TTS consumer to finish
     await ttsTask;
 
-    decayEmotion();
+    decayEmotion(ctx.emotion);
 
     latencyTracer.mark("tts_end");
     latencyTracer.log();

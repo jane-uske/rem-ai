@@ -10,15 +10,42 @@ function uid() {
   return crypto.randomUUID();
 }
 
+const MESSAGE_STORAGE_KEY = "rem-chat-messages-v1";
+const MESSAGE_STORAGE_MAX = 50;
+
+function loadPersistedMessages(): ChatMessage[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(MESSAGE_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (m): m is ChatMessage =>
+          m != null &&
+          typeof m === "object" &&
+          typeof (m as ChatMessage).id === "string" &&
+          typeof (m as ChatMessage).text === "string" &&
+          typeof (m as ChatMessage).role === "string",
+      )
+      .slice(-MESSAGE_STORAGE_MAX);
+  } catch {
+    return [];
+  }
+}
+
 export function useRemChat() {
   const { enqueueBase64, clearQueue, voiceActive } = useAudioBase64Queue();
 
   const [emotion, setEmotion] = useState("neutral");
   const [connected, setConnected] = useState(false);
   const [connLabel, setConnLabel] = useState("连接中…");
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>(loadPersistedMessages);
   const [streamingText, setStreamingText] = useState("");
   const [typing, setTyping] = useState(false);
+  /** 首 token 前：展示「Rem 在想…」（S9） */
+  const thinkingHint = typing && streamingText.length === 0;
   const [waiting, setWaiting] = useState(false);
   const [inputPlaceholder, setInputPlaceholder] = useState("说点什么…");
   const [recording, setRecording] = useState(false);
@@ -29,7 +56,6 @@ export function useRemChat() {
   const waitingRef = useRef(false);
   const duplexRef = useRef(false);
   const pcmRef = useRef<PcmCapture | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordingRef = useRef(false);
   const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const streamingBufRef = useRef("");
@@ -50,6 +76,68 @@ export function useRemChat() {
     streamingBufRef.current = "";
     setStreamingText("");
   }, []);
+
+  /* ── Full-duplex voice（须在 WebSocket 回调之前定义）── */
+
+  const startDuplex = useCallback(async () => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+
+      const capture = startPcmCapture(stream, (base64) => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "audio_stream", audio: base64 }));
+        }
+      });
+
+      pcmRef.current = capture;
+      ws.send(JSON.stringify({ type: "duplex_start", sampleRate: capture.sampleRate }));
+
+      duplexRef.current = true;
+      setDuplex(true);
+      setRecording(true);
+      recordingRef.current = true;
+      setInputPlaceholder("全双工语音 — 随时说话…");
+    } catch {
+      setMessages((m) => [
+        ...m,
+        { id: uid(), role: "error", text: "无法访问麦克风" },
+      ]);
+    }
+  }, []);
+
+  const stopVoiceSession = useCallback(() => {
+    const ws = wsRef.current;
+    if (pcmRef.current) {
+      pcmRef.current.stop();
+      pcmRef.current = null;
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "duplex_stop" }));
+    }
+    duplexRef.current = false;
+    setDuplex(false);
+    setRecording(false);
+    recordingRef.current = false;
+    setUserSpeaking(false);
+    setInputPlaceholder("说点什么…");
+  }, []);
+
+  const toggleMic = useCallback(() => {
+    if (recordingRef.current) {
+      stopVoiceSession();
+    } else {
+      void startDuplex();
+    }
+  }, [startDuplex, stopVoiceSession]);
 
   /* ── WebSocket connection ── */
 
@@ -122,6 +210,7 @@ export function useRemChat() {
         case "interrupt":
           clearQueue();
           resetStreaming();
+          setTyping(false);
           break;
 
         case "vad_start":
@@ -137,7 +226,6 @@ export function useRemChat() {
           break;
 
         case "stt_final": {
-          setTyping(false);
           const content = String(data.content ?? "");
           setMessages((m) => [...m, { id: uid(), role: "user", text: content }]);
           setInputPlaceholder("说点什么…");
@@ -170,9 +258,7 @@ export function useRemChat() {
     ws.onclose = () => {
       if (!mountedRef.current) return;
 
-      // Tear down duplex / legacy recording
-      stopDuplexInternal();
-      stopLegacyRecording();
+      stopVoiceSession();
 
       setConnected(false);
       setConnLabel("已断开");
@@ -202,6 +288,18 @@ export function useRemChat() {
     };
   }, []);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const persist = messages
+      .filter((m) => m.role === "user" || m.role === "rem")
+      .slice(-MESSAGE_STORAGE_MAX);
+    try {
+      localStorage.setItem(MESSAGE_STORAGE_KEY, JSON.stringify(persist));
+    } catch {
+      /* quota or private mode */
+    }
+  }, [messages]);
+
   /* ── Text chat ── */
 
   const sendText = useCallback(
@@ -225,140 +323,6 @@ export function useRemChat() {
     [resetStreaming],
   );
 
-  /* ── Full-duplex voice ── */
-
-  const startDuplex = useCallback(async () => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-
-      const capture = startPcmCapture(stream, (base64) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "audio_stream", audio: base64 }));
-        }
-      });
-
-      pcmRef.current = capture;
-      ws.send(JSON.stringify({ type: "duplex_start", sampleRate: capture.sampleRate }));
-
-      duplexRef.current = true;
-      setDuplex(true);
-      setRecording(true);
-      recordingRef.current = true;
-      setInputPlaceholder("全双工语音 — 随时说话…");
-    } catch {
-      setMessages((m) => [
-        ...m,
-        { id: uid(), role: "error", text: "无法访问麦克风" },
-      ]);
-    }
-  }, []);
-
-  function stopDuplexInternal() {
-    const ws = wsRef.current;
-    if (pcmRef.current) {
-      pcmRef.current.stop();
-      pcmRef.current = null;
-    }
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "duplex_stop" }));
-    }
-    duplexRef.current = false;
-    setDuplex(false);
-    setRecording(false);
-    recordingRef.current = false;
-    setUserSpeaking(false);
-    setInputPlaceholder("说点什么…");
-  }
-
-  const stopDuplex = useCallback(() => {
-    stopDuplexInternal();
-  }, []);
-
-  /* ── Legacy half-duplex voice (fallback) ── */
-
-  function stopLegacyRecording() {
-    const mr = mediaRecorderRef.current;
-    if (mr && mr.state !== "inactive") {
-      try { mr.stop(); } catch {}
-    }
-    recordingRef.current = false;
-    setRecording(false);
-  }
-
-  const startLegacyRecording = useCallback(async () => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus"
-        : "audio/webm";
-      const mediaRecorder = new MediaRecorder(stream, { mimeType });
-      mediaRecorderRef.current = mediaRecorder;
-
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size === 0) return;
-        const reader = new FileReader();
-        reader.onload = () => {
-          const r = reader.result as string;
-          const b64 = r.split(",")[1];
-          ws.send(JSON.stringify({ type: "audio_chunk", audio: b64 }));
-        };
-        reader.readAsDataURL(e.data);
-      };
-
-      mediaRecorder.onstop = () => {
-        stream.getTracks().forEach((t) => t.stop());
-        ws.send(JSON.stringify({ type: "audio_end" }));
-        setTyping(true);
-      };
-
-      mediaRecorder.start(500);
-      recordingRef.current = true;
-      setRecording(true);
-      setInputPlaceholder("录音中…");
-    } catch {
-      setMessages((m) => [
-        ...m,
-        { id: uid(), role: "error", text: "无法访问麦克风" },
-      ]);
-    }
-  }, []);
-
-  const stopLegacyRecordingCb = useCallback(() => {
-    stopLegacyRecording();
-    setInputPlaceholder("识别中…");
-    waitingRef.current = true;
-    setWaiting(true);
-  }, []);
-
-  /* ── Unified mic toggle ──
-   *  Long-press or single tap enters full-duplex mode.
-   *  Tap again to exit.
-   */
-
-  const toggleMic = useCallback(() => {
-    if (recordingRef.current) {
-      if (pcmRef.current) {
-        stopDuplexInternal();
-      } else {
-        stopLegacyRecordingCb();
-      }
-    } else {
-      void startDuplex();
-    }
-  }, [startDuplex, stopLegacyRecordingCb]);
-
   return {
     emotion,
     connected,
@@ -366,6 +330,7 @@ export function useRemChat() {
     messages,
     streamingText,
     typing,
+    thinkingHint,
     waiting,
     inputPlaceholder,
     recording,
@@ -375,6 +340,8 @@ export function useRemChat() {
     hasMic,
     sendText,
     toggleMic,
+    /** 显式结束语音会话（与再点麦克风等效） */
+    stopVoice: stopVoiceSession,
     setInputPlaceholder,
   };
 }

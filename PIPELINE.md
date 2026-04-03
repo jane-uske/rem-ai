@@ -9,31 +9,40 @@ interrupt check (InterruptController)
     ↓
 runPipeline()
     ↓
-updateEmotion() → emotion state
+updateEmotion(runtime) → 情绪 + 强度/惯性（`EmotionRuntime`，每连接）
     ↓
-extractMemory() + retrieveMemory()
+（可选 env）rem_thinking_filler=1 → 异步短「嗯」TTS，与下文 LLM 并行
     ↓
-fast brain (LLM stream)
+extractMemory() + retrieveMemory()（`RemSessionContext.memory`，每连接）
     ↓
-sentence chunker (逐句切分)
+brain router：trimHistoryToTokenBudget（MAX_HISTORY_TOKENS）
     ↓
-TTS synthesize (emotion params)
+fast brain：system 含 priorityContext（策略提示 + 慢脑画像）
+    ↓
+LLM stream（complete/stream 带 withRetry）
+    ↓
+sentence chunker（逐句切分）
+    ↓
+TTS synthesize（Edge 默认同 voice+韵律参数 **连接池** 复用 WS；`textToSpeech` withRetry + 短句缓存；emotion params）
     ↓
 audio stream → client
     ↓
-slow brain (background)
+slow brain（background，user_facts → 当前连接的 `InMemoryRepository`）
+
+（可选）用户沉默超过 REM_SILENCE_NUDGE_MS → 服务端触发「陪伴搭话」管线（不写 user 入库 / 不跑慢脑）
 ```
 
 ## 详细步骤
 
 1. **Interrupt Check**: 检查是否需要打断当前回复
-2. **Emotion Update**: 根据用户输入更新情绪
-3. **Memory Extraction**: 从用户输入提取新记忆
-4. **Fast Brain**: 流式生成 LLM 回复
-5. **Sentence Chunker**: 按标点切分句子
-6. **TTS**: 逐句合成语音（带情绪参数）
-7. **Audio Stream**: 推送音频到客户端
-8. **Slow Brain**: 后台异步分析对话
+2. **Emotion Update**: 根据用户输入更新情绪（含强度衰减逻辑，见 `emotion/`）
+3. **（可选）Thinking Filler**: `rem_thinking_filler=1` 时异步合成极短填充音
+4. **Memory Extraction**: 从用户输入提取新记忆
+5. **Fast Brain**: 流式生成 LLM 回复（历史按 token 预算裁剪）
+6. **Sentence Chunker**: 按标点切分句子
+7. **TTS**: 逐句合成语音（带情绪参数）
+8. **Audio Stream**: 推送音频到客户端
+9. **Slow Brain**: 后台异步分析对话，事实写入记忆库
 
 ## 目录结构
 

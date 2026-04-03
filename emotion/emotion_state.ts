@@ -1,18 +1,2 @@
-import { createLogger } from "../infra/logger";
-
+/** 情绪标签（每条连接有独立的 EmotionRuntime 实例） */
 export type Emotion = "neutral" | "happy" | "curious" | "shy" | "sad";
-
-const logger = createLogger("emotion_state");
-
-let currentEmotion: Emotion = "neutral";
-
-export function getEmotion(): Emotion {
-  return currentEmotion;
-}
-
-export function setEmotion(emotion: Emotion): void {
-  if (currentEmotion !== emotion) {
-    logger.info("情绪变化", { from: currentEmotion, to: emotion });
-  }
-  currentEmotion = emotion;
-}

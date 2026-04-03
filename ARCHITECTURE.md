@@ -28,6 +28,7 @@
 ┌─────────────────────────────────────────────────────────────┐
 │                  server/session/                           │
 │              ConnectionSession (per conn)                   │
+│  RemSessionContext: emotion + slow brain + history + memory │
 │  ┌──────────────┐ ┌──────────────┐ ┌───────────────────┐  │
 │  │ STT Stream   │ │ VAD Detector │ │ InterruptCtrl     │  │
 │  │ Vad Events   │ │ Msg Router   │ │ AvatarController  │  │
@@ -106,7 +107,7 @@ HTTP + WebSocket 网关层，负责创建服务器和连接升级。
 
 | 职责 | 实现 |
 |------|------|
-| ConnectionSession 类 | 封装每个连接的状态和逻辑 |
+| ConnectionSession 类 | 封装每个连接的状态和逻辑；含 `brain: RemSessionContext`（情绪、慢脑、历史、会话内记忆） |
 | 状态管理 | STT/VAD/Interrupt/Avatar 实例、pipelineChain、speechBuffer |
 | 消息路由 | 按 type 分发消息 |
 | VAD 事件处理 | speech_start/speech_end 事件 |
@@ -261,11 +262,10 @@ OpenAI 兼容的流式聊天客户端。
 | 情绪衰减 | `decayEmotion()`：happy→neutral, curious→neutral, shy→neutral, sad→neutral |
 | 情绪日志 | EmotionLogger 记录状态变化 |
 
-**Emotion State (`emotion_state.ts`)**
+**Emotion type (`emotion_state.ts`) + `EmotionRuntime` (`emotion_runtime.ts`)**
 
-模块级状态管理：
-- 5 种情绪：`neutral` / `happy` / `curious` / `shy` / `sad`
-- `getEmotion()` / `setEmotion()` + 状态转换日志
+- `emotion_state.ts`：仅导出 `Emotion` 类型（5 种标签）。
+- `EmotionRuntime`：每条连接独立实例，持有当前情绪与强度；`updateEmotion` / `decayEmotion` 接收 runtime 而非全局变量。
 
 ```
               ┌───────────┐
@@ -500,8 +500,12 @@ server/
 | 领域 | 当前状态 | 演进方向 |
 |------|---------|---------|
 | 记忆存储 | PostgreSQL + pgvector 已集成，可选启用 | 向量语义检索集成到记忆检索流程 |
-| 情绪识别 | 关键词规则 + EmotionLogger | LLM 辅助识别 + 多维情绪 |
+| 情绪识别 | 关键词规则 + 强度/惯性 + EmotionLogger | LLM 辅助识别 + 多维情绪（见 OPTIMIZATION C5） |
 | 虚拟形象 | Avatar 协议 + 控制器已集成，SVG 表情切换 | Live2D / Three.js + VRM，口型同步（T-032） |
 | 语音打断 | 全双工 VAD + 打断控制已实现 | 优化回声消除、VAD 阈值、TTS 分段 |
 | 认证限流 | WebSocket 限流已集成，HTTP 限流待集成 | 完整集成 Auth + HTTP Rate Limiter |
+| TTS 工程 | Edge 默认同参数连接池 + 短句缓存 + 全链路重试；`edge_tts_pool=0` 可关闭池化 | 极端负载下池化策略与多音色隔离可再调 |
+| 每连接对话状态 | `RemSessionContext`：情绪 / 历史 / 慢脑 / 会话内记忆（**C1 ✅**） | 用户级持久记忆与 DB 双写、向量检索等 |
 | 部署 | Dockerfile + Docker Compose 已完成 | 生产环境验证 + CI/CD |
+
+**文档：** 已完成与待办的工程项清单见根目录 [OPTIMIZATION.md](OPTIMIZATION.md)（含 M1–M9、S9/S10、C1–C5 状态）。

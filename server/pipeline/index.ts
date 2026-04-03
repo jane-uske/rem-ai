@@ -1,1 +1,1 @@
-export { runPipeline } from "./runner";
+export { runPipeline, type RunPipelineOptions } from "./runner";

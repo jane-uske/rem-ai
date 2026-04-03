@@ -47,6 +47,9 @@ npm run dev
 
 # 启动前端（另一个终端）
 npm run web:dev
+
+# 仅类型检查（不写 dist）
+npm run typecheck
 ```
 
 ### 环境变量
@@ -66,6 +69,8 @@ npm run web:dev
 | `JWT_SECRET` | JWT 签名密钥 |
 | `LOG_LEVEL` | 日志级别（默认 `info`） |
 | `PORT` | 服务端口（默认 `3000`） |
+| `REM_SILENCE_NUDGE_MS` | 用户无消息后多久由 Rem 主动搭话（毫秒）；`0` 或不设为关闭 |
+| `REM_SILENCE_NUDGE_MIN_TURNS` | 至少聊过几轮才允许沉默搭话（默认 `2`） |
 
 ## 项目目录
 
@@ -79,7 +84,8 @@ rem-ai/
 │   ├── brain_router.ts        # 双脑路由（情绪 + 记忆 + 快慢脑调度）
 │   ├── fast_brain.ts          # 快脑：低延迟流式 LLM 回复
 │   ├── slow_brain.ts          # 慢脑：后台对话分析与长期上下文
-│   └── slow_brain_store.ts    # 慢脑上下文存储
+│   ├── slow_brain_store.ts    # SlowBrainStore（每连接实例）
+│   └── rem_session_context.ts # C1：每连接情绪 + 慢脑 + 历史 + 会话记忆
 ├── brain/
 │   ├── personality.ts         # Rem 人设定义
 │   ├── character_rules.ts     # 说话风格规则
@@ -92,8 +98,9 @@ rem-ai/
 │   ├── memory_repository.ts   # MemoryRepository 接口定义
 │   └── memory_decay.ts        # 记忆衰减与遗忘（重要性 × 频率 × 时间）
 ├── emotion/
-│   ├── emotion_engine.ts      # 情绪识别（关键词 + 标点）+ 衰减
-│   └── emotion_state.ts       # 情绪状态管理（5 种状态）
+│   ├── emotion_engine.ts      # 情绪识别（关键词 + 标点）
+│   ├── emotion_runtime.ts     # 每连接情绪状态与强度（C1）
+│   └── emotion_state.ts       # Emotion 类型别名
 ├── voice/
 │   ├── stt_stream.ts          # STT（Whisper API / whisper-cpp，WebM + PCM 双模式）
 │   ├── tts.ts                 # TTS（Edge / Piper / OpenAI 三后端）
@@ -136,6 +143,8 @@ rem-ai/
 ├── package.json
 ├── tsconfig.json
 ├── ARCHITECTURE.md
+├── PIPELINE.md
+├── OPTIMIZATION.md   # 架构分析、优化清单与完成状态
 └── TASKS.md
 ```
 
@@ -152,14 +161,14 @@ rem-ai/
 | P1 | 内存记忆提取 + 记忆衰减 | **已完成** |
 | P1 | SVG 表情头像 + 情绪映射 | **已完成** |
 | P1 | Next.js 前端 | **已完成** |
-| P2 | 记忆持久化（PostgreSQL + pgvector） | **已完成**（待 wiring） |
-| P2 | 语义记忆检索（向量数据库） | **已完成**（待 wiring） |
-| P2 | TTS 情绪语调适配 | **已完成**（待 wiring） |
-| P2 | 情绪日志记录 | **已完成**（待 wiring） |
-| P3 | Avatar 驱动协议 + 动作触发 + 控制器 | **已完成**（待 wiring） |
+| P2 | 记忆持久化（PostgreSQL + pgvector） | **已完成**（可选启用） |
+| P2 | 语义记忆检索（向量数据库） | **已完成**（可选启用） |
+| P2 | TTS 情绪语调适配 | **已完成** |
+| P2 | 情绪日志记录 | **已完成** |
+| P3 | Avatar 驱动协议 + 动作触发 + 控制器 | **已完成** |
 | P3 | 口型同步 | 未完成（需音素提取 + 前端 3D 渲染） |
-| P4 | JWT 认证 + 限流 | **已完成**（待 wiring） |
-| P4 | 结构化日志（pino） | **已完成**（待 wiring） |
+| P4 | JWT 认证 + 限流 | **已完成**（HTTP 限流可继续加强） |
+| P4 | 结构化日志（pino） | **已完成** |
 | P4 | Docker 容器化部署 | **已完成** |
 
-> **待 wiring**：模块代码已完成，需要集成到 `server/server.ts` 主管线中。
+> 主管线已拆分为 `server/gateway` / `session` / `pipeline`，多数模块已集成；细节见 [ARCHITECTURE.md](ARCHITECTURE.md)。体验与工程向的增量优化（重试、历史 token、情绪惯性、本地消息、**Edge TTS 连接池**、whisper 一次重试等）见 [OPTIMIZATION.md](OPTIMIZATION.md) 顶部 **「已完成优化」** 与 **「尚未完成」**。

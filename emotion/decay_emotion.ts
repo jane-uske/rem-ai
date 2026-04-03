@@ -1,29 +1,20 @@
-import type { Emotion } from "./emotion_state";
-import { getEmotion, setEmotion } from "./emotion_state";
+import type { EmotionRuntime } from "./emotion_runtime";
 import { EmotionLogger } from "../infra/emotion_logger";
 
 const emotionLogger = new EmotionLogger();
 
-const DECAY_MAP: Record<Emotion, Emotion> = {
-  happy: "neutral",
-  curious: "neutral",
-  shy: "neutral",
-  sad: "neutral",
-  neutral: "neutral",
-};
-
 /**
- * 回复后轻微回归 neutral。
+ * 回复后削弱情绪惯性；强度不足时回到 neutral。
  */
-export function decayEmotion(): void {
-  const current = getEmotion();
-  const next = DECAY_MAP[current];
-  if (next !== current) {
-    setEmotion(next);
+export function decayEmotion(runtime: EmotionRuntime): void {
+  const before = runtime.getEmotion();
+  runtime.weakenEmotionAfterReply();
+  const after = runtime.getEmotion();
+  if (before !== after) {
     emotionLogger.log({
-      userId: "dev",
-      fromEmotion: current,
-      toEmotion: next,
+      userId: runtime.connId,
+      fromEmotion: before,
+      toEmotion: after,
       trigger: "decay",
     });
   }

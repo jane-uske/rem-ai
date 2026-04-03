@@ -5,54 +5,49 @@
 
 import { complete, type ChatMessage } from "../llm/qwen_client";
 import { extractMemory } from "../memory/memory_agent";
+import type { MemoryRepository } from "../memory/memory_repository";
 import type { PromptMessage } from "../brain/prompt_builder";
 import { createLogger } from "../infra/logger";
-import {
-  addFact,
-  addInterest,
-  addPersonalityNote,
-  bumpRelationship,
-  touchTopic,
-  recordMood,
-  setConversationSummary,
-  setProactiveTopics,
-  synthesizeContext,
-} from "./slow_brain_store";
+import type { SlowBrainStore } from "./slow_brain_store";
 
 const logger = createLogger("slow_brain");
-
-export { synthesizeContext } from "./slow_brain_store";
 
 export interface SlowBrainInput {
   userMessage: string;
   assistantReply: string;
   history: PromptMessage[];
+  slowBrain: SlowBrainStore;
+  memoryRepo: MemoryRepository;
 }
 
 // ── Public API ──
 
 export async function runSlowBrain(input: SlowBrainInput): Promise<void> {
   const t0 = Date.now();
-  const { userMessage, assistantReply, history } = input;
+  const { userMessage, assistantReply, history, slowBrain, memoryRepo } =
+    input;
 
-  // Phase 1: fast local extraction (always runs, ~0ms)
-  extractMemory(userMessage);
-  localAnalysis(userMessage);
+  extractMemory(userMessage, memoryRepo);
+  localAnalysis(slowBrain, userMessage);
 
-  // Phase 2: LLM deep analysis (async, may take seconds)
   const configured =
     process.env.key && process.env.base_url && process.env.model;
 
   if (configured) {
     try {
-      await llmAnalysis(userMessage, assistantReply, history);
+      await llmAnalysis(
+        userMessage,
+        assistantReply,
+        history,
+        slowBrain,
+        memoryRepo,
+      );
     } catch (err) {
       logger.warn("LLM 分析失败，仅使用本地分析", { error: (err as Error).message });
     }
   }
 
-  // Phase 3: relationship bookkeeping
-  updateRelationship(userMessage);
+  updateRelationship(slowBrain, userMessage);
 
   logger.info("分析完成", { duration: Date.now() - t0 });
 }
@@ -80,21 +75,21 @@ const MOOD_KEYWORDS: { keywords: string[]; mood: string }[] = [
   { keywords: ["无聊", "没意思", "好闲"], mood: "无聊" },
 ];
 
-function localAnalysis(userMessage: string): void {
+function localAnalysis(store: SlowBrainStore, userMessage: string): void {
   for (const { pattern, topic } of TOPIC_PATTERNS) {
     if (pattern.test(userMessage)) {
       const sentiment = guessSentiment(userMessage);
-      touchTopic(topic, sentiment);
+      store.touchTopic(topic, sentiment);
     }
   }
 
   for (const { keywords, mood } of MOOD_KEYWORDS) {
     if (keywords.some((kw) => userMessage.includes(kw))) {
-      recordMood(mood);
+      store.recordMood(mood);
       return;
     }
   }
-  recordMood("平静");
+  store.recordMood("平静");
 }
 
 function guessSentiment(
@@ -145,6 +140,8 @@ async function llmAnalysis(
   userMessage: string,
   assistantReply: string,
   history: PromptMessage[],
+  store: SlowBrainStore,
+  memoryRepo: MemoryRepository,
 ): Promise<void> {
   const recentHistory = history.slice(-8);
   const historyText = recentHistory
@@ -165,41 +162,46 @@ async function llmAnalysis(
   const analysis = parseAnalysis(raw);
   if (!analysis) return;
 
-  // Apply extracted facts
   if (analysis.user_facts) {
     for (const { key, value } of analysis.user_facts) {
-      if (key && value) addFact(key, value);
+      if (!key || !value) continue;
+      const k = key.trim();
+      const v = value.trim();
+      store.addFact(k, v);
+      try {
+        await memoryRepo.upsert(
+          normalizeMemoryKey(k),
+          v,
+          0.55,
+        );
+      } catch (err) {
+        logger.warn("记忆同步失败", { key: k, error: (err as Error).message });
+      }
     }
   }
 
-  // Apply interests
   if (analysis.interests) {
     for (const interest of analysis.interests) {
-      if (interest) addInterest(interest);
+      if (interest) store.addInterest(interest);
     }
   }
 
-  // Apply personality note
   if (analysis.personality_note) {
-    addPersonalityNote(analysis.personality_note);
+    store.addPersonalityNote(analysis.personality_note);
   }
 
-  // Apply emotional undertone as mood
   if (analysis.emotional_undertone) {
-    recordMood(analysis.emotional_undertone);
+    store.recordMood(analysis.emotional_undertone);
   }
 
-  // Apply conversation summary
   if (analysis.conversation_summary) {
-    setConversationSummary(analysis.conversation_summary);
+    store.setConversationSummary(analysis.conversation_summary);
   }
 
-  // Apply proactive topics
   if (analysis.proactive_topics?.length) {
-    setProactiveTopics(analysis.proactive_topics);
+    store.setProactiveTopics(analysis.proactive_topics);
   }
 
-  // Apply relationship signal
   if (analysis.relationship_signal) {
     const delta =
       analysis.relationship_signal === "warming"
@@ -207,7 +209,7 @@ async function llmAnalysis(
         : analysis.relationship_signal === "cooling"
           ? -0.03
           : 0.01;
-    bumpRelationship({ emotionalBondDelta: delta });
+    store.bumpRelationship({ emotionalBondDelta: delta });
   }
 
   logger.debug("LLM 分析结果", {
@@ -228,19 +230,20 @@ function parseAnalysis(raw: string): LLMAnalysis | null {
 
 // ── Phase 3: Relationship bookkeeping ──
 
-function updateRelationship(userMessage: string): void {
-  // Every turn bumps familiarity slightly
-  bumpRelationship({ familiarityDelta: 0.02 });
+function normalizeMemoryKey(key: string): string {
+  return key.replace(/\s+/g, "").slice(0, 48);
+}
 
-  // Emotional sharing increases bond
+function updateRelationship(store: SlowBrainStore, userMessage: string): void {
+  store.bumpRelationship({ familiarityDelta: 0.02 });
+
   const emotionalSharing =
     /我(觉得|感到|心里|内心)|说实话|跟你说|其实/.test(userMessage);
   if (emotionalSharing) {
-    bumpRelationship({ emotionalBondDelta: 0.05 });
+    store.bumpRelationship({ emotionalBondDelta: 0.05 });
   }
 
-  // Personal stories increase bond
   if (/我(以前|之前|小时候|年轻|那时|曾经)/.test(userMessage)) {
-    bumpRelationship({ emotionalBondDelta: 0.03 });
+    store.bumpRelationship({ emotionalBondDelta: 0.03 });
   }
 }

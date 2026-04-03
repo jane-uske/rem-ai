@@ -11,6 +11,8 @@ export interface FastBrainInput {
   emotion: Emotion;
   memory: Memory[];
   history: PromptMessage[];
+  /** 由 Router 从 SlowBrainStore 注入 */
+  strategyHints?: string;
   slowBrainContext?: string;
   signal?: AbortSignal;
 }
@@ -22,21 +24,19 @@ export interface FastBrainInput {
 export async function* fastBrainStream(
   input: FastBrainInput,
 ): AsyncGenerator<string> {
+  const priorityParts = [input.strategyHints, input.slowBrainContext].filter(
+    (s): s is string => Boolean(s?.trim()),
+  );
+  const priorityContext =
+    priorityParts.length > 0 ? priorityParts.join("\n\n") : undefined;
+
   const messages = buildPrompt({
     memory: input.memory,
     emotion: input.emotion,
     history: input.history,
     userMessage: input.userMessage,
+    priorityContext,
   });
-
-  if (input.slowBrainContext) {
-    const sys = messages[0];
-    if (sys?.role === "system") {
-      sys.content +=
-        "\n\n── 以下是你对用户的长期观察和记忆，自然地融入对话中，不要逐条复述 ──\n" +
-        input.slowBrainContext;
-    }
-  }
 
   const configured =
     process.env.key && process.env.base_url && process.env.model;

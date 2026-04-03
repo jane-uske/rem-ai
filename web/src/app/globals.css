@@ -132,3 +132,33 @@ body {
 .rem-mic-pulse {
   animation: remMicPulse 1s ease-in-out infinite;
 }
+
+/* 思考气泡：轻微呼吸感 */
+@keyframes remThinking {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.88;
+  }
+}
+
+.rem-thinking-bubble {
+  animation: remThinking 2.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rem-msg-pop,
+  .rem-typing-dot,
+  .rem-mic-pulse,
+  .rem-thinking-bubble {
+    animation: none !important;
+  }
+
+  .rem-voice-bars[data-active="true"] .rem-voice-bar {
+    animation: none !important;
+    opacity: 1;
+    height: 18px;
+  }
+}

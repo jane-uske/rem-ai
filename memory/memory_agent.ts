@@ -1,7 +1,10 @@
-import { addMemory, getAllMemories, Memory } from "./memory_store";
+import type { MemoryRepository } from "./memory_repository";
+import type { Memory } from "./memory_store";
 import { createLogger } from "../infra/logger";
 
 const logger = createLogger("memory_agent");
+
+export type { Memory };
 
 interface MemoryPattern {
   pattern: RegExp;
@@ -36,7 +39,7 @@ function hasNegationBeforeMatch(msg: string, matchIndex: number): boolean {
   return NEGATION_WORDS.some((neg) => beforeMatch.includes(neg));
 }
 
-export function extractMemory(userMessage: string): void {
+export function extractMemory(userMessage: string, repo: MemoryRepository): void {
   for (const { pattern, key, isNegative } of PATTERNS) {
     const match = userMessage.match(pattern);
     if (match?.[0] && match?.[1]) {
@@ -45,13 +48,14 @@ export function extractMemory(userMessage: string): void {
       }
       const value = match[1].trim();
       if (value) {
-        addMemory(key, value);
+        void repo.upsert(key, value);
         logger.info("记住了", { key, value });
       }
     }
   }
 }
 
-export async function retrieveMemory(): Promise<Memory[]> {
-  return getAllMemories();
+export async function retrieveMemory(repo: MemoryRepository): Promise<Memory[]> {
+  const entries = await repo.getAll();
+  return entries.map(({ key, value }) => ({ key, value }));
 }

@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { withRetry } from "../utils/retry";
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
@@ -28,12 +29,16 @@ export async function complete(
   const model = process.env.model;
   if (!model) throw new Error("LLM 未配置：缺少 model");
 
-  const res = await openai.chat.completions.create({
-    model,
-    messages,
-    temperature: 0.3,
-    max_tokens: maxTokens,
-  });
+  const res = await withRetry(
+    () =>
+      openai.chat.completions.create({
+        model,
+        messages,
+        temperature: 0.3,
+        max_tokens: maxTokens,
+      }),
+    { retries: 1, label: "complete" },
+  );
 
   const raw = res.choices?.[0]?.message?.content ?? "";
   return raw.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
@@ -51,13 +56,17 @@ export async function* streamTokens(
   const model = process.env.model;
   if (!model) throw new Error("LLM 未配置：缺少 model");
 
-  const stream = await (openai.chat.completions.create as Function)({
-    model,
-    messages,
-    temperature: 0.7,
-    max_tokens: 1024,
-    stream: true,
-  });
+  const stream = (await withRetry(
+    () =>
+      (openai.chat.completions.create as Function)({
+        model,
+        messages,
+        temperature: 0.7,
+        max_tokens: 1024,
+        stream: true,
+      }),
+    { retries: 1, label: "streamTokens" },
+  )) as AsyncIterable<{ choices?: { delta?: { content?: string } }[] }>;
 
   let inThink = false;
   let buf = "";
@@ -65,7 +74,7 @@ export async function* streamTokens(
   for await (const chunk of stream) {
     if (signal?.aborted) break;
 
-    const text = (chunk as any).choices?.[0]?.delta?.content;
+    const text = chunk.choices?.[0]?.delta?.content;
     if (!text) continue;
 
     buf += text;
