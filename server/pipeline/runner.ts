@@ -50,7 +50,7 @@ export async function runPipeline(
 
     const chunker = new SentenceChunker();
     let full = "";
-    let ttsChain = Promise.resolve();
+    const pendingSentences: string[] = [];
 
     for await (const token of chatStream(text, signal)) {
       if (signal.aborted) break;
@@ -59,25 +59,18 @@ export async function runPipeline(
       send(ws, { type: "chat_chunk", content: token });
 
       for (const sentence of chunker.push(token)) {
-        const s = sentence;
-        ttsChain = ttsChain.then(() => {
-          if (signal.aborted) return;
-          ic.markSpeaking();
-          return ttsSend(ws, s, signal, replyEmotion);
-        });
+        pendingSentences.push(sentence);
       }
     }
 
     if (!signal.aborted) {
       const last = chunker.flush();
       if (last) {
-        ttsChain = ttsChain.then(() => {
-          if (signal.aborted) return;
-          return ttsSend(ws, last, signal, replyEmotion);
-        });
+        pendingSentences.push(last);
       }
     } else {
       chunker.reset();
+      pendingSentences.length = 0;
     }
 
     // Always send chat_end so the client can finalise the message bubble
@@ -97,7 +90,7 @@ export async function runPipeline(
     }
 
     // Avatar actions from reply
-    if (full) {
+    if (full && !signal.aborted) {
       const actionFrames = avatar.processReply(full);
       for (const frame of actionFrames) {
         send(ws, { type: "avatar_frame", frame });
@@ -112,11 +105,24 @@ export async function runPipeline(
     }
     decayEmotion();
 
-    ttsChain.catch((err) => {
-      if ((err as Error).name !== "AbortError") {
-        logger.warn("[TTS bg]", { error: (err as Error).message, connId });
+    // Process TTS sentences sequentially, checking abort before each step
+    for (const sentence of pendingSentences) {
+      if (signal.aborted) {
+        logger.debug("[TTS] Aborted, skipping remaining sentences", { connId });
+        break;
       }
-    });
+      try {
+        ic.markSpeaking();
+        await ttsSend(ws, sentence, signal, replyEmotion);
+      } catch (err) {
+        if ((err as Error).name !== "AbortError") {
+          logger.warn("[TTS]", { error: (err as Error).message, connId });
+        } else {
+          logger.debug("[TTS] Aborted during synthesis", { connId });
+          break;
+        }
+      }
+    }
   } catch (err) {
     if ((err as Error).name !== "AbortError") {
       logger.error("[错误]", { error: err, connId });
