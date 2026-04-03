@@ -72,7 +72,7 @@
 - [x] **T-016** 实现对话历史持久化
   - `storage/repositories/message_repository.ts`：saveMessage / getSessionMessages
   - `storage/repositories/session_repository.ts`：createSession / endSession / getSession
-  - 待集成到 server/server.ts（需要 wiring）
+  - 已集成到 server/server.ts
 
 ## Phase 4 · 记忆系统
 
@@ -95,6 +95,7 @@
   - `memory/memory_decay.ts`：decayScore（重要性 × 访问频率 × 时间衰减）
   - runDecay：超出上限淘汰低分条目 + 清理极低分条目
   - startDecayTimer / stopDecayTimer 定时任务
+  - 已集成到 server/server.ts
 
 ## Phase 5 · 情绪系统
 
@@ -110,7 +111,7 @@
 - [x] **T-025** 情绪日志记录
   - `infra/emotion_logger.ts`：EmotionLogger 环形缓冲区（1000 条）
   - log / getHistory / getStats / exportEntries
-  - 待集成到 emotion_engine.ts
+  - 已集成到 emotion/emotion_engine.ts
 
 ## Phase 6 · 语音模块
 
@@ -130,6 +131,7 @@
   - Piper：情绪状态 → length_scale + noise_scale
   - OpenAI：情绪状态 → speed
   - `voice/tts_stream.ts`：synthesize 支持 emotion 参数透传
+  - 已集成到 server/server.ts
 
 - [x] **T-029.1** 实现管线打断控制
   - `voice/interrupt_controller.ts`：AbortSignal + 状态机
@@ -154,7 +156,7 @@
 - [x] **T-034** Avatar 控制器
   - `avatar/avatar_controller.ts`：AvatarController 类
   - setEmotion（平滑过渡帧）/ processReply（动作检测）/ getFrame
-  - 待集成到 server.ts 管线中
+  - 已集成到 server/server.ts
 
 ## Phase 8 · 前端
 
@@ -180,12 +182,12 @@
   - `infra/auth.ts`：JWT 中间件 + generateToken / verifyToken / wsAuthenticateOnce
   - `infra/rate_limiter.ts`：HTTP 限流（100/min per IP）+ WebSocket 限流（30/10s per conn）
   - 开发模式自动跳过认证
-  - 待集成到 server.ts
+  - WebSocket 限流已集成到 server/server.ts
 
 - [x] **T-038** 错误处理与日志系统
   - `infra/logger.ts`：pino 结构化日志，开发模式 pretty-print
   - createLogger(module) 创建子日志器
-  - 待替换 server.ts 中的 console.log
+  - 已集成到 server/server.ts，替换 console.log
 
 - [x] **T-039** Docker 容器化部署
   - `Dockerfile`：多阶段构建（backend-build → frontend-build → production）
@@ -198,9 +200,9 @@
 
 | 状态 | 数量 |
 |------|------|
-| ✅ 已完成 | 37 |
+| ✅ 已完成 | 38 |
 | ⬜ 未完成 | 1 |
-| **总计** | **38** |
+| **总计** | **39** |
 
 **完成率：97%**
 
@@ -210,15 +212,36 @@
 |------|------|------|
 | T-032 口型同步 | 需要音素提取 + 前端 3D 渲染引擎 | Live2D SDK 或 Three.js + VRM |
 
-### 待集成（模块已完成，需 wiring 到主管线）
+### 已完成集成（Phase 1 + Phase 2）
 
-| 模块 | 集成点 | 说明 |
-|------|--------|------|
-| Storage | `server/server.ts` | initDatabase/initRedis 启动时调用，消息持久化 |
-| Memory Decay | `server/server.ts` | startDecayTimer 启动时调用 |
-| Emotion Logger | `emotion/emotion_engine.ts` | EmotionLogger.log 在状态变化时调用 |
-| Auth | `server/server.ts` | authMiddleware + wsAuthenticateOnce |
-| Rate Limiter | `server/server.ts` | createRateLimiter + createWsRateLimiter |
-| Logger | 全局 | 替换 console.log 为结构化日志 |
-| TTS Emotion | `server/server.ts` | synthesize 调用时传入 emotion 参数 |
-| Avatar Controller | `server/server.ts` | 管线中生成 AvatarFrame 并推送 |
+| 模块 | 状态 |
+|------|------|
+| Logger 结构化日志 | ✅ 已集成 |
+| Emotion Logger | ✅ 已集成 |
+| TTS Emotion 情绪语调 | ✅ 已集成 |
+| Memory Decay 定时任务 | ✅ 已集成 |
+| Storage (PostgreSQL + Redis) | ✅ 已集成（可选，环境变量配置时启用）|
+| Avatar Controller | ✅ 已集成 |
+| WebSocket Rate Limiter | ✅ 已集成 |
+| Server 重构 | ✅ 已拆分为 gateway/session/pipeline |
+
+### Server 重构（Phase 2）
+
+`server/server.ts` 已重构为更小的模块，每个文件 ≤ 500 行：
+
+```
+server/
+├── server.ts                    # 入口文件 (~80 行)
+├── gateway/
+│   ├── index.ts                 # HTTP + WebSocket 网关
+│   └── types.ts                 # ServerMessage 类型
+├── session/
+│   ├── index.ts                 # ConnectionSession 类
+│   └── types.ts                 # 会话状态类型
+└── pipeline/
+    ├── index.ts                 # runPipeline 导出
+    ├── runner.ts                # 管线执行逻辑
+    └── types.ts                 # 管线类型
+```
+
+新增 `PIPELINE.md` 文档，描述完整数据流。
