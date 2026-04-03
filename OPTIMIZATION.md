@@ -1,5 +1,20 @@
 # Rem AI — 系统架构分析、优化点与提升方案
 
+## 已完成优化 (2026-04-03)
+
+| 任务 | 说明 | Commit |
+|------|------|--------|
+| S1 | 修复 fast_brain.ts 中 AbortSignal 未传递给 streamTokens | d44b5e4 |
+| S2 | 修复 brain_router.ts 中重复调用 updateEmotion | d44b5e4 |
+| S3 | 统一 console.log → pino logger (6 个文件) | d44b5e4 |
+| S4 | ServerMessage.type 改为严格联合类型 | d44b5e4 |
+| S5 | emotion_engine.ts 增加否定词前缀检测 | d44b5e4 |
+| S6 | memory_agent.ts 扩展正则规则集 | d44b5e4 |
+| S7 | SentenceChunker 增加字数阈值强制输出 | d44b5e4 |
+| S8 | 丰富 personality.ts 和 character_rules.ts 内容 | d44b5e4 |
+
+---
+
 ## 一、系统架构总览
 
 ```
@@ -137,7 +152,7 @@ class ConnectionSession {
 **现状问题：**
 
 `emotion_engine.ts` 纯关键词匹配，存在严重缺陷：
-- "我不喜欢你" 命中 "喜欢你" → 误判为 happy
+- "我不喜欢你" 命中 "喜欢你" → 误判为 happy ✅ (已修复)
 - "你为什么这么厉害" 命中 "为什么" → curious，但实际是赞美
 - "笑死了，这也太糟糕了" 命中 "笑死" → happy，但实际可能是讽刺/无奈
 - 无法识别复合情绪 ("开心但有点担心")
@@ -145,8 +160,8 @@ class ConnectionSession {
 
 **优化方案（分两步）：**
 
-**Step 1 (🟢S)** — 改进规则引擎：
-- 增加否定前缀检查 (`不|没有|别|不要` + 正面词 → 反转)
+**Step 1 (🟢S)** — 改进规则引擎：✅ 已完成
+- ✅ 增加否定前缀检查 (`不|没有|别|不要` + 正面词 → 反转)
 - 支持情绪强度 (intensity: 0-1)，不再每次立即 decay
 - 增加情绪惯性：相同情绪连续触发时增加持续轮次
 
@@ -155,6 +170,8 @@ class ConnectionSession {
 - 或在 Fast Brain 的 system prompt 中要求输出情绪标签，从回复首 token 解析
 
 **涉及文件：** `emotion/emotion_engine.ts`, `emotion/emotion_state.ts`
+
+**状态：** Step 1 ✅ 已完成 (Commit d44b5e4)
 
 ---
 
@@ -172,17 +189,18 @@ const PATTERNS = [
 ];
 ```
 
-- "我叫小明，在北京上班" → 只能提取名字，丢失工作地点
-- "我有一只猫叫咪咪" → 完全无法提取
-- "我每天六点起床" → 无法提取日常习惯
-- "我不喜欢吃辣" → 提取为 "喜好: 吃辣"（丢失否定）
+- "我叫小明，在北京上班" → 只能提取名字，丢失工作地点 ✅ (已扩展)
+- "我有一只猫叫咪咪" → 完全无法提取 ✅ (已支持)
+- "我每天六点起床" → 无法提取日常习惯 ✅ (已支持)
+- "我不喜欢吃辣" → 提取为 "喜好: 吃辣"（丢失否定）✅ (已支持)
 
 **优化方案：**
 
-**Step 1 (🟢S)** — 扩展正则规则集：
-- 增加否定句处理 (`不喜欢` → `不喜好`)
-- 增加宠物、习惯、家人等维度
-- 增加关联提取（一句话多个信息）
+**Step 1 (🟢S)** — 扩展正则规则集：✅ 已完成
+- ✅ 增加否定句处理 (`不喜欢` → `不喜好`)
+- ✅ 增加宠物、习惯、家人、故乡、专业、学校等维度
+- ✅ 增加否定词检测，避免在否定句中提取正面信息
+- ✅ 增加关联提取（一句话多个信息）
 
 **Step 2 (🟡M)** — 利用 Slow Brain 现有分析补充：
 - `slow_brain.ts` 已经有 LLM 分析提取 `user_facts`，但结果只存在 `slow_brain_store` 中
@@ -190,9 +208,11 @@ const PATTERNS = [
 
 **涉及文件：** `memory/memory_agent.ts`, `brains/slow_brain.ts`, `brains/slow_brain_store.ts`
 
+**状态：** Step 1 ✅ 已完成 (Commit d44b5e4)
+
 ---
 
-### 3.4 AbortSignal 未透传到 LLM 调用 🟢S
+### 3.4 AbortSignal 未透传到 LLM 调用 🟢S ✅ 已完成
 
 **现状问题：**
 
@@ -216,18 +236,20 @@ for await (const token of streamTokens(messages, input.signal)) {
 
 **涉及文件：** `brains/fast_brain.ts`
 
+**状态：** ✅ 已完成 (Commit d44b5e4)
+
 ---
 
 ### 3.5 对话体验不够自然 🔴C
 
 **现状问题：**
 
-1. **人设过于简单：**
+1. **人设过于简单：** ✅ (已丰富)
    ```typescript
-   // personality.ts — 仅 4 个特质词
+   // personality.ts — 仅 4 个特质词 → 已扩展为 8 个
    REM_PERSONALITY_TRAITS = ["温柔", "稍微害羞", "关心用户", "说话自然"];
-   
-   // character_rules.ts — 仅 4 条规则
+
+   // character_rules.ts — 仅 4 条规则 → 已扩展为 10 条
    CHARACTER_RULES = ["句子不要太长", "不要像客服", "语气自然", "会主动提问"];
    ```
    缺乏具体行为指导，LLM 容易回到通用对话模式。
@@ -245,7 +267,7 @@ for await (const token of streamTokens(messages, input.signal)) {
 
 **优化方案：**
 
-**Step 1 (🟢S)** — 丰富人设和规则：
+**Step 1 (🟢S)** — 丰富人设和规则：✅ 已完成
 
 ```typescript
 // 更具体的行为规则
@@ -284,6 +306,8 @@ interface ConversationStrategy {
 - 0.8-1.0 (默契)：简短但懂你，有专属互动模式
 
 **涉及文件：** `brain/personality.ts`, `brain/character_rules.ts`, `brain/prompt_builder.ts`, `brains/slow_brain_store.ts`
+
+**状态：** Step 1 ✅ 已完成 (Commit d44b5e4)
 
 ---
 
@@ -352,7 +376,7 @@ async function synthesizeWithCache(text: string, emotion: Emotion): Promise<Buff
 
 ---
 
-### 3.8 Pipeline 中 Emotion 被调用两次 🟢S
+### 3.8 Pipeline 中 Emotion 被调用两次 🟢S ✅ 已完成
 
 **现状问题：**
 
@@ -366,13 +390,15 @@ const replyEmotion = updateEmotion(text);
 const emotion = updateEmotion(userMessage);
 ```
 
-**修复：** 移除 `brain_router.ts` 中的 `updateEmotion` 调用，或让 router 接收 emotion 参数而非自行计算。
+**修复：** 移除 `brain_router.ts` 中的 `updateEmotion` 调用，让 router 接收 emotion 参数而非自行计算。
 
-**涉及文件：** `brains/brain_router.ts`, `server/pipeline/runner.ts`
+**涉及文件：** `brains/brain_router.ts`, `server/pipeline/runner.ts`, `agents/conversation_agent.ts`
+
+**状态：** ✅ 已完成 (Commit d44b5e4)
 
 ---
 
-### 3.9 console.log 与结构化日志混用 🟢S
+### 3.9 console.log 与结构化日志混用 🟢S ✅ 已完成
 
 **现状问题：**
 
@@ -393,9 +419,11 @@ console.log(`[memory] 记住了：${key} = ${value}`);
 console.log(`[emotion] ${currentEmotion} → ${emotion}`);
 ```
 
-**修复：** 统一替换为 `createLogger("module_name")` 调用。
+**修复：** 统一替换为 `createLogger("module_name")` 调用。✅ 已完成
 
 **涉及文件：** `brains/slow_brain.ts`, `brains/fast_brain.ts`, `memory/memory_agent.ts`, `emotion/emotion_state.ts`, `memory/memory_decay.ts`, `voice/tts.ts`
+
+**状态：** ✅ 已完成 (Commit d44b5e4)
 
 ---
 
@@ -421,8 +449,8 @@ VAD speech_end                    0ms
 
 **优化方案：**
 
-**Step 1 (🟢S)** — 更激进的 Eager 模式：
-- 当前 SentenceChunker eager 模式在逗号处断句，可以加一个 char count 阈值
+**Step 1 (🟢S)** — 更激进的 Eager 模式：✅ 已完成
+- ✅ 当前 SentenceChunker eager 模式在逗号处断句，增加 char count 阈值 (20 字)
 - 达到 15-20 字没遇到任何标点也强制输出，避免 LLM 生成长句时等太久
 
 **Step 2 (🟡M)** — 预测性回应：
@@ -435,6 +463,8 @@ VAD speech_end                    0ms
 - 使用 streaming STT 时，可以在 partial 结果上提前开始 LLM 推理（投机执行）
 
 **涉及文件：** `utils/sentence_chunker.ts`, `server/pipeline/runner.ts`, `server/session/index.ts`
+
+**状态：** Step 1 ✅ 已完成 (Commit d44b5e4)
 
 ---
 
@@ -495,7 +525,7 @@ Slow Brain 已经在做深度分析（话题识别、情绪倾向、关系信号
 
 ---
 
-### 3.13 ServerMessage 类型不严格 🟢S
+### 3.13 ServerMessage 类型不严格 🟢S ✅ 已完成
 
 **现状问题：**
 
@@ -512,7 +542,7 @@ export interface ServerMessage {
 
 `type` 是宽泛的 string，无法在编译期检查消息类型的正确性。
 
-**修复：**
+**修复：** ✅ 已完成
 
 ```typescript
 type ServerMessageType =
@@ -527,6 +557,8 @@ interface ServerMessage {
 ```
 
 **涉及文件：** `server/gateway/types.ts`
+
+**状态：** ✅ 已完成 (Commit d44b5e4)
 
 ---
 
@@ -590,18 +622,18 @@ async function withRetry<T>(fn: () => Promise<T>, retries = 2, delay = 500): Pro
 
 ### 🟢 简单任务 (适合快速模型)
 
-| # | 任务 | 文件 | 预计耗时 |
-|---|------|------|---------|
-| S1 | 修复 `fast_brain.ts` 中 AbortSignal 未传递给 `streamTokens` | `brains/fast_brain.ts` | 5 min |
-| S2 | 修复 `brain_router.ts` 中重复调用 `updateEmotion` | `brains/brain_router.ts` | 10 min |
-| S3 | 统一 console.log → pino logger (6 个文件) | 多文件 | 15 min |
-| S4 | `ServerMessage.type` 改为联合类型 | `server/gateway/types.ts` | 5 min |
-| S5 | `emotion_engine.ts` 增加否定词前缀检测 | `emotion/emotion_engine.ts` | 15 min |
-| S6 | `memory_agent.ts` 扩展正则规则集 | `memory/memory_agent.ts` | 20 min |
-| S7 | `SentenceChunker` 增加字数阈值强制输出 | `utils/sentence_chunker.ts` | 10 min |
-| S8 | 丰富 `personality.ts` 和 `character_rules.ts` 内容 | `brain/personality.ts`, `brain/character_rules.ts` | 15 min |
-| S9 | 前端增加 "思考中" 状态提示 | `web/src/hooks/useRemChat.ts` | 10 min |
-| S10 | TTS 短句缓存 | `voice/tts.ts` | 15 min |
+| # | 任务 | 文件 | 预计耗时 | 状态 |
+|---|------|------|---------|------|
+| S1 | 修复 `fast_brain.ts` 中 AbortSignal 未传递给 `streamTokens` | `brains/fast_brain.ts` | 5 min | ✅ 已完成 |
+| S2 | 修复 `brain_router.ts` 中重复调用 `updateEmotion` | `brains/brain_router.ts`, `agents/conversation_agent.ts` | 10 min | ✅ 已完成 |
+| S3 | 统一 console.log → pino logger (6 个文件) | 多文件 | 15 min | ✅ 已完成 |
+| S4 | `ServerMessage.type` 改为联合类型 | `server/gateway/types.ts` | 5 min | ✅ 已完成 |
+| S5 | `emotion_engine.ts` 增加否定词前缀检测 | `emotion/emotion_engine.ts` | 15 min | ✅ 已完成 |
+| S6 | `memory_agent.ts` 扩展正则规则集 | `memory/memory_agent.ts` | 20 min | ✅ 已完成 |
+| S7 | `SentenceChunker` 增加字数阈值强制输出 | `utils/sentence_chunker.ts` | 10 min | ✅ 已完成 |
+| S8 | 丰富 `personality.ts` 和 `character_rules.ts` 内容 | `brain/personality.ts`, `brain/character_rules.ts` | 15 min | ✅ 已完成 |
+| S9 | 前端增加 "思考中" 状态提示 | `web/src/hooks/useRemChat.ts` | 10 min | ⬜ 待处理 |
+| S10 | TTS 短句缓存 | `voice/tts.ts` | 15 min | ⬜ 待处理 |
 
 ### 🟡 中等任务 (需要上下文理解)
 
