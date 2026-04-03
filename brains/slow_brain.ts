@@ -6,6 +6,7 @@
 import { complete, type ChatMessage } from "../llm/qwen_client";
 import { extractMemory } from "../memory/memory_agent";
 import type { PromptMessage } from "../brain/prompt_builder";
+import { createLogger } from "../infra/logger";
 import {
   addFact,
   addInterest,
@@ -17,6 +18,8 @@ import {
   setProactiveTopics,
   synthesizeContext,
 } from "./slow_brain_store";
+
+const logger = createLogger("slow_brain");
 
 export { synthesizeContext } from "./slow_brain_store";
 
@@ -44,17 +47,14 @@ export async function runSlowBrain(input: SlowBrainInput): Promise<void> {
     try {
       await llmAnalysis(userMessage, assistantReply, history);
     } catch (err) {
-      console.warn(
-        "[slow_brain] LLM 分析失败，仅使用本地分析:",
-        (err as Error).message,
-      );
+      logger.warn("LLM 分析失败，仅使用本地分析", { error: (err as Error).message });
     }
   }
 
   // Phase 3: relationship bookkeeping
   updateRelationship(userMessage);
 
-  console.log(`[slow_brain] 分析完成 (${Date.now() - t0}ms)`);
+  logger.info("分析完成", { duration: Date.now() - t0 });
 }
 
 // ── Phase 1: Local heuristics (zero-cost) ──
@@ -210,10 +210,9 @@ async function llmAnalysis(
     bumpRelationship({ emotionalBondDelta: delta });
   }
 
-  console.log(
-    "[slow_brain] LLM 分析结果:",
-    JSON.stringify(analysis, null, 0).slice(0, 200),
-  );
+  logger.debug("LLM 分析结果", {
+    analysis: JSON.stringify(analysis, null, 0).slice(0, 200),
+  });
 }
 
 function parseAnalysis(raw: string): LLMAnalysis | null {
@@ -222,7 +221,7 @@ function parseAnalysis(raw: string): LLMAnalysis | null {
     if (!jsonMatch) return null;
     return JSON.parse(jsonMatch[0]) as LLMAnalysis;
   } catch {
-    console.warn("[slow_brain] JSON 解析失败:", raw.slice(0, 100));
+    logger.warn("JSON 解析失败", { raw: raw.slice(0, 100) });
     return null;
   }
 }

@@ -2,30 +2,28 @@ import type { MemoryEntry, MemoryRepository } from "../../memory/memory_reposito
 import {
   upsertMemory,
   getUserMemories,
+  getMemoryByKey,
   touchMemory,
-  deleteMemory,
+  deleteMemoryByKey,
 } from "./memory_repository";
 import { createLogger } from "../../infra/logger";
 
 const logger = createLogger("pg-memory-repo");
 
-/**
- * PostgreSQL-backed MemoryRepository implementation.
- * Wraps the storage/repositories/memory_repository.ts functions
- * to match the MemoryRepository interface.
- */
 export class PgMemoryRepository implements MemoryRepository {
-  private userId: string;
+  private readonly _userId: string;
 
   constructor(userId: string = "dev") {
-    this.userId = userId;
+    this._userId = userId;
   }
 
-  async upsert(key: string, value: string, importance?: number): Promise<void> {
+  get userId(): string {
+    return this._userId;
+  }
+
+  async upsert(key: string, value: string, _importance?: number): Promise<void> {
     try {
-      // Note: Our current pg schema doesn't support passing importance yet,
-      // it defaults to 1.0. This is okay for now.
-      await upsertMemory(this.userId, key, value);
+      await upsertMemory(this._userId, key, value);
       logger.debug("[Memory] upserted", { key, value: value.slice(0, 50) });
     } catch (err) {
       logger.warn("[Memory] upsert failed", { key, error: err });
@@ -35,12 +33,12 @@ export class PgMemoryRepository implements MemoryRepository {
 
   async getAll(): Promise<MemoryEntry[]> {
     try {
-      const dbMemories = await getUserMemories(this.userId);
-      return dbMemories.map((m) => ({
+      const rows = await getUserMemories(this._userId);
+      return rows.map((m) => ({
         key: m.key,
         value: m.value,
         importance: m.importance,
-        accessCount: 0, // Not tracked in pg schema yet
+        accessCount: 0,
         createdAt: m.created_at.getTime(),
         lastAccessedAt: m.last_accessed_at.getTime(),
       }));
@@ -52,9 +50,16 @@ export class PgMemoryRepository implements MemoryRepository {
 
   async getByKey(key: string): Promise<MemoryEntry | null> {
     try {
-      const all = await this.getAll();
-      const found = all.find((m) => m.key === key);
-      return found || null;
+      const row = await getMemoryByKey(this._userId, key);
+      if (!row) return null;
+      return {
+        key: row.key,
+        value: row.value,
+        importance: row.importance,
+        accessCount: 0,
+        createdAt: row.created_at.getTime(),
+        lastAccessedAt: row.last_accessed_at.getTime(),
+      };
     } catch (err) {
       logger.warn("[Memory] getByKey failed", { key, error: err });
       throw err;
@@ -63,14 +68,8 @@ export class PgMemoryRepository implements MemoryRepository {
 
   async delete(key: string): Promise<void> {
     try {
-      const all = await this.getAll();
-      const found = all.find((m) => m.key === key);
-      if (found) {
-        // Note: Our pg memory repo doesn't have delete by key, only by id.
-        // This is a limitation - we'd need to add that function.
-        // For now, just log a warning.
-        logger.warn("[Memory] delete not fully implemented for pg");
-      }
+      await deleteMemoryByKey(this._userId, key);
+      logger.debug("[Memory] deleted", { key });
     } catch (err) {
       logger.warn("[Memory] delete failed", { key, error: err });
       throw err;
@@ -79,12 +78,10 @@ export class PgMemoryRepository implements MemoryRepository {
 
   async touch(key: string): Promise<void> {
     try {
-      const all = await this.getAll();
-      const found = all.find((m) => m.key === key);
-      if (found) {
-        // We need the DB id to touch - our current schema doesn't expose this
-        // from getUserMemories(). For now, this is a no-op with a warning.
-        logger.debug("[Memory] touch not fully implemented for pg", { key });
+      const row = await getMemoryByKey(this._userId, key);
+      if (row) {
+        await touchMemory(row.id);
+        logger.debug("[Memory] touched", { key });
       }
     } catch (err) {
       logger.warn("[Memory] touch failed", { key, error: err });
@@ -97,8 +94,7 @@ export class PgMemoryRepository implements MemoryRepository {
       const all = await this.getAll();
       const now = Date.now();
       return all.filter(
-        (e) =>
-          now - e.lastAccessedAt > maxAge && e.importance < minImportance,
+        (e) => now - e.lastAccessedAt > maxAge && e.importance < minImportance,
       );
     } catch (err) {
       logger.warn("[Memory] getStale failed", { error: err });
@@ -110,7 +106,7 @@ export class PgMemoryRepository implements MemoryRepository {
 let pgRepoInstance: PgMemoryRepository | null = null;
 
 export function getPgMemoryRepository(userId: string = "dev"): PgMemoryRepository {
-  if (!pgRepoInstance || pgRepoInstance["userId"] !== userId) {
+  if (!pgRepoInstance || pgRepoInstance.userId !== userId) {
     pgRepoInstance = new PgMemoryRepository(userId);
   }
   return pgRepoInstance;

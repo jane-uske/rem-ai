@@ -4,8 +4,8 @@
   "description": "这是 Rem AI 项目。",
   "main": "dist/server/server.js",
   "scripts": {
-    "dev": "ts-node server/server.ts",
-    "restart": "lsof -i :3000 -t | xargs kill 2>/dev/null; sleep 1; ts-node server/server.ts",
+    "dev": "nodemon --watch server --exec ts-node server/server.ts",
+    "restart": "lsof -i :3000 -t | xargs kill 2>/dev/null; sleep 1; nodemon --watch server --exec ts-node server/server.ts",
     "build": "npm run build --prefix web && tsc",
     "start": "NODE_ENV=production node dist/server/server.js",
     "web:dev": "npm run dev --prefix web",

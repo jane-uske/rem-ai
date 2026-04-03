@@ -7,18 +7,13 @@ import { VadDetector } from "../../voice/vad_detector";
 import { InterruptController } from "../../voice/interrupt_controller";
 import { AvatarController } from "../../avatar/avatar_controller";
 import { createLogger } from "../../infra/logger";
+import { isDbReady } from "../../infra/app_state";
+import { getLatencyTracer, removeLatencyTracer } from "../../infra/latency_tracer";
 import { createSession as createDbSession, endSession } from "../../storage/repositories/session_repository";
 import { runPipeline } from "../pipeline";
-import { send } from "../gateway";
+import { send, getWsRateLimiter } from "../gateway";
 
 const logger = createLogger("session");
-
-// Global state for optional storage
-let dbReady = false;
-
-export function setDbReady(ready: boolean): void {
-  dbReady = ready;
-}
 
 export class ConnectionSession {
   readonly connId: string;
@@ -32,6 +27,7 @@ export class ConnectionSession {
   pipelineChain: Promise<void> = Promise.resolve();
   duplexActive: boolean = false;
   speechBuffer: Buffer[] = [];
+  private speechBufferBytes: number = 0;
 
   constructor(ws: WebSocket) {
     this.connId = randomUUID();
@@ -40,13 +36,16 @@ export class ConnectionSession {
     this.vad = new VadDetector();
     this.interrupt = new InterruptController();
     this.avatar = new AvatarController();
+
+    this.setupVadEvents();
+    this.setupMessageHandlers();
+    this.setupCloseHandlers();
   }
 
-  async initialize(): Promise<void> {
+  async initializeAsync(): Promise<void> {
     logger.info("[Rem] 新客户端已连接", { connId: this.connId });
 
-    // Create DB session if available
-    if (dbReady) {
+    if (isDbReady()) {
       try {
         const sess = await createDbSession("dev");
         this.sessionId = sess.id;
@@ -55,15 +54,24 @@ export class ConnectionSession {
         logger.warn("[Storage] Failed to create session", { error: err });
       }
     }
+  }
 
-    this.setupVadEvents();
-    this.setupMessageHandlers();
-    this.setupCloseHandlers();
+  private pushSpeechChunk(chunk: Buffer): void {
+    this.speechBuffer.push(chunk);
+    this.speechBufferBytes += chunk.length;
+  }
+
+  private clearSpeechBuffer(): void {
+    this.speechBuffer = [];
+    this.speechBufferBytes = 0;
   }
 
   private setupVadEvents(): void {
     this.vad.on("speech_start", () => {
       logger.info("[VAD] speech_start", { connId: this.connId });
+      const tracer = getLatencyTracer(this.connId);
+      tracer.reset();
+      tracer.mark("vad_speech_start");
 
       if (this.interrupt.active) {
         this.interrupt.interrupt();
@@ -72,24 +80,35 @@ export class ConnectionSession {
       }
 
       this.stt.cancelPcm();
-      this.speechBuffer = [];
+      this.clearSpeechBuffer();
       send(this.ws, { type: "vad_start" });
     });
 
     this.vad.on("speech_end", () => {
       logger.info("[VAD] speech_end", { connId: this.connId });
+      getLatencyTracer(this.connId).mark("vad_speech_end");
       send(this.ws, { type: "vad_end" });
+
+      const MIN_SPEECH_MS = 400;
+      const speechDurationMs = (this.speechBufferBytes / 2 / 16000) * 1000;
+      if (speechDurationMs < MIN_SPEECH_MS) {
+        logger.info(`[VAD] speech too short (${speechDurationMs.toFixed(0)}ms < ${MIN_SPEECH_MS}ms), discarding`, { connId: this.connId });
+        this.clearSpeechBuffer();
+        this.stt.cancelPcm();
+        return;
+      }
 
       for (const chunk of this.speechBuffer) {
         this.stt.feedPcm(chunk);
       }
-      this.speechBuffer = [];
+      this.clearSpeechBuffer();
 
       this.pipelineChain = this.pipelineChain
         .then(async () => {
           try {
             const text = await this.stt.endPcm();
             if (!text) return;
+            getLatencyTracer(this.connId).mark("stt_final");
             send(this.ws, { type: "stt_final", content: text });
             logger.info(`[用户·语音] ${text}`, { connId: this.connId });
             await runPipeline(this.ws, text, this.interrupt, this.avatar, this.sessionId, this.connId);
@@ -109,6 +128,15 @@ export class ConnectionSession {
         data = JSON.parse(raw.toString());
       } catch {
         data = { type: "chat", content: raw.toString() };
+      }
+
+      const isAudioMsg = data.type === "audio_stream" || data.type === "audio_chunk";
+      if (!isAudioMsg) {
+        const limiter = getWsRateLimiter();
+        if (limiter && !limiter.check(this.connId)) {
+          send(this.ws, { type: "error", content: "消息频率过高，请稍后再试" });
+          return;
+        }
       }
 
       switch (data.type) {
@@ -140,7 +168,7 @@ export class ConnectionSession {
     this.stt.setSampleRate(rate);
     this.vad.reset();
     this.stt.reset();
-    this.speechBuffer = [];
+    this.clearSpeechBuffer();
     logger.info(`[Duplex] 已启动`, { connId: this.connId, sampleRate: rate });
   }
 
@@ -150,13 +178,14 @@ export class ConnectionSession {
 
     if (this.speechBuffer.length > 0) {
       for (const chunk of this.speechBuffer) this.stt.feedPcm(chunk);
-      this.speechBuffer = [];
+      this.clearSpeechBuffer();
 
       this.pipelineChain = this.pipelineChain
         .then(async () => {
           try {
             const text = await this.stt.endPcm();
             if (!text) return;
+            getLatencyTracer(this.connId).mark("stt_final");
             send(this.ws, { type: "stt_final", content: text });
             logger.info(`[用户·语音] ${text}`, { connId: this.connId });
             await runPipeline(this.ws, text, this.interrupt, this.avatar, this.sessionId, this.connId);
@@ -177,10 +206,10 @@ export class ConnectionSession {
     this.vad.feed(pcm);
 
     if (this.vad.speaking) {
-      this.speechBuffer.push(pcm);
+      this.pushSpeechChunk(pcm);
 
-      const totalBytes = this.speechBuffer.reduce((s, b) => s + b.length, 0);
-      const durMs = (totalBytes / 2 / (Number(data.sampleRate) || 16000)) * 1000;
+      const durMs = (this.speechBufferBytes / 2 / (Number(data.sampleRate) || 16000)) * 1000;
+      getLatencyTracer(this.connId).mark("stt_partial");
       send(this.ws, { type: "stt_partial", content: `录音中… ${(durMs / 1000).toFixed(1)}s` });
     }
   }
@@ -195,6 +224,7 @@ export class ConnectionSession {
         try {
           const text = await this.stt.end();
           if (!text) return;
+          getLatencyTracer(this.connId).mark("stt_final");
           send(this.ws, { type: "stt_final", content: text });
           logger.info(`[用户·语音] ${text}`, { connId: this.connId });
           await runPipeline(this.ws, text, this.interrupt, this.avatar, this.sessionId, this.connId);
@@ -219,6 +249,9 @@ export class ConnectionSession {
       send(this.ws, { type: "interrupt" });
     }
 
+    const tracer = getLatencyTracer(this.connId);
+    tracer.reset();
+
     this.pipelineChain = this.pipelineChain
       .then(() => runPipeline(this.ws, content, this.interrupt, this.avatar, this.sessionId, this.connId))
       .catch((err) => logger.error("[pipeline]", { error: err, connId: this.connId }));
@@ -231,19 +264,23 @@ export class ConnectionSession {
       this.interrupt.interrupt();
       logger.info("[Rem] 客户端已断开", { connId: this.connId });
 
-      if (dbReady && this.sessionId) {
+      if (isDbReady() && this.sessionId) {
         void endSession(this.sessionId).catch((err) => {
           logger.warn("[Storage] Failed to end session", { error: err, sessionId: this.sessionId });
         });
       }
+
+      removeLatencyTracer(this.connId);
     });
 
     this.ws.on("error", (err) => logger.error("[WebSocket 错误]", { error: err, connId: this.connId }));
   }
 }
 
-export function createSession(ws: WebSocket, req: IncomingMessage): ConnectionSession {
+export function createSession(ws: WebSocket, _req: IncomingMessage): ConnectionSession {
   const session = new ConnectionSession(ws);
-  void session.initialize();
+  session.initializeAsync().catch((err) => {
+    logger.error("[Session] initializeAsync failed", { error: err, connId: session.connId });
+  });
   return session;
 }

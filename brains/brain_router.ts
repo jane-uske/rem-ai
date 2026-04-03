@@ -1,11 +1,13 @@
 import { fastBrainStream } from "./fast_brain";
 import { runSlowBrain, synthesizeContext } from "./slow_brain";
-import { updateEmotion } from "../emotion/emotion_engine";
 import { extractMemory, retrieveMemory } from "../memory/memory_agent";
 import type { PromptMessage } from "../brain/prompt_builder";
+import type { Emotion } from "../emotion/emotion_state";
+import { createLogger } from "../infra/logger";
 
 const MAX_HISTORY = 10;
 const history: PromptMessage[] = [];
+const logger = createLogger("brain_router");
 
 /**
  * Brain Router: dispatches user input to both brains.
@@ -22,12 +24,11 @@ const history: PromptMessage[] = [];
  */
 export async function* routeMessage(
   userMessage: string,
+  emotion: Emotion,
   signal?: AbortSignal,
 ): AsyncGenerator<string> {
-  const emotion = updateEmotion(userMessage);
-
   extractMemory(userMessage);
-  const memory = retrieveMemory();
+  const memory = await retrieveMemory();
 
   const slowBrainContext = synthesizeContext();
 
@@ -56,6 +57,6 @@ export async function* routeMessage(
     assistantReply: fullReply,
     history: [...history],
   }).catch((err) =>
-    console.warn("[slow_brain] 后台分析失败:", (err as Error).message),
+    logger.warn("后台分析失败", { error: (err as Error).message }),
   );
 }

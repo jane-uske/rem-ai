@@ -1,4 +1,5 @@
 import { routeMessage } from "../brains/brain_router";
+import type { Emotion } from "../emotion/emotion_state";
 
 export interface Message {
   role: "system" | "user" | "assistant";
@@ -12,7 +13,8 @@ export interface Message {
  */
 export async function* chatStream(
   message: string,
+  emotion: Emotion,
   signal?: AbortSignal,
 ): AsyncGenerator<string> {
-  yield* routeMessage(message, signal);
+  yield* routeMessage(message, emotion, signal);
 }

@@ -1,4 +1,7 @@
 import { MemoryRepository, MemoryEntry } from "./memory_repository";
+import { createLogger } from "../infra/logger";
+
+const logger = createLogger("memory_decay");
 
 export interface DecayConfig {
   maxMemories: number;
@@ -64,7 +67,7 @@ export async function runDecay(
 
   for (const key of toRemove) {
     await repo.delete(key);
-    console.log(`[memory decay] removed: ${key}`);
+    logger.info("移除记忆", { key });
   }
 
   return toRemove.size;

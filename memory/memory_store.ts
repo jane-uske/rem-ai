@@ -67,8 +67,9 @@ export class InMemoryRepository implements MemoryRepository {
   }
 }
 
-let repository: MemoryRepository = new InMemoryRepository();
-let currentInMemoryRepo: InMemoryRepository | null = new InMemoryRepository();
+const defaultRepo = new InMemoryRepository();
+let repository: MemoryRepository = defaultRepo;
+let currentInMemoryRepo: InMemoryRepository | null = defaultRepo;
 
 export function getMemoryRepository(): MemoryRepository {
   return repository;
@@ -87,11 +88,17 @@ export function addMemory(key: string, value: string): void {
   void repository.upsert(key, value);
 }
 
-export function getAllMemories(): Memory[] {
+export function getAllMemoriesSync(): Memory[] {
   if (currentInMemoryRepo) {
     return currentInMemoryRepo.snapshotMemories();
   }
-  // For non-in-memory repos, return empty array for now
-  // This maintains backwards compatibility
   return [];
+}
+
+export async function getAllMemories(): Promise<Memory[]> {
+  if (currentInMemoryRepo) {
+    return currentInMemoryRepo.snapshotMemories();
+  }
+  const entries = await repository.getAll();
+  return entries.map(({ key, value }) => ({ key, value }));
 }

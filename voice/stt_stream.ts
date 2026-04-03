@@ -208,14 +208,29 @@ export class SttStream extends EventEmitter {
     const lang = process.env.whisper_lang || "zh";
     const model = process.env.whisper_model!;
 
-    const raw = await run(cmd, [
+    const args = [
       "-m", model,
       "-f", wavPath,
       "-l", lang,
       "--no-timestamps",
-    ]);
+    ];
 
-    return raw.replace(/^\[.*?\]\s*/gm, "").trim();
+    const prompt = process.env.whisper_prompt;
+    if (prompt) {
+      args.push("--prompt", prompt);
+    }
+
+    const extraArgs = process.env.whisper_extra_args;
+    if (extraArgs) {
+      args.push(...extraArgs.split(/\s+/).filter(Boolean));
+    }
+
+    const raw = await run(cmd, args);
+
+    return raw
+      .replace(/^\[.*?\]\s*/gm, "")
+      .replace(/\[BLANK_AUDIO\]/g, "")
+      .trim();
   }
 
   /* ======== Helpers ======== */

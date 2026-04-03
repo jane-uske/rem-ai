@@ -3,6 +3,8 @@ import { EmotionLogger } from "../infra/emotion_logger";
 
 const emotionLogger = new EmotionLogger();
 
+const NEGATION_WORDS = ["不", "没有", "别", "不要", "不是", "没", "莫"];
+
 interface EmotionRule {
   emotion: Emotion;
   keywords: string[];
@@ -49,6 +51,24 @@ const RULES: EmotionRule[] = [
   },
 ];
 
+function hasNegationBeforeKeyword(msg: string, keywordIndex: number): boolean {
+  const beforeKeyword = msg.slice(0, keywordIndex);
+  return NEGATION_WORDS.some((neg) => beforeKeyword.includes(neg));
+}
+
+function getSadIfNegatedHappy(msg: string): Emotion | null {
+  const happyRule = RULES.find((r) => r.emotion === "happy");
+  if (!happyRule) return null;
+
+  for (const kw of happyRule.keywords) {
+    const idx = msg.indexOf(kw);
+    if (idx !== -1 && hasNegationBeforeKeyword(msg, idx)) {
+      return "sad";
+    }
+  }
+  return null;
+}
+
 export function updateEmotion(userMessage: string): Emotion {
   const msg = userMessage.trim();
   const fromEmotion = getEmotion();
@@ -58,11 +78,22 @@ export function updateEmotion(userMessage: string): Emotion {
     toEmotion = "neutral";
   } else {
     let found = false;
-    for (const rule of RULES) {
-      if (rule.keywords.some((kw) => msg.includes(kw))) {
-        toEmotion = rule.emotion;
-        found = true;
-        break;
+
+    const negated = getSadIfNegatedHappy(msg);
+    if (negated) {
+      toEmotion = negated;
+      found = true;
+    } else {
+      for (const rule of RULES) {
+        for (const kw of rule.keywords) {
+          const idx = msg.indexOf(kw);
+          if (idx !== -1 && !hasNegationBeforeKeyword(msg, idx)) {
+            toEmotion = rule.emotion;
+            found = true;
+            break;
+          }
+        }
+        if (found) break;
       }
     }
     if (!found) {
@@ -87,30 +118,4 @@ export function updateEmotion(userMessage: string): Emotion {
   });
 
   return toEmotion;
-}
-
-const DECAY_MAP: Record<Emotion, Emotion> = {
-  happy: "neutral",
-  curious: "neutral",
-  shy: "neutral",
-  sad: "neutral",
-  neutral: "neutral",
-};
-
-/**
- * 回复后轻微回归 neutral：
- * 强烈情绪先变为过渡态，过渡态再变为 neutral。
- */
-export function decayEmotion(): void {
-  const current = getEmotion();
-  const next = DECAY_MAP[current];
-  if (next !== current) {
-    setEmotion(next);
-    emotionLogger.log({
-      userId: "dev",
-      fromEmotion: current,
-      toEmotion: next,
-      trigger: "decay",
-    });
-  }
 }

@@ -94,6 +94,32 @@ export async function findSimilarMemories(
   }
 }
 
+export async function getMemoryByKey(userId: string, key: string): Promise<DbMemory | null> {
+  try {
+    const res = await query(
+      `SELECT id, user_id, key, value, importance, embedding, created_at, last_accessed_at
+       FROM memories
+       WHERE user_id = $1 AND key = $2
+       LIMIT 1`,
+      [userId, key]
+    );
+    if (res.rows.length === 0) return null;
+    return mapRow(res.rows[0] as Record<string, unknown>);
+  } catch (e) {
+    console.log('[Storage] getMemoryByKey failed:', e);
+    throw e;
+  }
+}
+
+export async function deleteMemoryByKey(userId: string, key: string): Promise<void> {
+  try {
+    await query(`DELETE FROM memories WHERE user_id = $1 AND key = $2`, [userId, key]);
+  } catch (e) {
+    console.log('[Storage] deleteMemoryByKey failed:', e);
+    throw e;
+  }
+}
+
 export async function touchMemory(id: string): Promise<void> {
   try {
     await query(

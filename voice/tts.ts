@@ -3,8 +3,12 @@ import { spawn, ChildProcess } from "child_process";
 import { promises as fs } from "fs";
 import os from "os";
 import path from "path";
-import { EdgeTTS } from "node-edge-tts";
+import { WebSocket } from "ws";
+import { randomBytes } from "crypto";
 import { getEmotionVoiceParams, type Emotion } from "./tts_emotion";
+import { createLogger } from "../infra/logger";
+
+const logger = createLogger("tts");
 
 let client: OpenAI | null = null;
 let warnedTtsDisabled = false;
@@ -71,10 +75,10 @@ function warnTtsDisabledOnce(provider: TtsProvider): void {
   if (warnedTtsDisabled) return;
   warnedTtsDisabled = true;
   if (provider === "piper") {
-    console.warn("[TTS] 已禁用：tts_provider=piper 但未配置 piper_model");
+    logger.warn("已禁用：tts_provider=piper 但未配置 piper_model");
     return;
   }
-  console.warn("[TTS] 已禁用：请配置 tts_key 和 tts_base_url，或切到 tts_provider=edge");
+  logger.warn("已禁用：请配置 tts_key 和 tts_base_url，或切到 tts_provider=edge");
 }
 
 /* ── Abort helpers ── */
@@ -178,7 +182,7 @@ async function speakWithPiper(
     child.stdin!.end();
   });
 
-  console.log(`[TTS] piper ${Date.now() - t0}ms "${text.slice(0, 30)}…"`);
+  logger.info("piper 合成完成", { duration: Date.now() - t0, text: text.slice(0, 30) });
 
   try {
     return await fs.readFile(outFile);
@@ -187,18 +191,110 @@ async function speakWithPiper(
   }
 }
 
-let edgeInstance: InstanceType<typeof EdgeTTS> | null = null;
+/* ── Edge TTS (in-memory, no disk I/O) ── */
 
-function getEdgeTTS(): InstanceType<typeof EdgeTTS> {
-  if (edgeInstance) return edgeInstance;
-  edgeInstance = new EdgeTTS({
-    voice: process.env.tts_voice || "zh-CN-XiaoxiaoNeural",
-    lang: process.env.tts_lang || "zh-CN",
-    rate: process.env.tts_rate || "default",
-    outputFormat: "audio-24khz-48kbitrate-mono-mp3",
-    timeout: 15_000,
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const edgeDrm = require("node-edge-tts/dist/drm");
+const EDGE_CHROMIUM_VER: string = edgeDrm.CHROMIUM_FULL_VERSION;
+const EDGE_TOKEN: string = edgeDrm.TRUSTED_CLIENT_TOKEN;
+const EDGE_TIMEOUT_MS = Number(process.env.edge_tts_timeout || 10_000);
+
+function edgeGecToken(): string {
+  return edgeDrm.generateSecMsGecToken();
+}
+
+function escapeXml(s: string): string {
+  return s.replace(/[<>&"']/g, (c) => {
+    switch (c) {
+      case "<": return "&lt;";
+      case ">": return "&gt;";
+      case "&": return "&amp;";
+      case '"': return "&quot;";
+      case "'": return "&apos;";
+      default: return c;
+    }
   });
-  return edgeInstance;
+}
+
+function edgeTtsBuffer(
+  text: string,
+  voice: string,
+  lang: string,
+  rate: string,
+  pitch: string,
+  outputFormat: string,
+  signal?: AbortSignal,
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("TTS aborted", "AbortError"));
+      return;
+    }
+
+    const majorVer = EDGE_CHROMIUM_VER.split(".")[0];
+    const ws = new WebSocket(
+      `wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=${EDGE_TOKEN}&Sec-MS-GEC=${edgeGecToken()}&Sec-MS-GEC-Version=1-${EDGE_CHROMIUM_VER}`,
+      {
+        headers: {
+          Pragma: "no-cache",
+          "Cache-Control": "no-cache",
+          "User-Agent": `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${majorVer}.0.0.0 Safari/537.36 Edg/${majorVer}.0.0.0`,
+          "Accept-Encoding": "gzip, deflate, br",
+          "Accept-Language": "en-US,en;q=0.9",
+          Origin: "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold",
+        },
+      },
+    );
+
+    const chunks: Buffer[] = [];
+    let done = false;
+
+    const finish = (err?: Error) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", abortHandler);
+      try { ws.close(); } catch {}
+      if (err) reject(err);
+      else resolve(Buffer.concat(chunks));
+    };
+
+    const timer = setTimeout(() => {
+      finish(new Error(`Edge TTS 超时 (${EDGE_TIMEOUT_MS}ms)`));
+    }, EDGE_TIMEOUT_MS);
+
+    const abortHandler = () => finish(new DOMException("TTS aborted", "AbortError"));
+    if (signal) signal.addEventListener("abort", abortHandler, { once: true });
+
+    ws.on("open", () => {
+      ws.send(
+        `Content-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n` +
+        `{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"${outputFormat}"}}}}`,
+      );
+      const reqId = randomBytes(16).toString("hex");
+      ws.send(
+        `X-RequestId:${reqId}\r\nContent-Type:application/ssml+xml\r\nPath:ssml\r\n\r\n` +
+        `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="${lang}">` +
+        `<voice name="${voice}"><prosody rate="${rate}" pitch="${pitch}">${escapeXml(text)}</prosody></voice></speak>`,
+      );
+    });
+
+    ws.on("message", (data: Buffer, isBinary: boolean) => {
+      if (done) return;
+      if (isBinary) {
+        const sep = "Path:audio\r\n";
+        const idx = data.indexOf(sep);
+        if (idx >= 0) chunks.push(data.subarray(idx + sep.length));
+      } else {
+        if (data.toString().includes("Path:turn.end")) finish();
+      }
+    });
+
+    ws.on("error", (err) => finish(err));
+    ws.on("close", () => {
+      if (!done) finish(new Error("Edge TTS WebSocket 意外关闭"));
+    });
+  });
 }
 
 async function speakWithEdge(
@@ -206,35 +302,28 @@ async function speakWithEdge(
   signal?: AbortSignal,
   emotion?: Emotion,
 ): Promise<Buffer> {
-  const tmpFile = path.join(
-    os.tmpdir(),
-    `rem-edge-${Date.now()}-${Math.random().toString(36).slice(2)}.mp3`,
-  );
+  throwIfAborted(signal);
   const t0 = Date.now();
-  try {
-    throwIfAborted(signal);
-    const resolved = emotion ?? "neutral";
-    let edge: InstanceType<typeof EdgeTTS>;
-    if (resolved === "neutral") {
-      edge = getEdgeTTS();
-    } else {
-      const { rate, pitch } = getEmotionVoiceParams(resolved);
-      edge = new EdgeTTS({
-        voice: process.env.tts_voice || "zh-CN-XiaoxiaoNeural",
-        lang: process.env.tts_lang || "zh-CN",
-        rate,
-        pitch,
-        outputFormat: "audio-24khz-48kbitrate-mono-mp3",
-        timeout: 15_000,
-      });
-    }
-    await edge.ttsPromise(text, tmpFile);
-    throwIfAborted(signal);
-    console.log(`[TTS] edge ${Date.now() - t0}ms "${text.slice(0, 30)}…"`);
-    return await fs.readFile(tmpFile);
-  } finally {
-    await fs.unlink(tmpFile).catch(() => {});
+
+  const voice = process.env.tts_voice || "zh-CN-XiaoyiNeural";
+  const lang = process.env.tts_lang || "zh-CN";
+  const fmt = "audio-24khz-48kbitrate-mono-mp3";
+
+  const resolved = emotion ?? "neutral";
+  let rate: string;
+  let pitch: string;
+  if (resolved === "neutral") {
+    rate = process.env.tts_rate || "default";
+    pitch = process.env.tts_pitch || "default";
+  } else {
+    const ev = getEmotionVoiceParams(resolved);
+    rate = ev.rate;
+    pitch = ev.pitch;
   }
+
+  const buf = await edgeTtsBuffer(text, voice, lang, rate, pitch, fmt, signal);
+  logger.info("edge 合成完成", { duration: Date.now() - t0, text: text.slice(0, 30) });
+  return buf;
 }
 
 /* ── Public API ── */

@@ -1,23 +1,19 @@
 import { WebSocket } from "ws";
 
 import { chatStream } from "../../agents/conversation_agent";
-import { decayEmotion, updateEmotion } from "../../emotion/emotion_engine";
+import { decayEmotion } from "../../emotion/decay_emotion";
+import { updateEmotion } from "../../emotion/emotion_engine";
 import { synthesize, isTtsEnabled } from "../../voice/tts_stream";
 import { SentenceChunker } from "../../utils/sentence_chunker";
 import { InterruptController } from "../../voice/interrupt_controller";
 import { AvatarController } from "../../avatar/avatar_controller";
 import { createLogger } from "../../infra/logger";
+import { isDbReady } from "../../infra/app_state";
+import { getLatencyTracer } from "../../infra/latency_tracer";
 import { saveMessage } from "../../storage/repositories/message_repository";
 import { send } from "../gateway";
 
 const logger = createLogger("pipeline");
-
-// Global state for optional storage
-let dbReady = false;
-
-export function setDbReady(ready: boolean): void {
-  dbReady = ready;
-}
 
 export async function runPipeline(
   ws: WebSocket,
@@ -28,19 +24,18 @@ export async function runPipeline(
   connId: string,
 ): Promise<void> {
   const signal = ic.begin();
+  const latencyTracer = getLatencyTracer(connId);
 
   try {
     const replyEmotion = updateEmotion(text);
     send(ws, { type: "emotion", emotion: replyEmotion });
 
-    // Avatar emotion transition
     const avatarFrames = avatar.setEmotion(replyEmotion as any);
     for (const frame of avatarFrames) {
       send(ws, { type: "avatar_frame", frame });
     }
 
-    // Persist user message if DB available
-    if (dbReady && sessionId) {
+    if (isDbReady() && sessionId) {
       try {
         await saveMessage(sessionId, "user", text);
       } catch (err) {
@@ -48,40 +43,115 @@ export async function runPipeline(
       }
     }
 
-    const chunker = new SentenceChunker();
-    let full = "";
-    const pendingSentences: string[] = [];
+    // ── Producer-consumer TTS: synthesize sentences as they stream in ──
 
-    for await (const token of chatStream(text, signal)) {
+    const sentenceQueue: string[] = [];
+    let sentenceIdx = 0;
+    let producerDone = false;
+    let waitResolve: (() => void) | null = null;
+
+    function pushSentence(s: string) {
+      sentenceQueue.push(s);
+      if (waitResolve) {
+        const r = waitResolve;
+        waitResolve = null;
+        r();
+      }
+    }
+
+    function endProducer() {
+      producerDone = true;
+      if (waitResolve) {
+        const r = waitResolve;
+        waitResolve = null;
+        r();
+      }
+    }
+
+    const onAbort = () => endProducer();
+    signal.addEventListener("abort", onAbort, { once: true });
+
+    let firstAudioSent = false;
+    let ttsError: Error | null = null;
+
+    const ttsTask = (async () => {
+      while (true) {
+        if (signal.aborted) break;
+
+        if (sentenceIdx < sentenceQueue.length) {
+          const sentence = sentenceQueue[sentenceIdx++];
+          if (signal.aborted) break;
+
+          if (sentenceIdx === 1) latencyTracer.mark("tts_start");
+
+          try {
+            ic.markSpeaking();
+            await ttsSend(ws, sentence, signal, replyEmotion, latencyTracer, !firstAudioSent);
+            if (!firstAudioSent) firstAudioSent = true;
+          } catch (err) {
+            if ((err as Error).name === "AbortError") break;
+            logger.warn("[TTS]", { error: (err as Error).message, connId });
+            ttsError = err as Error;
+          }
+        } else if (producerDone) {
+          break;
+        } else {
+          await new Promise<void>((r) => { waitResolve = r; });
+        }
+      }
+    })();
+
+    // ── LLM streaming (producer) ──
+
+    const chunker = new SentenceChunker();
+    chunker.setEager(true);
+    let full = "";
+    let firstTokenReceived = false;
+    let firstSentenceSent = false;
+
+    latencyTracer.mark("llm_request_start");
+
+    for await (const token of chatStream(text, replyEmotion, signal)) {
       if (signal.aborted) break;
+
+      if (!firstTokenReceived) {
+        firstTokenReceived = true;
+        latencyTracer.mark("llm_first_token");
+      }
 
       full += token;
       send(ws, { type: "chat_chunk", content: token });
 
       for (const sentence of chunker.push(token)) {
-        pendingSentences.push(sentence);
+        pushSentence(sentence);
+        if (!firstSentenceSent) {
+          firstSentenceSent = true;
+          chunker.setEager(false);
+        }
       }
     }
+
+    latencyTracer.mark("llm_end");
 
     if (!signal.aborted) {
       const last = chunker.flush();
-      if (last) {
-        pendingSentences.push(last);
-      }
+      if (last) pushSentence(last);
     } else {
       chunker.reset();
-      pendingSentences.length = 0;
     }
 
-    // Always send chat_end so the client can finalise the message bubble
+    endProducer();
+    signal.removeEventListener("abort", onAbort);
+
+    // ── Post-LLM steps (run while TTS processes in parallel) ──
+
     send(ws, {
       type: "chat_end",
       emotion: replyEmotion,
       content: signal.aborted ? "[interrupted]" : undefined,
     });
 
-    // Persist assistant message if DB available
-    if (dbReady && sessionId && full) {
+    if (isDbReady() && sessionId && full) {
       try {
         await saveMessage(sessionId, "assistant", full);
       } catch (err) {
@@ -89,7 +159,6 @@ export async function runPipeline(
       }
     }
 
-    // Avatar actions from reply
     if (full && !signal.aborted) {
       const actionFrames = avatar.processReply(full);
       for (const frame of actionFrames) {
@@ -103,26 +172,14 @@ export async function runPipeline(
         connId,
       });
     }
+
+    // Wait for TTS consumer to finish
+    await ttsTask;
+
     decayEmotion();
 
-    // Process TTS sentences sequentially, checking abort before each step
-    for (const sentence of pendingSentences) {
-      if (signal.aborted) {
-        logger.debug("[TTS] Aborted, skipping remaining sentences", { connId });
-        break;
-      }
-      try {
-        ic.markSpeaking();
-        await ttsSend(ws, sentence, signal, replyEmotion);
-      } catch (err) {
-        if ((err as Error).name !== "AbortError") {
-          logger.warn("[TTS]", { error: (err as Error).message, connId });
-        } else {
-          logger.debug("[TTS] Aborted during synthesis", { connId });
-          break;
-        }
-      }
-    }
+    latencyTracer.mark("tts_end");
+    latencyTracer.log();
   } catch (err) {
     if ((err as Error).name !== "AbortError") {
       logger.error("[错误]", { error: err, connId });
@@ -133,12 +190,22 @@ export async function runPipeline(
   }
 }
 
-async function ttsSend(ws: WebSocket, sentence: string, signal?: AbortSignal, emotion?: string): Promise<void> {
+async function ttsSend(
+  ws: WebSocket,
+  sentence: string,
+  signal?: AbortSignal,
+  emotion?: string,
+  latencyTracer?: ReturnType<typeof getLatencyTracer>,
+  isFirstSentence: boolean = false,
+): Promise<void> {
   if (!isTtsEnabled()) return;
   if (signal?.aborted) return;
   try {
     const audio = await synthesize(sentence, signal, emotion as any);
     if (signal?.aborted) return;
+    if (isFirstSentence && latencyTracer) {
+      latencyTracer.mark("tts_first_audio");
+    }
     send(ws, { type: "voice", audio: audio.toString("base64") });
   } catch (err) {
     if ((err as Error).name !== "AbortError") {
