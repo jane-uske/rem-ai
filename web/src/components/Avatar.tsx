@@ -2,6 +2,8 @@
 
 import { useMemo } from "react";
 
+import { getEmotionLabel } from "@/lib/emotionLabels";
+
 const ASSET_MAP: Record<string, string> = {
   neutral: "/avatar/assets/neutral.svg",
   happy: "/avatar/assets/happy.svg",
@@ -33,7 +35,7 @@ export function Avatar({ emotion }: AvatarProps) {
       <div className="flex min-w-0 flex-col gap-1">
         <span className="text-xs text-[var(--rem-dim)]">当前情绪</span>
         <span className="break-words text-sm font-semibold text-[var(--rem-accent)]">
-          {key}
+          {getEmotionLabel(key)}
         </span>
       </div>
     </div>

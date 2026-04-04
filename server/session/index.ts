@@ -37,6 +37,36 @@ function utteranceGapMs(): number {
   return n;
 }
 
+function parseNonNegativeMs(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return n;
+}
+
+/**
+ * After speech_end, delay before STT. Longer spoken segments get a longer merge window
+ * (mid-sentence pause); short phrases use a shorter delay (snappier end).
+ * Set VAD_UTTERANCE_GAP_ADAPTIVE=0 for a fixed VAD_UTTERANCE_GAP_MS (legacy behavior).
+ */
+function effectiveUtteranceGapMs(speechDurationMs: number): number {
+  const base = utteranceGapMs();
+  if (base <= 0) return 0;
+
+  if (process.env.VAD_UTTERANCE_GAP_ADAPTIVE === "0") {
+    return base;
+  }
+
+  const minG = parseNonNegativeMs(process.env.VAD_UTTERANCE_GAP_MIN_MS, 300);
+  const maxG = parseNonNegativeMs(process.env.VAD_UTTERANCE_GAP_MAX_MS, 780);
+  const lo = parseNonNegativeMs(process.env.VAD_UTTERANCE_GAP_ADAPTIVE_LO_MS, 400);
+  const hi = parseNonNegativeMs(process.env.VAD_UTTERANCE_GAP_ADAPTIVE_HI_MS, 4400);
+  if (maxG <= minG) return base;
+
+  const t = Math.min(1, Math.max(0, (speechDurationMs - lo) / Math.max(1, hi - lo)));
+  return Math.round(minG + t * (maxG - minG));
+}
+
 /** 用户多久没发消息后触发 Rem 主动搭话（ms）；未设置或 0 表示关闭 */
 function silenceNudgeMs(): number {
   const raw = process.env.REM_SILENCE_NUDGE_MS;
@@ -248,7 +278,13 @@ export class ConnectionSession {
 
       const MIN_SPEECH_MS = 420;
       const speechDurationMs = (this.speechBufferBytes / 2 / 16000) * 1000;
-      const gap = utteranceGapMs();
+      const gap = effectiveUtteranceGapMs(speechDurationMs);
+      logger.debug("[VAD] utterance_gap", {
+        connId: this.connId,
+        speechMs: Math.round(speechDurationMs),
+        gapMs: gap,
+        adaptive: process.env.VAD_UTTERANCE_GAP_ADAPTIVE !== "0",
+      });
 
       if (gap <= 0) {
         if (speechDurationMs < MIN_SPEECH_MS) {

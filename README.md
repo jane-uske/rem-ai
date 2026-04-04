@@ -9,7 +9,7 @@
 - **情绪系统** — 基于关键词识别用户情绪，维护 AI 情绪状态（neutral / happy / curious / shy / sad），影响回复风格
 - **语音输入（STT）** — 支持 Whisper API 和 whisper-cpp，实时双工 PCM 流式传输 + VAD 语音活动检测
 - **语音输出（TTS）** — 支持 Edge TTS / Piper / OpenAI TTS 三种后端，逐句流式合成
-- **虚拟形象** — SVG 表情头像，根据情绪状态实时切换（5 种表情）
+- **虚拟形象** — VRM 三维角色（Three.js）+ 情绪驱动；旧版含 SVG 表情头像
 - **实时通信** — WebSocket 全双工通信，支持打断控制、流式 token 推送、音频流传输
 
 ## 技术栈
@@ -71,6 +71,14 @@ npm run typecheck
 | `PORT` | 服务端口（默认 `3000`） |
 | `REM_SILENCE_NUDGE_MS` | 用户无消息后多久由 Rem 主动搭话（毫秒）；`0` 或不设为关闭 |
 | `REM_SILENCE_NUDGE_MIN_TURNS` | 至少聊过几轮才允许沉默搭话（默认 `2`） |
+| `NEXT_PUBLIC_VRM_URL` | （前端）自定义 VRM 路径；不设则使用 `web/public/vrm/` 下默认模型。根目录 `npm run web:dev` 时 `next.config` 会读取**仓库根** `.env`。 |
+| `NEXT_PUBLIC_WS_URL` | WebSocket 地址，须含 `ws://` 或 `wss://`（勿写 `localhost:3000/ws` 无前缀）。 |
+| `NEXT_PUBLIC_VRM_YAW` | VRM 绕 Y 轴旋转（弧度），模型背对镜头时可调。 |
+| `NEXT_PUBLIC_VRM_FRAMING` | `full`（默认）全身；`upper` 上半身特写。 |
+| `NEXT_PUBLIC_VRM_DISABLE_NODE_CONSTRAINT` | 默认禁用 `VRMC_node_constraint`（避免手臂被约束拉回展示姿势）；设为 `0` 恢复。 |
+| `REM_NEXT_HOSTNAME` | 传给 Next 的主机名（勿含端口）；见 `.env.example`。 |
+
+前端排障与实现细节见 **`web/docs/FRONTEND_PITFALLS.md`**。
 
 ## 项目目录
 
@@ -134,9 +142,10 @@ rem-ai/
 │   └── assets/                # SVG 表情头像（neutral/happy/curious/shy/sad）
 ├── public/                    # 旧版原生 JS 前端
 ├── web/                       # Next.js 前端
-│   ├── src/components/        # React 组件（聊天窗口、输入栏、头像、语音指示器）
+│   ├── docs/                  # 前端踩坑与排障（FRONTEND_PITFALLS.md）
+│   ├── src/components/        # RemChatApp、Rem3DAvatar、输入栏等
 │   ├── src/hooks/             # useRemChat（WebSocket）、useAudioBase64Queue
-│   ├── src/lib/               # 音频工具、PCM 采集、WebSocket URL
+│   ├── src/lib/               # wsUrl、rem3d（VRM viewer）等
 │   └── src/types/             # 消息类型定义
 ├── Dockerfile                 # 多阶段构建
 ├── docker-compose.yml         # App + PostgreSQL + Redis

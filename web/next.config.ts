@@ -1,5 +1,12 @@
 import type { NextConfig } from "next";
+import { loadEnvConfig } from "@next/env";
 import path from "path";
+
+/**
+ * `npm run web:dev` 的 cwd 在 `web/`，Next 默认只加载 `web/.env*`。
+ * 单体仓库里常见把 `NEXT_PUBLIC_*` 写在仓库根 `.env`，导致不生效 —— 这里补读上一级。
+ */
+loadEnvConfig(path.join(__dirname, ".."));
 
 const nextConfig: NextConfig = {
   turbopack: {

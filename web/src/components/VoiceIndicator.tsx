@@ -9,22 +9,22 @@ export function VoiceIndicator({ active }: VoiceIndicatorProps) {
     <div
       role="status"
       aria-live="polite"
-      className="flex shrink-0 items-center gap-2 rounded-xl border border-[var(--rem-border)] bg-[var(--rem-input)] px-3 py-1.5"
+      className="flex shrink-0 items-center gap-2.5 rounded-2xl border border-white/15 bg-white/[0.08] px-3 py-2 shadow-lg backdrop-blur-xl dark:bg-black/35"
     >
       <div
-        className="rem-voice-bars flex h-10 items-end justify-center gap-1"
+        className="rem-voice-bars flex h-9 items-end justify-center gap-1"
         data-active={active ? "true" : "false"}
         aria-hidden
       >
         {[0, 1, 2, 3].map((i) => (
           <span
             key={i}
-            className="rem-voice-bar inline-block w-[5px] self-end rounded-sm bg-[var(--rem-dot-off)] transition-colors"
+            className="rem-voice-bar inline-block w-[4px] self-end rounded-sm bg-[var(--rem-dot-off)] transition-colors"
           />
         ))}
       </div>
-      <span className="whitespace-nowrap text-[11px] text-[var(--rem-dim)]">
-        {active ? "播放中" : ""}
+      <span className="max-w-[5rem] truncate text-[11px] font-medium text-[var(--rem-dim)]">
+        {active ? "播放中" : "语音"}
       </span>
     </div>
   );

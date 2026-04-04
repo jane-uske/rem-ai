@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "@/types/chat";
 import { MessageBubble } from "@/components/MessageBubble";
 
@@ -17,14 +17,39 @@ export function ChatWindow({
   thinkingHint,
 }: ChatWindowProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
+  const prevStreamingRef = useRef("");
+  const [streamStatus, setStreamStatus] = useState("");
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, streamingText, thinkingHint]);
 
+  useEffect(() => {
+    const next = streamingText;
+    const prev = prevStreamingRef.current;
+    prevStreamingRef.current = next;
+    if (!prev && next) {
+      setStreamStatus("Rem 正在回复…");
+    } else if (prev && !next) {
+      setStreamStatus("");
+    }
+  }, [streamingText]);
+
+  const responseBusy = thinkingHint || Boolean(streamingText);
+
   return (
-    <section className="flex min-h-0 flex-1 flex-col bg-[var(--background)]">
-      <div className="flex flex-1 flex-col gap-2.5 overflow-y-auto px-4 py-5">
+    <section className="flex min-h-0 flex-1 flex-col bg-transparent">
+      <div className="sr-only" aria-live="polite" aria-atomic="true">
+        {streamStatus}
+      </div>
+      <div
+        role="log"
+        aria-label="对话消息"
+        aria-live="off"
+        aria-busy={responseBusy}
+        tabIndex={0}
+        className="flex flex-1 flex-col gap-3 overflow-y-auto px-3 py-3 outline-none min-[480px]:px-4 min-[480px]:py-4 sm:px-5 sm:py-5 focus-visible:ring-2 focus-visible:ring-[var(--rem-accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-transparent"
+      >
         {messages.map((m) => (
           <MessageBubble key={m.id} role={m.role}>
             {m.text}
@@ -35,8 +60,8 @@ export function ChatWindow({
         ) : null}
         {thinkingHint ? (
           <div
-            className="rem-thinking-bubble flex max-w-[85%] flex-wrap items-center gap-2 self-start rounded-2xl rounded-bl-md bg-[var(--rem-surface)] px-[18px] py-3 text-sm text-[var(--foreground)] shadow-[0_1px_3px_rgba(0,0,0,0.06)] dark:shadow-[0_1px_4px_rgba(0,0,0,0.35)]"
-            aria-live="polite"
+            role="status"
+            className="rem-thinking-bubble flex max-w-[85%] flex-wrap items-center gap-2 self-start rounded-2xl rounded-bl-md border border-white/12 bg-[var(--rem-bubble-rem)] px-4 py-3 text-sm text-[var(--foreground)] backdrop-blur-md dark:border-white/10"
           >
             <span className="text-[var(--rem-dim)]">Rem 在想…</span>
             <span className="flex gap-1.5" aria-hidden>

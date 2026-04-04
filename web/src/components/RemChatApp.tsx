@@ -1,16 +1,76 @@
 "use client";
 
-import { Avatar } from "@/components/Avatar";
+import { useRef } from "react";
+import dynamic from "next/dynamic";
 import { ChatWindow } from "@/components/ChatWindow";
 import { InputBar } from "@/components/InputBar";
 import { VoiceIndicator } from "@/components/VoiceIndicator";
-import { useRemChat } from "@/hooks/useRemChat";
+import {
+  useRemChat,
+  type RemConnectionPhase,
+} from "@/hooks/useRemChat";
+import { getEmotionLabel } from "@/lib/emotionLabels";
+
+const Rem3DAvatar = dynamic(
+  () =>
+    import("@/components/Rem3DAvatar").then((m) => m.Rem3DAvatar),
+  {
+    ssr: false,
+    loading: () => (
+      <div
+        className="flex min-h-[240px] w-full flex-1 items-center justify-center rounded-2xl border border-white/10 bg-black/20 text-sm text-[var(--rem-dim)] backdrop-blur-md"
+        aria-hidden
+      >
+        3D 加载中…
+      </div>
+    ),
+  },
+);
+
+function remConnectionStatusText(
+  phase: RemConnectionPhase,
+  reconnectInSec: number | null,
+): string {
+  switch (phase) {
+    case "connecting":
+      return "正在连接服务器…";
+    case "open":
+      return "已连接";
+    case "closed":
+      if (reconnectInSec != null && reconnectInSec > 0) {
+        return `已断开，约 ${reconnectInSec} 秒后重连`;
+      }
+      if (reconnectInSec === 0) {
+        return "正在重新连接…";
+      }
+      return "已断开";
+  }
+}
+
+function remConnectionDotClass(
+  phase: RemConnectionPhase,
+  reconnectInSec: number | null,
+): string {
+  const base = "h-2 w-2 shrink-0 rounded-full";
+  switch (phase) {
+    case "connecting":
+      return `${base} bg-sky-400`;
+    case "open":
+      return `${base} bg-[var(--rem-accent)]`;
+    case "closed":
+      if (reconnectInSec != null) {
+        return `${base} bg-amber-400`;
+      }
+      return `${base} bg-[var(--rem-dot-off)]`;
+  }
+}
 
 export function RemChatApp() {
   const {
     emotion,
     connected,
-    connLabel,
+    connectionPhase,
+    reconnectInSec,
     messages,
     streamingText,
     thinkingHint,
@@ -18,51 +78,92 @@ export function RemChatApp() {
     inputPlaceholder,
     recording,
     voiceActive,
+    lipEnvelopeRef,
     hasMic,
     sendText,
     toggleMic,
   } = useRemChat();
 
+  const voiceActiveRef = useRef(false);
+  voiceActiveRef.current = voiceActive;
+
   const inputDisabled = !connected || waiting || recording;
   const micDisabled = !connected || !hasMic;
 
+  const connectionStatusLabel = remConnectionStatusText(
+    connectionPhase,
+    reconnectInSec,
+  );
+
   return (
-    <div className="mx-auto flex h-[100dvh] max-w-2xl flex-col bg-[var(--background)]">
-      <header className="shrink-0 border-b border-[var(--rem-border)] bg-[var(--rem-surface)]">
-        <div className="flex items-center gap-2.5 px-4 pt-2.5 text-sm text-[var(--rem-dim)]">
-          <span className="font-semibold text-[var(--foreground)]">Rem</span>
+    <div className="rem-app-shell relative flex h-svh min-h-0 w-full flex-col overflow-hidden bg-transparent text-[var(--foreground)]">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col lg:flex-row">
+        <section className="rem-stage relative flex min-h-[30vh] min-w-0 flex-[1.15] flex-col lg:min-h-0 lg:flex-1">
+          <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+            <Rem3DAvatar
+              emotion={emotion}
+              lipEnvelopeRef={lipEnvelopeRef}
+              voiceActiveRef={voiceActiveRef}
+              variant="stage"
+              className="min-h-0 min-w-0 flex-1"
+            />
+            <div className="pointer-events-none absolute left-4 top-[calc(4.25rem+env(safe-area-inset-top))] sm:left-6">
+              <div className="pointer-events-auto">
+                <VoiceIndicator active={voiceActive} />
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <aside className="rem-chat-panel rem-glass-edge flex min-h-0 w-full min-w-0 flex-1 flex-col border-t lg:w-[min(100%,clamp(320px,42vw,440px))] lg:max-w-[min(100%,440px)] lg:flex-none lg:border-l lg:border-t-0 lg:pt-14">
+          <ChatWindow
+            messages={messages}
+            streamingText={streamingText}
+            thinkingHint={thinkingHint}
+          />
+          <div className="shrink-0 border-t border-white/10 bg-transparent p-2 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:p-4 dark:border-white/5">
+            <InputBar
+              onSend={sendText}
+              onMicToggle={toggleMic}
+              disabled={inputDisabled}
+              micDisabled={micDisabled}
+              recording={recording}
+              placeholder={inputPlaceholder}
+            />
+          </div>
+        </aside>
+      </div>
+
+      <header className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center justify-between gap-2 bg-transparent px-3 py-3 pt-[max(0.75rem,env(safe-area-inset-top))] sm:gap-4 sm:px-6">
+        <div className="pointer-events-auto flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-[var(--rem-accent)] to-[var(--rem-accent-dim)] text-sm font-bold text-[#042f2e] shadow-lg shadow-teal-500/25 ring-1 ring-white/20">
+            R
+          </div>
+          <div className="min-w-0">
+            <h1 className="text-base font-semibold tracking-tight text-[var(--foreground)]">
+              Rem
+            </h1>
+            <p className="text-[11px] text-[var(--rem-dim)]">
+              AI 陪伴
+              <span className="font-medium text-[var(--rem-accent)]">
+                {" "}
+                · {getEmotionLabel(emotion)}
+              </span>
+            </p>
+          </div>
+        </div>
+        <div
+          className="pointer-events-auto flex min-w-0 max-w-[min(100%,min(14rem,45vw))] shrink items-center gap-2 rounded-full bg-transparent px-2 py-1.5 text-xs text-[var(--rem-dim)] sm:max-w-none sm:px-3"
+          aria-live="polite"
+          aria-atomic="true"
+        >
           <span
-            className={
-              connected
-                ? "h-2 w-2 rounded-full bg-[#5ecc7b]"
-                : "h-2 w-2 rounded-full bg-[var(--rem-dot-off)]"
-            }
+            className={remConnectionDotClass(connectionPhase, reconnectInSec)}
             aria-hidden
           />
-          <span>{connLabel}</span>
-        </div>
-        <div className="flex items-center justify-between gap-4 px-4 py-3.5">
-          <Avatar emotion={emotion} />
-          <VoiceIndicator active={voiceActive} />
+          <span className="truncate">{connectionStatusLabel}</span>
         </div>
       </header>
-
-      <ChatWindow
-        messages={messages}
-        streamingText={streamingText}
-        thinkingHint={thinkingHint}
-      />
-
-      <footer className="shrink-0 border-t border-[var(--rem-border)] bg-[var(--rem-surface)] px-4 py-3">
-        <InputBar
-          onSend={sendText}
-          onMicToggle={toggleMic}
-          disabled={inputDisabled}
-          micDisabled={micDisabled}
-          recording={recording}
-          placeholder={inputPlaceholder}
-        />
-      </footer>
     </div>
   );
 }

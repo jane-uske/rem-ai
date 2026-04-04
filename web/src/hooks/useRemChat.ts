@@ -10,6 +10,14 @@ function uid() {
   return crypto.randomUUID();
 }
 
+/** WebSocket 断线后自动重连的延迟（与 UI 倒计时同源） */
+export const REM_WS_RECONNECT_DELAY_MS = 3000;
+
+/** 长时间停留在 CONNECTING 则判定失败（避免 UI 永远「正在连接」） */
+const WS_CONNECT_TIMEOUT_MS = 12_000;
+
+export type RemConnectionPhase = "connecting" | "open" | "closed";
+
 const MESSAGE_STORAGE_KEY = "rem-chat-messages-v1";
 const MESSAGE_STORAGE_MAX = 50;
 
@@ -36,10 +44,16 @@ function loadPersistedMessages(): ChatMessage[] {
 }
 
 export function useRemChat() {
-  const { enqueueBase64, clearQueue, voiceActive } = useAudioBase64Queue();
+  const { enqueueBase64, clearQueue, voiceActive, lipEnvelopeRef } =
+    useAudioBase64Queue();
 
   const [emotion, setEmotion] = useState("neutral");
   const [connected, setConnected] = useState(false);
+  const [connectionPhase, setConnectionPhase] =
+    useState<RemConnectionPhase>("connecting");
+  const [reconnectDeadline, setReconnectDeadline] = useState<number | null>(null);
+  /** 仅用于在重连倒计时期间驱动按秒刷新（deadline 派生秒数） */
+  const [, bumpReconnectTick] = useState(0);
   const [connLabel, setConnLabel] = useState("连接中…");
   const [messages, setMessages] = useState<ChatMessage[]>(loadPersistedMessages);
   const [streamingText, setStreamingText] = useState("");
@@ -60,6 +74,21 @@ export function useRemChat() {
   const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const streamingBufRef = useRef("");
   const mountedRef = useRef(true);
+  /** 连接超时主动 close 时，onclose 不再刷「已断开」系统提示（避免与超时错误重复） */
+  const suppressDisconnectSysMsgRef = useRef(false);
+
+  useEffect(() => {
+    if (reconnectDeadline == null) return;
+    const id = setInterval(() => {
+      bumpReconnectTick((n) => n + 1);
+    }, 250);
+    return () => clearInterval(id);
+  }, [reconnectDeadline]);
+
+  const reconnectInSec =
+    reconnectDeadline == null
+      ? null
+      : Math.max(0, Math.ceil((reconnectDeadline - Date.now()) / 1000));
 
   const hasMic =
     typeof navigator !== "undefined" &&
@@ -148,15 +177,49 @@ export function useRemChat() {
       clearTimeout(reconnectRef.current);
       reconnectRef.current = null;
     }
+    setReconnectDeadline(null);
+    setConnectionPhase("connecting");
     setConnLabel("连接中…");
     const url = getRemWsUrl();
-    if (!url) return;
+    if (!url) {
+      setConnectionPhase("closed");
+      setConnLabel("无法解析 WS 地址");
+      setMessages((m) => [
+        ...m,
+        {
+          id: uid(),
+          role: "error",
+          text: "WebSocket 地址为空（仅应在浏览器环境连接）",
+        },
+      ]);
+      return;
+    }
 
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
+    const connectTimer = window.setTimeout(() => {
+      if (ws.readyState === WebSocket.CONNECTING) {
+        suppressDisconnectSysMsgRef.current = true;
+        setConnLabel("连接超时");
+        setMessages((m) => [
+          ...m,
+          {
+            id: uid(),
+            role: "error",
+            text:
+              "连接服务器超时。请确认已在仓库根目录运行「npm run dev」（默认端口 3000），或设置 NEXT_PUBLIC_WS_URL=ws://你的后端:端口/ws",
+          },
+        ]);
+        ws.close();
+      }
+    }, WS_CONNECT_TIMEOUT_MS);
+
     ws.onopen = () => {
+      window.clearTimeout(connectTimer);
       setConnected(true);
+      setConnectionPhase("open");
+      setReconnectDeadline(null);
       setConnLabel("在线");
       setMessages((m) => [
         ...m,
@@ -256,26 +319,35 @@ export function useRemChat() {
     };
 
     ws.onclose = () => {
+      window.clearTimeout(connectTimer);
       if (!mountedRef.current) return;
 
       stopVoiceSession();
 
       setConnected(false);
+      setConnectionPhase("closed");
+      setReconnectDeadline(Date.now() + REM_WS_RECONNECT_DELAY_MS);
       setConnLabel("已断开");
       waitingRef.current = false;
       setWaiting(false);
       resetStreaming();
       setTyping(false);
-      setMessages((m) => [
-        ...m,
-        { id: uid(), role: "sys", text: "连接已断开，3 秒后重连…" },
-      ]);
+      const quiet = suppressDisconnectSysMsgRef.current;
+      suppressDisconnectSysMsgRef.current = false;
+      if (!quiet) {
+        setMessages((m) => [
+          ...m,
+          { id: uid(), role: "sys", text: "连接已断开，3 秒后重连…" },
+        ]);
+      }
       reconnectRef.current = setTimeout(() => {
         if (mountedRef.current) connectRef.current?.();
-      }, 3000);
+      }, REM_WS_RECONNECT_DELAY_MS);
     };
 
-    ws.onerror = () => {};
+    ws.onerror = () => {
+      window.clearTimeout(connectTimer);
+    };
   };
 
   useEffect(() => {
@@ -326,6 +398,8 @@ export function useRemChat() {
   return {
     emotion,
     connected,
+    connectionPhase,
+    reconnectInSec,
     connLabel,
     messages,
     streamingText,
@@ -337,6 +411,8 @@ export function useRemChat() {
     duplex,
     userSpeaking,
     voiceActive,
+    /** TTS 音量包络 0–1，供 3D 口型同步 */
+    lipEnvelopeRef,
     hasMic,
     sendText,
     toggleMic,

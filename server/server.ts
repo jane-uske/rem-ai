@@ -75,8 +75,10 @@ async function bootstrap() {
   startServer(server);
 }
 
-bootstrap().catch((err) => {
-  logger.error("[Rem AI] 启动失败", { error: err });
+bootstrap().catch((err: unknown) => {
+  const message = err instanceof Error ? err.message : String(err);
+  const stack = err instanceof Error ? err.stack : undefined;
+  logger.error("[Rem AI] 启动失败", { err: message, stack });
   process.exit(1);
 });
 

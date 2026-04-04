@@ -1,36 +1,69 @@
 @import "tailwindcss";
 
+/* 默认：现代深色 + 青绿点缀（可随系统切换浅色） */
 :root {
-  --background: #f5f0fa;
-  --foreground: #2c2c3a;
-  --rem-surface: #ffffff;
-  --rem-accent: #9b7ec8;
-  --rem-border: #e8e0f0;
-  --rem-input: #ffffff;
-  --rem-dim: #8888a0;
-  --rem-user-bg: #dce8f8;
-  --rem-user-fg: #2a4060;
-  --rem-error-bg: #fde8eb;
-  --rem-danger: #e06070;
-  --rem-dot-off: #cccccc;
-  --rem-mic-bg: #e8e0f0;
+  --background: #0a0f14;
+  --foreground: #e6f0f0;
+  --rem-surface: rgba(255, 255, 255, 0.06);
+  --rem-accent: #2dd4bf;
+  --rem-accent-dim: #14b8a6;
+  --rem-border: rgba(255, 255, 255, 0.12);
+  --rem-input: rgba(0, 0, 0, 0.35);
+  --rem-dim: #8da8a8;
+  --rem-user-bg: rgba(45, 212, 191, 0.2);
+  --rem-user-fg: #d6fff8;
+  --rem-error-bg: rgba(220, 80, 100, 0.15);
+  --rem-danger: #f8718c;
+  --rem-dot-off: #4a5560;
+  --rem-mic-bg: rgba(255, 255, 255, 0.08);
+  --rem-app-bg: transparent;
+  /* 侧栏聊天区：偏透明，叠在背景图上 */
+  --rem-panel: rgba(255, 255, 255, 0.04);
+  --rem-bubble-rem: rgba(255, 255, 255, 0.08);
+  --rem-page-bg-image: url("/rem-ui-bg.svg");
+  --rem-page-overlay: linear-gradient(
+    165deg,
+    rgba(4, 8, 14, 0.75) 0%,
+    rgba(6, 14, 22, 0.45) 45%,
+    rgba(3, 6, 12, 0.65) 100%
+  );
+  --rem-stage-veil: radial-gradient(
+    ellipse 80% 60% at 50% 40%,
+    rgba(45, 212, 191, 0.1) 0%,
+    transparent 65%
+  );
 }
 
-@media (prefers-color-scheme: dark) {
+@media (prefers-color-scheme: light) {
   :root {
-    --background: #141018;
-    --foreground: #e8e6f0;
-    --rem-surface: #1e1a26;
-    --rem-accent: #b89fe0;
-    --rem-border: rgba(255, 255, 255, 0.08);
-    --rem-input: #18141c;
-    --rem-dim: #9090a8;
-    --rem-user-bg: #2a3248;
-    --rem-user-fg: #c8d8f0;
-    --rem-error-bg: #3a2028;
-    --rem-danger: #f08090;
-    --rem-dot-off: #555555;
-    --rem-mic-bg: #2a2634;
+    --background: #f0f7f7;
+    --foreground: #1a2828;
+    --rem-surface: rgba(255, 255, 255, 0.65);
+    --rem-accent: #0d9488;
+    --rem-accent-dim: #0f766e;
+    --rem-border: rgba(0, 0, 0, 0.1);
+    --rem-input: #ffffff;
+    --rem-dim: #5c7070;
+    --rem-user-bg: #ccfbf1;
+    --rem-user-fg: #134e4a;
+    --rem-error-bg: #ffe4e8;
+    --rem-danger: #e11d48;
+    --rem-dot-off: #cbd5e1;
+    --rem-mic-bg: #e0f2f1;
+    --rem-app-bg: transparent;
+    --rem-panel: rgba(255, 255, 255, 0.22);
+    --rem-bubble-rem: rgba(255, 255, 255, 0.82);
+    --rem-page-overlay: linear-gradient(
+      165deg,
+      rgba(248, 252, 252, 0.88) 0%,
+      rgba(236, 248, 246, 0.78) 50%,
+      rgba(230, 242, 240, 0.85) 100%
+    );
+    --rem-stage-veil: radial-gradient(
+      ellipse 80% 60% at 50% 40%,
+      rgba(13, 148, 136, 0.12) 0%,
+      transparent 65%
+    );
   }
 }
 
@@ -65,7 +98,14 @@
 }
 
 body {
-  background: var(--background);
+  min-height: 100dvh;
+  min-height: 100svh;
+  background-color: #050a10;
+  background-image: var(--rem-page-overlay), var(--rem-page-bg-image);
+  background-size: cover, cover;
+  background-position: center, center;
+  background-repeat: no-repeat;
+  background-attachment: scroll;
   color: var(--foreground);
   font-family:
     var(--font-geist-sans),
@@ -73,6 +113,64 @@ body {
     "Segoe UI",
     "Noto Sans SC",
     sans-serif;
+}
+
+@media (prefers-color-scheme: light) {
+  body {
+    background-color: #e8f4f4;
+  }
+}
+
+/* 全页壳：与 body 同一背景图，内容区透明叠在上方 */
+.rem-app-shell {
+  min-height: 100dvh;
+  min-height: 100svh;
+  width: 100%;
+}
+
+/* 3D 舞台：透明，让 body 背景透出；WebGL canvas 亦 alpha */
+.rem-stage {
+  position: relative;
+  background: transparent;
+  background-image: var(--rem-stage-veil);
+  background-size: cover;
+  background-position: center top;
+}
+
+.rem-chat-panel {
+  background: var(--rem-panel);
+  backdrop-filter: blur(20px) saturate(1.15);
+  -webkit-backdrop-filter: blur(20px) saturate(1.15);
+}
+
+.rem-glass-edge {
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+@media (prefers-color-scheme: light) {
+  .rem-glass-edge {
+    border-color: rgba(0, 0, 0, 0.08);
+  }
+}
+
+.rem-msg-bubble {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font-family:
+    var(--font-geist-sans),
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    "Noto Sans SC",
+    "PingFang SC",
+    "Hiragino Sans GB",
+    "Microsoft YaHei",
+    sans-serif,
+    "Apple Color Emoji",
+    "Segoe UI Emoji",
+    "Segoe UI Symbol",
+    "Noto Color Emoji";
 }
 
 .rem-voice-bars[data-active="true"] .rem-voice-bar {
@@ -93,7 +191,7 @@ body {
 }
 
 .rem-msg-pop {
-  animation: remPop 0.2s ease forwards;
+  animation: remPop 0.22s ease forwards;
 }
 
 .rem-typing-dot {
@@ -122,10 +220,10 @@ body {
 @keyframes remMicPulse {
   0%,
   100% {
-    box-shadow: 0 0 0 0 rgba(224, 96, 112, 0.4);
+    box-shadow: 0 0 0 0 rgba(45, 212, 191, 0.45);
   }
   50% {
-    box-shadow: 0 0 0 8px rgba(224, 96, 112, 0);
+    box-shadow: 0 0 0 10px rgba(45, 212, 191, 0);
   }
 }
 
@@ -133,7 +231,6 @@ body {
   animation: remMicPulse 1s ease-in-out infinite;
 }
 
-/* 思考气泡：轻微呼吸感 */
 @keyframes remThinking {
   0%,
   100% {

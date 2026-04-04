@@ -1,6 +1,7 @@
 import http from "http";
 import path from "path";
-import { parse } from "url";
+import { parse } from "node:url";
+import type { NextUrlWithParsedQuery } from "next/dist/server/request-meta";
 import next from "next";
 import { WebSocketServer, WebSocket } from "ws";
 import type { Server as HttpServer } from "http";
@@ -13,9 +14,52 @@ import type { ServerMessage } from "./types";
 
 const logger = createLogger("gateway");
 
-export const PORT = 3000;
+/** 与 `listen`、传给 Next 的 `port` 一致；可通过环境变量覆盖（见 README `PORT`） */
+export const PORT = (() => {
+  const n = Number(process.env.PORT);
+  return Number.isFinite(n) && n > 0 && n < 65536 ? Math.floor(n) : 3000;
+})();
+
+/**
+ * Next 的 `hostname` 只能是主机名，不能含端口。误设 `localhost:3000` 或完整 URL 会导致畸形绝对链接/重定向。
+ */
+function remNextHostname(): string {
+  const raw = process.env.REM_NEXT_HOSTNAME?.trim();
+  if (!raw) return "localhost";
+  try {
+    const u = raw.includes("://") ? new URL(raw) : new URL(`http://${raw}`);
+    return u.hostname || "localhost";
+  } catch {
+    return "localhost";
+  }
+}
 const dev = process.env.NODE_ENV !== "production";
 const webDir = path.join(process.cwd(), "web");
+
+/** 少数客户端/代理会把完整 URL 放进 `req.url`，必须先收成 `/path?query`，否则 Next 会拼出畸形重定向 */
+function normalizeIncomingUrl(raw: string | undefined): string {
+  if (!raw) return "/";
+  if (raw.startsWith("http://") || raw.startsWith("https://")) {
+    try {
+      const u = new URL(raw);
+      return u.pathname + u.search;
+    } catch {
+      return "/";
+    }
+  }
+  return raw;
+}
+
+/**
+ * Next 文档与内部实现均以 `url.parse(req.url, true)` 为准；须配合 **await handle()**（handler 为 async）。
+ */
+function parseRequestUrl(req: IncomingMessage): NextUrlWithParsedQuery {
+  return parse(normalizeIncomingUrl(req.url), true) as NextUrlWithParsedQuery;
+}
+
+function requestPathname(req: IncomingMessage): string {
+  return parseRequestUrl(req).pathname ?? "/";
+}
 
 // ── HTTP rate limiter with periodic GC ──
 
@@ -67,8 +111,10 @@ function extractAuthToken(req: IncomingMessage): string | null {
 }
 
 function extractWsToken(req: IncomingMessage): string | null {
-  const { query: qs } = parse(req.url || "", true);
-  if (typeof qs.token === "string") return qs.token;
+  const { query: qs } = parseRequestUrl(req);
+  const t = qs.token;
+  if (typeof t === "string") return t;
+  if (Array.isArray(t) && typeof t[0] === "string") return t[0];
   return extractAuthToken(req);
 }
 
@@ -95,7 +141,13 @@ export function getWsRateLimiter(): ReturnType<typeof createWsRateLimiter> {
 }
 
 export async function createGateway(config: GatewayConfig): Promise<HttpServer> {
-  const nextApp = next({ dev, dir: webDir });
+  /** 与 `listen(PORT)` 一致，供 Next 拼规范 URL。勿用系统环境变量 `HOST`（常为机器名）。 */
+  const nextApp = next({
+    dev,
+    dir: webDir,
+    hostname: remNextHostname(),
+    port: PORT,
+  });
   const handle = nextApp.getRequestHandler();
   await nextApp.prepare();
 
@@ -119,7 +171,7 @@ export async function createGateway(config: GatewayConfig): Promise<HttpServer> 
         return;
       }
 
-      const { pathname } = parse(req.url || "", true);
+      const { pathname } = parseRequestUrl(req);
 
       if (useAuth && !shouldSkipAuth(pathname ?? "/")) {
         const token = extractAuthToken(req);
@@ -138,19 +190,23 @@ export async function createGateway(config: GatewayConfig): Promise<HttpServer> 
         }
       }
 
-      const parsedUrl = parse(req.url || "", true);
-      void handle(req, res, parsedUrl);
-    } catch (err) {
-      logger.error("[HTTP]", { error: err });
-      res.statusCode = 500;
-      res.end("Internal Server Error");
+      const parsedUrl = parseRequestUrl(req);
+      await handle(req, res, parsedUrl);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      const stack = err instanceof Error ? err.stack : undefined;
+      logger.error("[HTTP]", { err: message, stack });
+      if (!res.headersSent) {
+        res.statusCode = 500;
+        res.end("Internal Server Error");
+      }
     }
   });
 
   const wss = new WebSocketServer({ noServer: true });
 
   server.on("upgrade", (req, socket, head) => {
-    const { pathname } = parse(req.url || "");
+    const pathname = requestPathname(req);
     if (pathname !== "/ws") {
       socket.destroy();
       return;
@@ -184,6 +240,16 @@ export async function createGateway(config: GatewayConfig): Promise<HttpServer> 
 }
 
 export function startServer(server: HttpServer): void {
+  server.once("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EADDRINUSE") {
+      logger.error("[Rem AI] 端口已被占用，请结束占用该端口的进程或修改 .env 中的 PORT", {
+        port: PORT,
+      });
+    } else {
+      logger.error("[Rem AI] HTTP 监听失败", { err: err.message, code: err.code });
+    }
+    process.exit(1);
+  });
   server.listen(PORT, () => {
     logger.info(`[Rem AI] 服务已启动 — http://localhost:${PORT}`);
     if (dev) {
