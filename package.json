@@ -1,8 +1,8 @@
 {
-  "name": "rem-ai",
+  "name": "rem-companion-ai",
   "version": "1.0.0",
   "private": true,
-  "description": "这是 Rem AI 项目。",
+  "description": "这是 Rem Companion AI 项目。",
   "main": "dist/server/server.js",
   "workspaces": [
     "web"

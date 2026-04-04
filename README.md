@@ -1,4 +1,4 @@
-# Rem AI
+# Rem Companion AI
 
 实时 AI 陪伴系统 —— 能聊天、有记忆、懂情绪、能说话、有形象。
 
