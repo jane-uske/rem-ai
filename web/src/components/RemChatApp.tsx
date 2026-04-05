@@ -10,6 +10,7 @@ import {
   type RemConnectionPhase,
 } from "@/hooks/useRemChat";
 import { getEmotionLabel } from "@/lib/emotionLabels";
+import type { RemState } from "@/types/avatar";
 
 const Rem3DAvatar = dynamic(
   () =>
@@ -74,10 +75,13 @@ export function RemChatApp() {
     messages,
     sttPartialText,
     streamingText,
+    typing,
     thinkingHint,
     waiting,
+    avatarAction,
     inputPlaceholder,
     recording,
+    userSpeaking,
     voiceActive,
     lipEnvelopeRef,
     hasMic,
@@ -87,6 +91,13 @@ export function RemChatApp() {
 
   const voiceActiveRef = useRef(false);
   voiceActiveRef.current = voiceActive;
+  const remState: RemState = userSpeaking || recording
+    ? "listening"
+    : voiceActive
+      ? "speaking"
+      : typing || waiting
+        ? "thinking"
+        : "idle";
 
   const inputDisabled = !connected || waiting || recording;
   const micDisabled = !connected || !hasMic;
@@ -103,6 +114,8 @@ export function RemChatApp() {
           <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
             <Rem3DAvatar
               emotion={emotion}
+              remState={remState}
+              actionSignal={avatarAction}
               lipEnvelopeRef={lipEnvelopeRef}
               voiceActiveRef={voiceActiveRef}
               variant="stage"

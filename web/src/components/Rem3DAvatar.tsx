@@ -4,10 +4,13 @@ import type { MutableRefObject } from "react";
 import { useEffect, useRef, useState } from "react";
 import { getEmotionLabel } from "@/lib/emotionLabels";
 import { RemVrmViewer, type VrmViewerState } from "@/lib/rem3d/vrmViewer";
+import type { AvatarActionCommand, RemState } from "@/types/avatar";
 
 export type Rem3DAvatarProps = {
   /** 与 WebSocket `emotion` 一致：neutral / happy / curious / shy / sad */
   emotion: string;
+  remState?: RemState;
+  actionSignal?: { action: AvatarActionCommand; nonce: number } | null;
   /** TTS 实时音量包络 0–1（useAudioBase64Queue） */
   lipEnvelopeRef: MutableRefObject<number>;
   /** 是否正在播放 TTS（口型在 Web Audio 不可用时回退） */
@@ -22,6 +25,8 @@ export type Rem3DAvatarProps = {
  */
 export function Rem3DAvatar({
   emotion,
+  remState = "idle",
+  actionSignal = null,
   lipEnvelopeRef,
   voiceActiveRef,
   className = "",
@@ -64,6 +69,20 @@ export function Rem3DAvatar({
   useEffect(() => {
     viewerRef.current?.setEmotion(emotion);
   }, [emotion]);
+
+  useEffect(() => {
+    viewerRef.current?.setState(remState);
+  }, [remState]);
+
+  useEffect(() => {
+    if (!actionSignal) return;
+    const { action } = actionSignal;
+    viewerRef.current?.playAction(
+      action.action,
+      action.intensity,
+      action.duration,
+    );
+  }, [actionSignal]);
 
   const shell =
     isStage

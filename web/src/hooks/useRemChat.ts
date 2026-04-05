@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getRemWsUrl } from "@/lib/wsUrl";
 import type { ChatMessage } from "@/types/chat";
+import type { AvatarActionCommand } from "@/types/avatar";
 import { useAudioBase64Queue } from "@/hooks/useAudioBase64Queue";
 import { startPcmCapture, type PcmCapture } from "@/lib/pcmCapture";
 
@@ -89,6 +90,10 @@ export function useRemChat() {
   /** 首 token 前：展示「Rem 在想…」（S9） */
   const thinkingHint = typing && streamingText.length === 0;
   const [waiting, setWaiting] = useState(false);
+  const [avatarAction, setAvatarAction] = useState<{
+    action: AvatarActionCommand;
+    nonce: number;
+  } | null>(null);
   const [inputPlaceholder, setInputPlaceholder] = useState("说点什么…");
   const [recording, setRecording] = useState(false);
   const [duplex, setDuplex] = useState(false);
@@ -402,6 +407,23 @@ export function useRemChat() {
           break;
         }
 
+        case "avatar_frame": {
+          const frame = data.frame as
+            | {
+                action?: AvatarActionCommand;
+                emotion?: string;
+              }
+            | undefined;
+          if (frame?.emotion) setEmotion(String(frame.emotion));
+          if (frame?.action) {
+            setAvatarAction({
+              action: frame.action,
+              nonce: Date.now() + Math.floor(Math.random() * 1000),
+            });
+          }
+          break;
+        }
+
         /* ── Full-duplex events ── */
 
         case "interrupt": {
@@ -560,6 +582,7 @@ export function useRemChat() {
     typing,
     thinkingHint,
     waiting,
+    avatarAction,
     inputPlaceholder,
     recording,
     duplex,

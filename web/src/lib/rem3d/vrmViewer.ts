@@ -8,6 +8,7 @@ import {
   VRMHumanBoneName,
   VRMUtils,
 } from "@pixiv/three-vrm";
+import type { RemState } from "@/types/avatar";
 
 /** 关闭每帧「归一化骨骼 → 蒙皮」的自动同步，改由我们直接写 raw 骨骼，否则摆好的手臂会被覆盖回 T-pose */
 const VRM_LOADER_OPTIONS = { autoUpdateHumanBones: false as const };
@@ -117,6 +118,14 @@ export class RemVrmViewer {
   private loopStarted = false;
   /** Smoothed 0–1 lip opening driven by TTS envelope */
   private lipSmoothed = 0;
+  private remState: RemState = "idle";
+  private activeAction:
+    | {
+        name: string;
+        intensity: number;
+        endAtMs: number;
+      }
+    | null = null;
 
   readonly onStateChange?: (s: VrmViewerState, err?: string) => void;
   private readonly getLipEnvelope?: () => number;
@@ -405,6 +414,12 @@ export class RemVrmViewer {
       this.gestureT = Math.max(0, this.gestureT - 0.02);
     }
     const g = this.gestureT;
+    const now = Date.now();
+
+    if (this.activeAction && now >= this.activeAction.endAtMs) {
+      this.activeAction = null;
+    }
+    const action = this.activeAction;
 
     // 头部由 vrm.update 内 LookAt 控制，此处不再改 head/neck，避免每帧叠加或抢视线
 
@@ -443,6 +458,24 @@ export class RemVrmViewer {
       if (llArm && rlArm) {
         rlArm.rotation.x = 0.28 + Math.sin(t * 0.88) * 0.04;
         llArm.rotation.x = 0.28 + Math.sin(t * 0.9) * 0.04;
+      }
+    }
+
+    if (chest && this.remState === "thinking") {
+      chest.rotation.y += Math.sin(t * 1.8) * 0.045;
+    }
+
+    if (action && ruArm && luArm && chest) {
+      const k = Math.max(0.2, Math.min(1, action.intensity || 0.6));
+      if (action.name === "nod") {
+        chest.rotation.x += Math.sin(t * 7.5) * 0.06 * k;
+      } else if (action.name === "shake_head") {
+        chest.rotation.y += Math.sin(t * 8.2) * 0.11 * k;
+      } else if (action.name === "wave") {
+        ruArm.rotation.z += 0.5 * k;
+        ruArm.rotation.x += Math.sin(t * 10.5) * 0.28 * k;
+      } else if (action.name === "tilt_head") {
+        chest.rotation.z += 0.12 * k;
       }
     }
   }
@@ -578,6 +611,22 @@ export class RemVrmViewer {
     if (this.vrm) {
       applyEmotionToVrm(this.vrm, next);
     }
+  }
+
+  setState(state: RemState): void {
+    this.remState = state;
+  }
+
+  playAction(action: string, intensity: number, duration: number): void {
+    const safeDuration = Number.isFinite(duration)
+      ? Math.max(200, Math.min(duration, 4000))
+      : 700;
+    this.activeAction = {
+      name: action,
+      intensity: Number.isFinite(intensity) ? intensity : 0.6,
+      endAtMs: Date.now() + safeDuration,
+    };
+    this.gestureT = 1;
   }
 
   resize(): void {
