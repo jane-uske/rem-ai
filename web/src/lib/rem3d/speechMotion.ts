@@ -45,6 +45,9 @@ export class SpeechMotionController {
   private mouthOpen = 0;
   private mouthRound = 0;
   private speakingHold = 0;
+  private speakingIntro = 0;
+  private speakingOutro = 0;
+  private wasActivelySpeaking = false;
   private blinkTimer = pickBlinkInterval(false);
   private blinkPhase = 0;
   private gazeX = 0;
@@ -58,6 +61,9 @@ export class SpeechMotionController {
     this.mouthOpen = 0;
     this.mouthRound = 0;
     this.speakingHold = 0;
+    this.speakingIntro = 0;
+    this.speakingOutro = 0;
+    this.wasActivelySpeaking = false;
     this.blinkTimer = pickBlinkInterval(false);
     this.blinkPhase = 0;
     this.gazeX = 0;
@@ -72,6 +78,13 @@ export class SpeechMotionController {
     const emotion = String(input.emotion || "neutral").toLowerCase();
     const lip = clamp01(input.lipEnvelope);
     const activeSpeech = input.voiceActive || lip > 0.045;
+    if (activeSpeech && !this.wasActivelySpeaking) {
+      this.speakingIntro = 1;
+      this.speakingOutro = 0;
+    } else if (!activeSpeech && this.wasActivelySpeaking) {
+      this.speakingOutro = 1;
+    }
+    this.wasActivelySpeaking = activeSpeech;
 
     if (activeSpeech) {
       this.speakingHold = SPEECH_HOLD_SECONDS;
@@ -86,6 +99,8 @@ export class SpeechMotionController {
     const targetSpeech = Math.max(lip, fallbackChatter, this.speakingHold > 0 ? 0.08 : 0);
     const speechSpeed = targetSpeech > this.speakingAmount ? 15 : 10.5;
     this.speakingAmount = smooth(this.speakingAmount, targetSpeech, speechSpeed, delta);
+    this.speakingIntro = Math.max(0, this.speakingIntro - delta / 0.28);
+    this.speakingOutro = Math.max(0, this.speakingOutro - delta / 0.42);
 
     const talkPulse = 0.5 + 0.5 * Math.sin(input.elapsed * 18.5);
     const mouthTarget = clamp01(
@@ -111,6 +126,8 @@ export class SpeechMotionController {
     const speaking = this.speakingAmount;
     const thinking = input.remState === "thinking" ? 1 : 0;
     const listening = input.remState === "listening" ? 1 : 0;
+    const introPulse = Math.sin((1 - this.speakingIntro) * Math.PI);
+    const outroEase = this.speakingOutro * this.speakingOutro;
 
     const speechBob = Math.sin(input.elapsed * 5.4) * speaking;
     const microSway = Math.sin(input.elapsed * 0.9) * 0.5 + Math.sin(input.elapsed * 1.7 + 1.2) * 0.5;
@@ -144,6 +161,15 @@ export class SpeechMotionController {
     if (speaking > 0.08) {
       expressions[VRMExpressionPresetName.Relaxed] = 0.06 + speaking * 0.1;
     }
+    if (emotion === "happy" && speaking > 0.08) {
+      expressions[VRMExpressionPresetName.Happy] = 0.04 + speaking * 0.08;
+    }
+    if (emotion === "sad" && speaking > 0.08) {
+      expressions[VRMExpressionPresetName.Sad] = 0.04 + speaking * 0.07;
+    }
+    if (emotion === "shy" && speaking > 0.08) {
+      expressions[VRMExpressionPresetName.Happy] = 0.03 + speaking * 0.04;
+    }
     if (emotion === "curious" && speaking > 0.1) {
       expressions[VRMExpressionPresetName.Surprised] = 0.04 + speaking * 0.06;
     }
@@ -151,14 +177,20 @@ export class SpeechMotionController {
     return {
       expressions,
       speakingAmount: speaking,
-      chestPitch: 0.012 * speechBob + 0.018 * thinking,
+      chestPitch:
+        0.012 * speechBob +
+        0.018 * thinking -
+        0.012 * introPulse * this.speakingIntro +
+        0.008 * outroEase,
       chestYaw: 0.012 * microSway + 0.01 * speaking * Math.sin(input.elapsed * 2.7),
       chestRoll: emotionRollBias * (0.45 + speaking * 0.55),
       neckPitch:
         emotionPitchBias +
         0.01 * speechBob +
         0.02 * listening +
-        0.01 * Math.sin(input.elapsed * 1.3 + 0.6),
+        0.01 * Math.sin(input.elapsed * 1.3 + 0.6) -
+        0.024 * introPulse * this.speakingIntro +
+        0.01 * outroEase,
       neckYaw:
         this.gazeX * 0.08 +
         0.02 * speaking * Math.sin(input.elapsed * 3.1 + 0.4),
