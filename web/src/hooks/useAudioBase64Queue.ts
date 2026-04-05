@@ -197,57 +197,55 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
 
   const playBase64Fallback = useCallback(
     (base64: string, generationAtCall: number) => {
-      if (typeof window === "undefined") return;
+      if (typeof window === "undefined") return Promise.resolve();
       const url = base64ToObjectUrl(base64);
-      if (!url) return;
+      if (!url) return Promise.resolve();
       if (generationRef.current !== generationAtCall) {
         URL.revokeObjectURL(url);
-        return;
+        return Promise.resolve();
       }
 
-      const audio = new Audio(url);
-      audio.preload = "auto";
-      audio.setAttribute("playsinline", "");
-      fallbackAudioRef.current = audio;
+      return new Promise<void>((resolve) => {
+        const audio = new Audio(url);
+        audio.preload = "auto";
+        audio.muted = false;
+        audio.volume = 1;
+        audio.setAttribute("playsinline", "");
+        fallbackAudioRef.current = audio;
 
-      const cleanup = () => {
-        if (fallbackAudioRef.current === audio) fallbackAudioRef.current = null;
-        URL.revokeObjectURL(url);
-        audio.onended = null;
-        audio.onerror = null;
-      };
+        const cleanup = () => {
+          if (fallbackAudioRef.current === audio) fallbackAudioRef.current = null;
+          URL.revokeObjectURL(url);
+          audio.onended = null;
+          audio.onerror = null;
+          audio.onplaying = null;
+        };
 
-      audio.onended = () => {
-        cleanup();
-        if (generationRef.current !== generationAtCall) return;
-        playingRef.current = false;
-        playbackNotifiedRef.current = false;
-        stopEnvelopeLoop();
-        sync();
-      };
-      audio.onerror = () => {
-        cleanup();
-        if (generationRef.current !== generationAtCall) return;
-        playingRef.current = false;
-        playbackNotifiedRef.current = false;
-        stopEnvelopeLoop();
-        sync();
-      };
+        const finish = () => {
+          cleanup();
+          if (generationRef.current === generationAtCall) {
+            playingRef.current = false;
+            playbackNotifiedRef.current = false;
+            stopEnvelopeLoop();
+            sync();
+          }
+          resolve();
+        };
 
-      playingRef.current = true;
-      sync();
-      if (!playbackNotifiedRef.current) {
-        playbackNotifiedRef.current = true;
-        onPlaybackStartRef.current?.();
-      }
+        audio.onplaying = () => {
+          playingRef.current = true;
+          sync();
+          if (!playbackNotifiedRef.current) {
+            playbackNotifiedRef.current = true;
+            onPlaybackStartRef.current?.();
+          }
+        };
+        audio.onended = finish;
+        audio.onerror = finish;
 
-      void audio.play().catch(() => {
-        cleanup();
-        if (generationRef.current !== generationAtCall) return;
-        playingRef.current = false;
-        playbackNotifiedRef.current = false;
-        stopEnvelopeLoop();
-        sync();
+        void audio.play().catch(() => {
+          finish();
+        });
       });
     },
     [stopEnvelopeLoop, sync],
@@ -260,25 +258,10 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
         .catch(() => {})
         .then(async () => {
           if (generationRef.current !== generationAtCall) return;
-          const bytes = base64ToUint8Array(base64);
-          if (!bytes) return;
-          const ctx = await ensureAudioGraph();
-          if (!ctx || generationRef.current !== generationAtCall) {
-            playBase64Fallback(base64, generationAtCall);
-            return;
-          }
-          let decoded: AudioBuffer;
-          try {
-            decoded = await ctx.decodeAudioData(toArrayBuffer(bytes));
-          } catch {
-            playBase64Fallback(base64, generationAtCall);
-            return;
-          }
-          if (generationRef.current !== generationAtCall) return;
-          await scheduleAudioBuffer(decoded, generationAtCall);
+          await playBase64Fallback(base64, generationAtCall);
         });
     },
-    [ensureAudioGraph, playBase64Fallback, scheduleAudioBuffer],
+    [playBase64Fallback],
   );
 
   /** Stop current playback and discard all queued audio (used on interrupt). */
