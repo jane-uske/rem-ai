@@ -227,18 +227,22 @@ export class SpeechMotionController {
   private updateGaze(delta: number, emotion: string, voiceActive: boolean): void {
     this.gazeRetargetIn -= delta;
     if (this.gazeRetargetIn <= 0) {
-      const rangeX = voiceActive ? 0.1 : 0.16;
-      const rangeY = voiceActive ? 0.06 : 0.11;
+      const quiet = !voiceActive && this.speakingAmount < 0.05;
+      const rangeX = voiceActive ? 0.045 : quiet ? 0.05 : 0.08;
+      const rangeY = voiceActive ? 0.03 : quiet ? 0.04 : 0.06;
       const biasY =
-        emotion === "curious" ? 0.035
-        : emotion === "shy" || emotion === "sad" ? -0.04
+        emotion === "curious" ? 0.018
+        : emotion === "shy" || emotion === "sad" ? -0.02
         : 0;
-      this.gazeTargetX = (Math.random() * 2 - 1) * rangeX;
-      this.gazeTargetY = clamp01((Math.random() * 2 - 1) * rangeY + 0.5) - 0.5 + biasY;
-      this.gazeRetargetIn = 1.1 + Math.random() * 1.8;
+      this.gazeTargetX = quiet
+        ? (Math.random() * 2 - 1) * rangeX * 0.4
+        : (Math.random() * 2 - 1) * rangeX;
+      this.gazeTargetY =
+        clamp01((Math.random() * 2 - 1) * rangeY + 0.5) - 0.5 + biasY;
+      this.gazeRetargetIn = quiet ? 1.8 + Math.random() * 1.6 : 1.2 + Math.random() * 1.2;
     }
 
-    this.gazeX = smooth(this.gazeX, this.gazeTargetX, 3.4, delta);
-    this.gazeY = smooth(this.gazeY, this.gazeTargetY, 3.1, delta);
+    this.gazeX = smooth(this.gazeX, this.gazeTargetX, 2.8, delta);
+    this.gazeY = smooth(this.gazeY, this.gazeTargetY, 2.6, delta);
   }
 }
