@@ -195,34 +195,6 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
     [ensureAudioGraph, scheduleAudioBuffer],
   );
 
-  const enqueueBase64 = useCallback(
-    (base64: string) => {
-      const generationAtCall = generationRef.current;
-      decodeChainRef.current = decodeChainRef.current
-        .catch(() => {})
-        .then(async () => {
-          if (generationRef.current !== generationAtCall) return;
-          const bytes = base64ToUint8Array(base64);
-          if (!bytes) return;
-          const ctx = await ensureAudioGraph();
-          if (!ctx || generationRef.current !== generationAtCall) {
-            playBase64Fallback(base64, generationAtCall);
-            return;
-          }
-          let decoded: AudioBuffer;
-          try {
-            decoded = await ctx.decodeAudioData(toArrayBuffer(bytes));
-          } catch {
-            playBase64Fallback(base64, generationAtCall);
-            return;
-          }
-          if (generationRef.current !== generationAtCall) return;
-          await scheduleAudioBuffer(decoded, generationAtCall);
-        });
-    },
-    [ensureAudioGraph, playBase64Fallback, scheduleAudioBuffer],
-  );
-
   const playBase64Fallback = useCallback(
     (base64: string, generationAtCall: number) => {
       if (typeof window === "undefined") return;
@@ -279,6 +251,34 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
       });
     },
     [stopEnvelopeLoop, sync],
+  );
+
+  const enqueueBase64 = useCallback(
+    (base64: string) => {
+      const generationAtCall = generationRef.current;
+      decodeChainRef.current = decodeChainRef.current
+        .catch(() => {})
+        .then(async () => {
+          if (generationRef.current !== generationAtCall) return;
+          const bytes = base64ToUint8Array(base64);
+          if (!bytes) return;
+          const ctx = await ensureAudioGraph();
+          if (!ctx || generationRef.current !== generationAtCall) {
+            playBase64Fallback(base64, generationAtCall);
+            return;
+          }
+          let decoded: AudioBuffer;
+          try {
+            decoded = await ctx.decodeAudioData(toArrayBuffer(bytes));
+          } catch {
+            playBase64Fallback(base64, generationAtCall);
+            return;
+          }
+          if (generationRef.current !== generationAtCall) return;
+          await scheduleAudioBuffer(decoded, generationAtCall);
+        });
+    },
+    [ensureAudioGraph, playBase64Fallback, scheduleAudioBuffer],
   );
 
   /** Stop current playback and discard all queued audio (used on interrupt). */
