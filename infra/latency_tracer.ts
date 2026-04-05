@@ -132,7 +132,18 @@ export class LatencyTracer {
     const start = timestamps[startKey];
     const end = timestamps[endKey];
     if (start === undefined || end === undefined) return undefined;
+    if (end < start) return undefined;
     return end - start;
+  }
+
+  findActiveTraceIdByGenerationId(generationId: number): string | null {
+    let candidate: string | null = null;
+    for (const [traceId, trace] of this.traces) {
+      if (trace.completed) continue;
+      if (trace.context?.generationId !== generationId) continue;
+      candidate = traceId;
+    }
+    return candidate;
   }
 
   /** Compute all latency metrics from the current timestamps. */

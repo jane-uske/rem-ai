@@ -21,6 +21,17 @@ interface BuildPromptInput {
   priorityContext?: string;
 }
 
+function parsePositiveInt(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+function trimTextByChars(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
 const EMOTION_STYLE: Record<Emotion, string> = {
   neutral: "平静、温柔地回复。",
   happy: "开心地回复，语气轻快、带一点撒娇，可以用「～」「！」。",
@@ -35,10 +46,14 @@ function buildSystemPrompt(
   priorityContext?: string,
 ): string {
   const sections: string[] = [];
+  const maxPriorityChars = parsePositiveInt(process.env.MAX_PRIORITY_CONTEXT_CHARS, 700);
+  const maxMemoryEntries = parsePositiveInt(process.env.MAX_PROMPT_MEMORY_ENTRIES, 6);
+  const maxMemoryValueChars = parsePositiveInt(process.env.MAX_PROMPT_MEMORY_VALUE_CHARS, 48);
 
   if (priorityContext?.trim()) {
     sections.push(
-      "【优先参考（请自然融入对话，不要逐条复述）】\n" + priorityContext.trim(),
+      "【优先参考（请自然融入对话，不要逐条复述）】\n" +
+        trimTextByChars(priorityContext.trim(), maxPriorityChars),
     );
   }
 
@@ -50,7 +65,10 @@ function buildSystemPrompt(
   );
 
   if (memory.length > 0) {
-    const memoryLines = memory.map((m) => `- ${m.key}：${m.value}`).join("\n");
+    const memoryLines = memory
+      .slice(0, maxMemoryEntries)
+      .map((m) => `- ${m.key}：${trimTextByChars(m.value, maxMemoryValueChars)}`)
+      .join("\n");
     sections.push(`用户信息：\n${memoryLines}`);
   }
 

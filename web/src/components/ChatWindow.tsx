@@ -8,6 +8,7 @@ export type ChatWindowProps = {
   messages: ChatMessage[];
   sttPartialText: string;
   streamingText: string;
+  listeningHint: boolean;
   /** STT 结束或发送消息后、首 token 到达前 */
   thinkingHint: boolean;
 };
@@ -16,6 +17,7 @@ export function ChatWindow({
   messages,
   sttPartialText,
   streamingText,
+  listeningHint,
   thinkingHint,
 }: ChatWindowProps) {
   const scrollerRef = useRef<HTMLDivElement>(null);
@@ -40,7 +42,7 @@ export function ChatWindow({
     if (!scroller) return;
     const behavior: ScrollBehavior = addedMessage ? "smooth" : "auto";
     scroller.scrollTo({ top: scroller.scrollHeight, behavior });
-  }, [messages, sttPartialText, streamingText, thinkingHint]);
+  }, [messages, sttPartialText, streamingText, listeningHint, thinkingHint]);
 
   useEffect(() => {
     const next = streamingText;
@@ -76,6 +78,14 @@ export function ChatWindow({
         ))}
         {sttPartialText ? (
           <MessageBubble role="partial">{sttPartialText}</MessageBubble>
+        ) : null}
+        {listeningHint ? (
+          <div
+            role="status"
+            className="flex max-w-[85%] flex-wrap items-center gap-2 self-start rounded-2xl rounded-bl-md border border-white/10 bg-white/[0.05] px-4 py-3 text-sm text-[var(--rem-dim)] backdrop-blur-md"
+          >
+            <span>正在听你说…</span>
+          </div>
         ) : null}
         {streamingText ? (
           <MessageBubble role="rem">{streamingText}</MessageBubble>

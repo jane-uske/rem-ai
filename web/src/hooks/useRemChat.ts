@@ -51,6 +51,32 @@ export type RemConnectionPhase = "connecting" | "open" | "closed";
 
 const MESSAGE_STORAGE_KEY = "rem-chat-messages-v1";
 const MESSAGE_STORAGE_MAX = 50;
+const USER_SPEAKING_END_DEBOUNCE_MS = 260;
+const STT_FALLBACK_PREFIX = "录音中";
+const STT_USER_MERGE_WINDOW_MS = 2200;
+
+function isListeningFallbackText(text: string): boolean {
+  return text.startsWith(STT_FALLBACK_PREFIX);
+}
+
+function normalizeTranscriptForMerge(text: string): string {
+  return text.replace(/\s+/g, "").replace(/[，。！？,.!?、；;:“”"'`~·\-]/g, "");
+}
+
+function mergeTranscriptTexts(prev: string, next: string): string | null {
+  const a = prev.trim();
+  const b = next.trim();
+  if (!a || !b) return null;
+  if (a === b) return a;
+
+  const na = normalizeTranscriptForMerge(a);
+  const nb = normalizeTranscriptForMerge(b);
+  if (!na || !nb) return null;
+  if (na === nb) return b.length >= a.length ? b : a;
+  if (nb.startsWith(na)) return b;
+  if (na.startsWith(nb)) return a;
+  return null;
+}
 
 function loadPersistedMessages(): ChatMessage[] {
   if (typeof window === "undefined") return [];
@@ -87,9 +113,9 @@ export function useRemChat() {
   const [streamingText, setStreamingText] = useState("");
   const [sttPartialText, setSttPartialText] = useState("");
   const [typing, setTyping] = useState(false);
-  /** 首 token 前：展示「Rem 在想…」（S9） */
-  const thinkingHint = typing && streamingText.length === 0;
   const [waiting, setWaiting] = useState(false);
+  /** 首 token 前：展示「Rem 在想…」（S9） */
+  const thinkingHint = waiting && streamingText.length === 0;
   const [avatarAction, setAvatarAction] = useState<{
     action: AvatarActionCommand;
     nonce: number;
@@ -104,6 +130,8 @@ export function useRemChat() {
   const duplexRef = useRef(false);
   const pcmRef = useRef<PcmCapture | null>(null);
   const recordingRef = useRef(false);
+  const userSpeakingEndTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastUserTranscriptAtRef = useRef(0);
   const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const streamingBufRef = useRef("");
   const mountedRef = useRef(true);
@@ -117,6 +145,35 @@ export function useRemChat() {
     blockedGenerationsRef.current.clear();
   }, []);
   const hasAnnouncedConnectedRef = useRef(false);
+
+  const clearUserSpeakingEndTimer = useCallback(() => {
+    if (userSpeakingEndTimerRef.current) {
+      clearTimeout(userSpeakingEndTimerRef.current);
+      userSpeakingEndTimerRef.current = null;
+    }
+  }, []);
+
+  const appendUserTranscript = useCallback((content: string) => {
+    const trimmed = content.trim();
+    if (!trimmed) return;
+    const now = Date.now();
+    setMessages((prev) => {
+      const last = prev[prev.length - 1];
+      if (
+        last?.role === "user" &&
+        now - lastUserTranscriptAtRef.current <= STT_USER_MERGE_WINDOW_MS
+      ) {
+        const merged = mergeTranscriptTexts(last.text, trimmed);
+        if (merged) {
+          const next = [...prev];
+          next[next.length - 1] = { ...last, text: merged };
+          return next;
+        }
+      }
+      return [...prev, { id: uid(), role: "user", text: trimmed }];
+    });
+    lastUserTranscriptAtRef.current = now;
+  }, []);
 
   const blockGeneration = useCallback((id: number) => {
     const blocked = blockedGenerationsRef.current;
@@ -140,10 +197,14 @@ export function useRemChat() {
     return null;
   }, []);
 
-  const handlePlaybackStart = useCallback(() => {
+  const handlePlaybackStart = useCallback((generationId: number | null) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: "playback_start" }));
+    const payload: Record<string, unknown> = { type: "playback_start" };
+    if (typeof generationId === "number") {
+      payload.generationId = generationId;
+    }
+    ws.send(JSON.stringify(payload));
   }, []);
 
   const { enqueueBase64, enqueuePcmChunk, clearQueue, unlockPlayback, voiceActive, lipEnvelopeRef } =
@@ -278,9 +339,10 @@ export function useRemChat() {
     setDuplex(false);
     setRecording(false);
     recordingRef.current = false;
+    clearUserSpeakingEndTimer();
     setUserSpeaking(false);
     setInputPlaceholder("说点什么…");
-  }, [clearGenerationState]);
+  }, [clearGenerationState, clearUserSpeakingEndTimer]);
 
   const toggleMic = useCallback(() => {
     if (recordingRef.current) {
@@ -400,7 +462,7 @@ export function useRemChat() {
         case "voice":
           if (!allowServerGeneration("voice", data.generationId)) break;
           if (typeof data.audio === "string") {
-            enqueueBase64(data.audio);
+            enqueueBase64(data.audio, parseGenerationId(data.generationId));
           }
           break;
 
@@ -409,7 +471,11 @@ export function useRemChat() {
           if (!allowServerGeneration("voice_pcm_chunk", data.generationId)) break;
           if (typeof data.audio === "string") {
             const rate = Number(data.sampleRate);
-            enqueuePcmChunk(data.audio, Number.isFinite(rate) && rate > 0 ? rate : 24000);
+            enqueuePcmChunk(
+              data.audio,
+              Number.isFinite(rate) && rate > 0 ? rate : 24000,
+              parseGenerationId(data.generationId),
+            );
           }
           break;
         }
@@ -448,24 +514,42 @@ export function useRemChat() {
         }
 
         case "vad_start":
-          setSttPartialText("");
+          clearUserSpeakingEndTimer();
+          setSttPartialText((prev) => (isListeningFallbackText(prev) ? "" : prev));
           setUserSpeaking(true);
           setInputPlaceholder("正在听…");
           break;
 
         case "vad_end":
-          setUserSpeaking(false);
+          clearUserSpeakingEndTimer();
+          userSpeakingEndTimerRef.current = setTimeout(() => {
+            userSpeakingEndTimerRef.current = null;
+            setUserSpeaking(false);
+            if (recordingRef.current) {
+              setInputPlaceholder("全双工语音 — 随时说话…");
+            }
+          }, USER_SPEAKING_END_DEBOUNCE_MS);
           break;
 
-        case "stt_partial":
-          setSttPartialText(String(data.content ?? "").trim());
+        case "stt_partial": {
+          const partial = String(data.content ?? "").trim();
+          if (!partial) break;
+          setSttPartialText((prev) => {
+            if (isListeningFallbackText(partial)) {
+              return isListeningFallbackText(prev) ? "" : prev;
+            }
+            return partial;
+          });
           break;
+        }
 
         case "stt_final": {
           const content = String(data.content ?? "");
           activeGenerationRef.current = null;
+          clearUserSpeakingEndTimer();
+          setUserSpeaking(false);
           setSttPartialText("");
-          setMessages((m) => [...m, { id: uid(), role: "user", text: content }]);
+          appendUserTranscript(content);
           setInputPlaceholder("说点什么…");
           if (!duplexRef.current) {
             waitingRef.current = true;
@@ -476,6 +560,8 @@ export function useRemChat() {
         }
 
         case "error": {
+          clearUserSpeakingEndTimer();
+          setUserSpeaking(false);
           setTyping(false);
           setSttPartialText("");
           resetStreaming();
@@ -536,10 +622,11 @@ export function useRemChat() {
     connectRef.current?.();
     return () => {
       mountedRef.current = false;
+      clearUserSpeakingEndTimer();
       if (reconnectRef.current) clearTimeout(reconnectRef.current);
       wsRef.current?.close();
     };
-  }, [allowServerGeneration, appendStreaming, blockGeneration, clearGenerationState, clearQueue, enqueueBase64, enqueuePcmChunk, parseGenerationId, resetStreaming, stopVoiceSession]);
+  }, [allowServerGeneration, appendStreaming, appendUserTranscript, blockGeneration, clearGenerationState, clearQueue, clearUserSpeakingEndTimer, enqueueBase64, enqueuePcmChunk, parseGenerationId, resetStreaming, stopVoiceSession]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -598,6 +685,7 @@ export function useRemChat() {
     recording,
     duplex,
     userSpeaking,
+    listeningHint: recording && userSpeaking && !sttPartialText,
     voiceActive,
     /** TTS 音量包络 0–1，供 3D 口型同步 */
     lipEnvelopeRef,

@@ -3,6 +3,7 @@ import { buildPrompt, type PromptMessage } from "../brain/prompt_builder";
 import type { Emotion } from "../emotion/emotion_state";
 import type { Memory } from "../memory/memory_store";
 import { createLogger } from "../infra/logger";
+import { estimateTextTokens } from "./history_budget";
 
 const logger = createLogger("fast_brain");
 
@@ -36,6 +37,16 @@ export async function* fastBrainStream(
     history: input.history,
     userMessage: input.userMessage,
     priorityContext,
+  });
+  const promptText = messages.map((m) => m.content).join("\n");
+  const promptChars = messages.reduce((sum, msg) => sum + msg.content.length, 0);
+  logger.info("LLM prompt stats", {
+    messages: messages.length,
+    estimatedTokens: estimateTextTokens(promptText),
+    promptChars,
+    memoryCount: input.memory.length,
+    historyMessages: input.history.length,
+    priorityChars: priorityContext?.length ?? 0,
   });
 
   const configured =

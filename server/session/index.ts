@@ -66,6 +66,10 @@ function sttPreviewWindowMs(): number {
   return parseNonNegativeMs(process.env.STT_PREVIEW_WINDOW_MS, 4200);
 }
 
+function sttPreviewSettleMs(): number {
+  return parseNonNegativeMs(process.env.STT_PREVIEW_SETTLE_MS, 260);
+}
+
 /** Minimum utterance duration to run STT after VAD speech_end. */
 function minSpeechMs(): number {
   return parseNonNegativeMs(process.env.VAD_MIN_UTTERANCE_MS, 220);
@@ -105,6 +109,42 @@ function silenceNudgeMs(): number {
 
 function endsWithSentencePunctuation(text: string): boolean {
   return /[。！？.!?]\s*$/.test(text);
+}
+
+function normalizeSpeechText(text: string): string {
+  return text
+    .trim()
+    .replace(/\s+/g, "")
+    .replace(/[，。！？,.!?、；;：“”"'`~·…\-]/g, "");
+}
+
+function isTentativeSpeechText(text: string): boolean {
+  const normalized = normalizeSpeechText(text);
+  if (!normalized) return false;
+
+  if (/^(嗯+|啊+|呃+|额+|唔+|哦+|欸+|诶+|哎+|em+)$/.test(normalized)) {
+    return true;
+  }
+
+  return [
+    "这个",
+    "那个",
+    "等下",
+    "等一下",
+    "等等",
+    "稍等",
+    "我想想",
+    "我想一下",
+    "让我想想",
+    "先想想",
+    "我先想想",
+    "容我想想",
+    "想一下",
+  ].includes(normalized);
+}
+
+function hesitationHoldMs(): number {
+  return parseNonNegativeMs(process.env.VAD_UTTERANCE_GAP_HESITATION_MS, 980);
 }
 
 export class ConnectionSession {
@@ -290,25 +330,33 @@ export class ConnectionSession {
     const releaseMs = parseNonNegativeMs(process.env.VAD_UTTERANCE_GAP_PREVIEW_RELEASE_MS, 60);
     const minMs = parseNonNegativeMs(process.env.VAD_UTTERANCE_GAP_PREVIEW_MIN_MS, 80);
     const maxMs = parseNonNegativeMs(process.env.VAD_UTTERANCE_GAP_PREVIEW_MAX_MS, 520);
+    const tentative = isTentativeSpeechText(preview);
     const sentenceClosed = endsWithSentencePunctuation(preview);
+    let gap = base;
 
-    if (sentenceClosed) {
-      return Math.max(minMs, base - releaseMs);
+    if (tentative) {
+      gap = Math.max(gap, hesitationHoldMs());
+    } else if (sentenceClosed) {
+      gap = Math.max(minMs, base - releaseMs);
+    } else if (preview.length >= 8) {
+      gap = Math.min(maxMs, base + holdMs);
     }
-    if (preview.length >= 8) {
-      return Math.min(maxMs, base + holdMs);
+
+    const settleMs = sttPreviewSettleMs();
+    if (settleMs > 0 && !sentenceClosed && this.lastPreviewAt > 0) {
+      const age = Date.now() - this.lastPreviewAt;
+      if (age < settleMs) {
+        gap = Math.max(gap, settleMs - age);
+      }
     }
-    return base;
+    return gap;
   }
 
   private scheduleSttPreview(speechMs: number): void {
-    const fallback = `录音中… ${(speechMs / 1000).toFixed(1)}s`;
     if (!this.stt.canPreviewPcm()) {
-      this.emitSttPartial(fallback);
       return;
     }
     if (speechMs < sttPreviewMinSpeechMs()) {
-      this.emitSttPartial(fallback);
       return;
     }
     if (this.previewInFlight || this.previewTimer) return;
@@ -343,14 +391,18 @@ export class ConnectionSession {
       }
 
       const durMs = (this.speechBufferBytes / 2 / this.duplexSampleRate) * 1000;
-      this.emitSttPartial(`录音中… ${(durMs / 1000).toFixed(1)}s`);
+      if (!this.lastPreviewText) {
+        this.emitSttPartial(`录音中… ${(durMs / 1000).toFixed(1)}s`);
+      }
     } catch (err) {
       logger.debug("[STT preview]", {
         connId: this.connId,
         error: (err as Error).message,
       });
       const durMs = (this.speechBufferBytes / 2 / this.duplexSampleRate) * 1000;
-      this.emitSttPartial(`录音中… ${(durMs / 1000).toFixed(1)}s`);
+      if (!this.lastPreviewText) {
+        this.emitSttPartial(`录音中… ${(durMs / 1000).toFixed(1)}s`);
+      }
     } finally {
       this.previewInFlight = false;
     }
@@ -428,6 +480,15 @@ export class ConnectionSession {
         try {
           const text = await this.stt.endPcm();
           if (!text) return;
+          if (this.duplexActive && isTentativeSpeechText(text)) {
+            logger.info("[STT] suppress tentative duplex utterance", {
+              connId: this.connId,
+              text,
+            });
+            this.pendingVoiceTraceId = null;
+            this.resetPreviewState();
+            return;
+          }
           const generationId = this.nextGenerationId();
           this.bindActiveGeneration(generationId, traceId, "voice");
           getLatencyTracer(this.connId).mark("stt_final", traceId);
@@ -589,7 +650,7 @@ export class ConnectionSession {
           this.handleAudioEnd();
           break;
         case "playback_start":
-          this.handlePlaybackStart();
+          this.handlePlaybackStart(data);
           break;
         default:
           this.handleChat(data);
@@ -635,6 +696,15 @@ export class ConnectionSession {
           try {
             const text = await this.stt.endPcm();
             if (!text) return;
+            if (this.duplexActive && isTentativeSpeechText(text)) {
+              logger.info("[STT] suppress tentative duplex utterance", {
+                connId: this.connId,
+                text,
+              });
+              this.pendingVoiceTraceId = null;
+              this.resetPreviewState();
+              return;
+            }
             const generationId = this.nextGenerationId();
             this.bindActiveGeneration(generationId, traceId, "voice");
             getLatencyTracer(this.connId).mark("stt_final", traceId);
@@ -771,6 +841,13 @@ export class ConnectionSession {
         try {
           const text = await this.stt.end();
           if (!text) return;
+          if (this.duplexActive && isTentativeSpeechText(text)) {
+            logger.info("[STT] suppress tentative duplex utterance", {
+              connId: this.connId,
+              text,
+            });
+            return;
+          }
           const generationId = this.nextGenerationId();
           this.bindActiveGeneration(generationId, traceId, "voice");
           getLatencyTracer(this.connId).mark("stt_final", traceId);
@@ -795,9 +872,26 @@ export class ConnectionSession {
       .catch((err) => logger.error("[pipeline]", { error: err, connId: this.connId }));
   }
 
-  private handlePlaybackStart(): void {
+  private handlePlaybackStart(data?: any): void {
+    const tracer = getLatencyTracer(this.connId);
+    const rawGenerationId = data?.generationId;
+    const generationId =
+      typeof rawGenerationId === "number"
+        ? rawGenerationId
+        : typeof rawGenerationId === "string" && rawGenerationId.trim()
+          ? Number(rawGenerationId)
+          : null;
+
+    if (generationId != null && Number.isFinite(generationId)) {
+      const traceId = tracer.findActiveTraceIdByGenerationId(Math.floor(generationId));
+      if (traceId) {
+        tracer.mark("playback_start", traceId);
+        return;
+      }
+    }
+
     if (this.activeTraceId) {
-      getLatencyTracer(this.connId).mark("playback_start", this.activeTraceId);
+      tracer.mark("playback_start", this.activeTraceId);
     }
   }
 

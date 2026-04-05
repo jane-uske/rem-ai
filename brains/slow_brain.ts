@@ -18,6 +18,7 @@ export interface SlowBrainInput {
   history: PromptMessage[];
   slowBrain: SlowBrainStore;
   memoryRepo: MemoryRepository;
+  signal?: AbortSignal;
 }
 
 // ── Public API ──
@@ -41,8 +42,13 @@ export async function runSlowBrain(input: SlowBrainInput): Promise<void> {
         history,
         slowBrain,
         memoryRepo,
+        input.signal,
       );
     } catch (err) {
+      if ((err as Error).name === "AbortError") {
+        logger.info("LLM 分析已取消");
+        return;
+      }
       logger.warn("LLM 分析失败，仅使用本地分析", { error: (err as Error).message });
     }
   }
@@ -142,6 +148,7 @@ async function llmAnalysis(
   history: PromptMessage[],
   store: SlowBrainStore,
   memoryRepo: MemoryRepository,
+  signal?: AbortSignal,
 ): Promise<void> {
   const recentHistory = history.slice(-8);
   const historyText = recentHistory
@@ -158,7 +165,7 @@ async function llmAnalysis(
     },
   ];
 
-  const raw = await complete(messages, 512);
+  const raw = await complete(messages, 512, signal);
   const analysis = parseAnalysis(raw);
   if (!analysis) return;
 

@@ -35,6 +35,8 @@ export async function* routeMessage(
   signal?: AbortSignal,
   opts?: RouteMessageOptions,
 ): AsyncGenerator<string> {
+  ctx.cancelSlowBrain();
+
   if (!opts?.systemTriggered) {
     extractMemory(userMessage, ctx.memory);
   }
@@ -67,14 +69,18 @@ export async function* routeMessage(
   }
 
   if (!opts?.systemTriggered) {
+    const slowBrainSignal = ctx.beginSlowBrain();
     runSlowBrain({
       userMessage,
       assistantReply: fullReply,
       history: [...ctx.history],
       slowBrain: ctx.slowBrain,
       memoryRepo: ctx.memory,
+      signal: slowBrainSignal,
     }).catch((err) =>
       logger.warn("后台分析失败", { error: (err as Error).message }),
-    );
+    ).finally(() => {
+      ctx.endSlowBrain(slowBrainSignal);
+    });
   }
 }

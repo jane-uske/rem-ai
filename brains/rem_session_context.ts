@@ -11,10 +11,30 @@ export class RemSessionContext {
   readonly slowBrain: SlowBrainStore;
   readonly memory: InMemoryRepository;
   readonly history: PromptMessage[] = [];
+  private slowBrainController: AbortController | null = null;
 
   constructor(readonly connId: string) {
     this.emotion = new EmotionRuntime(connId);
     this.slowBrain = new SlowBrainStore();
     this.memory = new InMemoryRepository();
+  }
+
+  cancelSlowBrain(): void {
+    if (!this.slowBrainController) return;
+    this.slowBrainController.abort();
+    this.slowBrainController = null;
+  }
+
+  beginSlowBrain(): AbortSignal {
+    this.cancelSlowBrain();
+    const controller = new AbortController();
+    this.slowBrainController = controller;
+    return controller.signal;
+  }
+
+  endSlowBrain(signal: AbortSignal): void {
+    if (this.slowBrainController?.signal === signal) {
+      this.slowBrainController = null;
+    }
   }
 }

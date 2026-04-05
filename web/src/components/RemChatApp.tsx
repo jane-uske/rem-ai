@@ -76,6 +76,7 @@ export function RemChatApp() {
     sttPartialText,
     streamingText,
     typing,
+    listeningHint,
     thinkingHint,
     waiting,
     avatarAction,
@@ -134,6 +135,7 @@ export function RemChatApp() {
             messages={messages}
             sttPartialText={sttPartialText}
             streamingText={streamingText}
+            listeningHint={listeningHint}
             thinkingHint={thinkingHint}
           />
           <div className="shrink-0 border-t border-white/10 bg-transparent p-2 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:p-4 dark:border-white/5">

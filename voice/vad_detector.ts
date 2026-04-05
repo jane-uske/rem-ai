@@ -5,8 +5,18 @@ export interface VadOptions {
   energyThreshold?: number;
   /** Consecutive silent frames before speech_end. Default: 6 (~300 ms if each client chunk ≈50 ms) */
   silenceFrames?: number;
+  /**
+   * While already speaking, allow a longer silence hangover before speech_end.
+   * Default: 14 (~280 ms at 20 ms chunks, ~700 ms at 50 ms chunks).
+   */
+  speakingSilenceFrames?: number;
   /** Minimum speech frames before triggering speech_start. Default: 3 (~150 ms at 50 ms chunks) */
   minSpeechFrames?: number;
+  /**
+   * Keep speaking with a lower energy gate than onset, to avoid chopping
+   * natural mid-phrase dips ("嗯……我想一下") into multiple utterances.
+   */
+  continueEnergyRatio?: number;
   /**
    * Max zero-crossing rate (0–1) for a frame to count as speech.
    * Keyboard clicks typically have ZCR >0.5; Chinese speech (including
@@ -14,6 +24,8 @@ export interface VadOptions {
    * Default: 0.45
    */
   maxZcr?: number;
+  /** Looser ZCR gate while already speaking. Default: 0.58 */
+  continueMaxZcr?: number;
   /**
    * Max peak/RMS ratio (crest factor) for a frame to count as speech.
    * Impulsive noise (keyboard, mouse) is spike-dominated → crest often 30+.
@@ -21,6 +33,8 @@ export interface VadOptions {
    * Default: 22
    */
   maxCrest?: number;
+  /** Looser crest gate while already speaking. Default: 30 */
+  continueMaxCrest?: number;
 }
 
 /**
@@ -39,9 +53,13 @@ export interface VadOptions {
 export class VadDetector extends EventEmitter {
   private threshold: number;
   private silenceLimit: number;
+  private speakingSilenceLimit: number;
   private minSpeech: number;
+  private continueEnergyRatio: number;
   private maxZcr: number;
+  private continueMaxZcr: number;
   private maxCrest: number;
+  private continueMaxCrest: number;
 
   private _speaking = false;
   private speechCount = 0;
@@ -52,15 +70,32 @@ export class VadDetector extends EventEmitter {
     const envThreshold = process.env.VAD_THRESHOLD ? Number(process.env.VAD_THRESHOLD) : undefined;
     const envMinSpeech = process.env.VAD_MIN_SPEECH_FRAMES ? Number(process.env.VAD_MIN_SPEECH_FRAMES) : undefined;
     const envSilenceFrames = process.env.VAD_SILENCE_FRAMES ? Number(process.env.VAD_SILENCE_FRAMES) : undefined;
+    const envSpeakingSilenceFrames = process.env.VAD_SPEAKING_SILENCE_FRAMES
+      ? Number(process.env.VAD_SPEAKING_SILENCE_FRAMES)
+      : undefined;
+    const envContinueEnergyRatio = process.env.VAD_CONTINUE_ENERGY_RATIO
+      ? Number(process.env.VAD_CONTINUE_ENERGY_RATIO)
+      : undefined;
     const envMaxZcr = process.env.VAD_MAX_ZCR ? Number(process.env.VAD_MAX_ZCR) : undefined;
+    const envContinueMaxZcr = process.env.VAD_CONTINUE_MAX_ZCR
+      ? Number(process.env.VAD_CONTINUE_MAX_ZCR)
+      : undefined;
     const envMaxCrest = process.env.VAD_MAX_CREST ? Number(process.env.VAD_MAX_CREST) : undefined;
+    const envContinueMaxCrest = process.env.VAD_CONTINUE_MAX_CREST
+      ? Number(process.env.VAD_CONTINUE_MAX_CREST)
+      : undefined;
     // Balance: too high → mic never crosses threshold (no reaction); too low
     // → false triggers. Tune with VAD_THRESHOLD / VAD_MIN_SPEECH_FRAMES.
     this.threshold = opts.energyThreshold ?? envThreshold ?? 0.06;
     this.silenceLimit = opts.silenceFrames ?? envSilenceFrames ?? 6;
+    this.speakingSilenceLimit =
+      opts.speakingSilenceFrames ?? envSpeakingSilenceFrames ?? Math.max(this.silenceLimit, 14);
     this.minSpeech = opts.minSpeechFrames ?? envMinSpeech ?? 3;
+    this.continueEnergyRatio = opts.continueEnergyRatio ?? envContinueEnergyRatio ?? 0.55;
     this.maxZcr = opts.maxZcr ?? envMaxZcr ?? 0.45;
+    this.continueMaxZcr = opts.continueMaxZcr ?? envContinueMaxZcr ?? 0.58;
     this.maxCrest = opts.maxCrest ?? envMaxCrest ?? 22;
+    this.continueMaxCrest = opts.continueMaxCrest ?? envContinueMaxCrest ?? 30;
   }
 
   get speaking(): boolean {
@@ -77,10 +112,15 @@ export class VadDetector extends EventEmitter {
     const energy = rms(pcm);
     const zcr = zeroCrossingRate(pcm);
     const crest = crestFactor(pcm);
-    const isSpeech =
+    const isSpeechStart =
       energy > this.threshold && zcr < this.maxZcr && crest < this.maxCrest;
+    const continueThreshold = this.threshold * this.continueEnergyRatio;
+    const isSpeechContinue =
+      energy > continueThreshold &&
+      zcr < this.continueMaxZcr &&
+      crest < this.continueMaxCrest;
 
-    if (isSpeech) {
+    if (isSpeechStart || (this._speaking && isSpeechContinue)) {
       this.silentCount = 0;
       this.speechCount++;
 
@@ -90,7 +130,7 @@ export class VadDetector extends EventEmitter {
       }
     } else if (this._speaking) {
       this.silentCount++;
-      if (this.silentCount >= this.silenceLimit) {
+      if (this.silentCount >= this.speakingSilenceLimit) {
         this._speaking = false;
         this.speechCount = 0;
         this.silentCount = 0;
