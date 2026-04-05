@@ -6,6 +6,7 @@ import { MessageBubble } from "@/components/MessageBubble";
 
 export type ChatWindowProps = {
   messages: ChatMessage[];
+  sttPartialText: string;
   streamingText: string;
   /** STT 结束或发送消息后、首 token 到达前 */
   thinkingHint: boolean;
@@ -13,6 +14,7 @@ export type ChatWindowProps = {
 
 export function ChatWindow({
   messages,
+  sttPartialText,
   streamingText,
   thinkingHint,
 }: ChatWindowProps) {
@@ -22,7 +24,7 @@ export function ChatWindow({
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages, streamingText, thinkingHint]);
+  }, [messages, sttPartialText, streamingText, thinkingHint]);
 
   useEffect(() => {
     const next = streamingText;
@@ -55,6 +57,9 @@ export function ChatWindow({
             {m.text}
           </MessageBubble>
         ))}
+        {sttPartialText ? (
+          <MessageBubble role="partial">{sttPartialText}</MessageBubble>
+        ) : null}
         {streamingText ? (
           <MessageBubble role="rem">{streamingText}</MessageBubble>
         ) : null}

@@ -7,6 +7,11 @@ export interface SentenceChunkerOptions {
    */
   eagerCharThreshold?: number;
   /**
+   * While eager mode is on, allow a shorter minimum chunk so the first audio
+   * can start earlier. Falls back to minTtsChars when not provided.
+   */
+  eagerMinTtsChars?: number;
+  /**
    * After eager is off: if text has no sentence-ending punctuation, force a
    * chunk at this length so TTS does not wait forever.
    */
@@ -34,6 +39,7 @@ export class SentenceChunker {
   private hold = "";
   private _eager = false;
   private readonly eagerCharThreshold: number;
+  private readonly eagerMinTtsChars: number;
   private readonly maxChunkChars: number;
   private readonly minTtsChars: number;
 
@@ -41,12 +47,19 @@ export class SentenceChunker {
     const envMin = process.env.TTS_CHUNK_MIN_CHARS
       ? Number(process.env.TTS_CHUNK_MIN_CHARS)
       : NaN;
+    const envEagerMin = process.env.TTS_EAGER_MIN_CHARS
+      ? Number(process.env.TTS_EAGER_MIN_CHARS)
+      : NaN;
+    const envEagerChunk = process.env.TTS_EAGER_CHUNK_CHARS
+      ? Number(process.env.TTS_EAGER_CHUNK_CHARS)
+      : NaN;
     const envMax = process.env.TTS_CHUNK_MAX_CHARS
       ? Number(process.env.TTS_CHUNK_MAX_CHARS)
       : NaN;
     const envTtsMin = process.env.TTS_MIN_CHARS ? Number(process.env.TTS_MIN_CHARS) : NaN;
     this.eagerCharThreshold =
-      opts.eagerCharThreshold ?? (Number.isFinite(envMin) && envMin > 0 ? envMin : 48);
+      opts.eagerCharThreshold ??
+      (Number.isFinite(envEagerChunk) && envEagerChunk > 0 ? envEagerChunk : 24);
     this.maxChunkChars =
       opts.maxChunkChars ?? (Number.isFinite(envMax) && envMax > 0 ? envMax : 120);
     if (opts.minTtsChars !== undefined) {
@@ -55,6 +68,13 @@ export class SentenceChunker {
       this.minTtsChars = envTtsMin;
     } else {
       this.minTtsChars = 16;
+    }
+    if (opts.eagerMinTtsChars !== undefined) {
+      this.eagerMinTtsChars = opts.eagerMinTtsChars;
+    } else if (Number.isFinite(envEagerMin) && envEagerMin >= 0) {
+      this.eagerMinTtsChars = envEagerMin;
+    } else {
+      this.eagerMinTtsChars = 8;
     }
   }
 
@@ -96,13 +116,14 @@ export class SentenceChunker {
 
   /** Merge held text with outgoing chunks; hold fragments shorter than minTtsChars. */
   private applyMinTtsLength(chunks: string[]): string[] {
-    if (this.minTtsChars <= 0) return chunks;
+    const minChars = this._eager ? this.eagerMinTtsChars : this.minTtsChars;
+    if (minChars <= 0) return chunks;
 
     const out: string[] = [];
     for (const c of chunks) {
       if (!c) continue;
       const piece = this.hold + c;
-      if (piece.length >= this.minTtsChars) {
+      if (piece.length >= minChars) {
         out.push(piece);
         this.hold = "";
       } else {

@@ -1,30 +1,39 @@
 "use client";
 
 import { useCallback, useRef, useState } from "react";
-import { base64ToObjectUrl } from "@/lib/audioBase64";
 
 /**
- * Queue base64 audio from server (TTS); exposes whether playback is active
- * and clearQueue() to stop immediately (used on interrupt).
+ * Queue server TTS audio. Supports:
+ * - legacy complete clips (`voice`: base64 encoded wav/mp3)
+ * - streamed PCM chunks (`voice_pcm_chunk`: base64 encoded pcm16le mono)
  *
  * Routes playback through Web Audio + AnalyserNode so `lipEnvelopeRef` holds
  * 0–1 RMS envelope for lip-sync with the 3D avatar.
  */
-export function useAudioBase64Queue() {
+export interface AudioQueueOptions {
+  /** Called when a server TTS segment actually starts playing on client. */
+  onPlaybackStart?: () => void;
+}
+
+export function useAudioBase64Queue(options?: AudioQueueOptions) {
   const [playing, setPlaying] = useState(false);
-  const queueRef = useRef<string[]>([]);
+  const decodeChainRef = useRef<Promise<void>>(Promise.resolve());
   const playingRef = useRef(false);
-  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
-  const drainRef = useRef<() => void>(() => {});
+  const generationRef = useRef(0);
+  const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const nextStartTimeRef = useRef(0);
+  const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const playbackNotifiedRef = useRef(false);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const analyserReadyRef = useRef(false);
   const envelopeRafRef = useRef(0);
   /** Updated ~60fps while TTS plays; read by RemVrmViewer for mouth `aa` blend shape */
   const lipEnvelopeRef = useRef(0);
 
   const sync = useCallback(() => {
-    setPlaying(playingRef.current || queueRef.current.length > 0);
+    setPlaying(playingRef.current);
   }, []);
 
   const stopEnvelopeLoop = useCallback(() => {
@@ -60,92 +69,187 @@ export function useAudioBase64Queue() {
     envelopeRafRef.current = requestAnimationFrame(tick);
   }, []);
 
-  drainRef.current = () => {
-    if (playingRef.current || queueRef.current.length === 0) {
-      sync();
-      return;
-    }
-    playingRef.current = true;
-    sync();
-    const url = queueRef.current.shift()!;
-    const audio = new Audio(url);
-    audio.setAttribute("playsinline", "");
-    currentAudioRef.current = audio;
+  const ensureAudioGraph = useCallback(async (): Promise<AudioContext | null> => {
+    if (typeof window === "undefined") return null;
+    const Ctx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (!Ctx) return null;
 
-    const done = () => {
-      stopEnvelopeLoop();
-      URL.revokeObjectURL(url);
-      playingRef.current = false;
-      currentAudioRef.current = null;
-      sync();
-      drainRef.current();
-    };
-
-    audio.onended = done;
-    audio.onerror = done;
-
-    try {
-      const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      if (!Ctx) {
-        void audio.play().catch(done);
-        return;
+    const ctx = audioContextRef.current ?? new Ctx();
+    audioContextRef.current = ctx;
+    if (ctx.state !== "running") {
+      try {
+        await ctx.resume();
+      } catch {
+        /* ignore */
       }
-      const ctx = audioContextRef.current ?? new Ctx();
-      audioContextRef.current = ctx;
-      void ctx.resume();
+    }
 
-      const source = ctx.createMediaElementSource(audio);
+    if (!analyserReadyRef.current) {
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 512;
       analyser.smoothingTimeConstant = 0.45;
-      analyserRef.current = analyser;
-      source.connect(analyser);
       analyser.connect(ctx.destination);
-
-      stopEnvelopeLoop();
-      runEnvelopeLoop();
-    } catch {
-      analyserRef.current = null;
+      analyserRef.current = analyser;
+      analyserReadyRef.current = true;
     }
+    return ctx;
+  }, []);
 
-    void audio.play().catch(done);
-  };
+  const scheduleIdleCheck = useCallback(() => {
+    if (idleTimerRef.current) {
+      clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = null;
+    }
+    const ctx = audioContextRef.current;
+    if (!ctx) return;
+    const remainMs = Math.max(20, (nextStartTimeRef.current - ctx.currentTime) * 1000 + 20);
+    idleTimerRef.current = setTimeout(() => {
+      if (activeSourcesRef.current.size > 0) return;
+      const now = audioContextRef.current?.currentTime ?? 0;
+      if (now + 0.01 < nextStartTimeRef.current) return;
+      playingRef.current = false;
+      playbackNotifiedRef.current = false;
+      stopEnvelopeLoop();
+      sync();
+    }, remainMs);
+  }, [stopEnvelopeLoop, sync]);
+
+  const scheduleAudioBuffer = useCallback(
+    async (buffer: AudioBuffer, generationAtCall: number) => {
+      const ctx = await ensureAudioGraph();
+      if (!ctx) return;
+      if (generationRef.current !== generationAtCall) return;
+      const analyser = analyserRef.current;
+      if (!analyser) return;
+
+      const now = ctx.currentTime;
+      const startAt = Math.max(now + 0.01, nextStartTimeRef.current || now + 0.01);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(analyser);
+      source.onended = () => {
+        activeSourcesRef.current.delete(source);
+      };
+      activeSourcesRef.current.add(source);
+      source.start(startAt);
+      nextStartTimeRef.current = startAt + buffer.duration;
+
+      if (!playingRef.current) {
+        playingRef.current = true;
+        stopEnvelopeLoop();
+        runEnvelopeLoop();
+        sync();
+      }
+      if (!playbackNotifiedRef.current) {
+        playbackNotifiedRef.current = true;
+        options?.onPlaybackStart?.();
+      }
+      scheduleIdleCheck();
+    },
+    [ensureAudioGraph, options, runEnvelopeLoop, scheduleIdleCheck, stopEnvelopeLoop, sync],
+  );
+
+  const enqueuePcmChunk = useCallback(
+    (pcmBase64: string, sampleRate = 24000) => {
+      const generationAtCall = generationRef.current;
+      const floats = pcm16Base64ToFloat32(pcmBase64);
+      if (!floats) return;
+      const ctxRate = Number.isFinite(sampleRate) && sampleRate > 0 ? sampleRate : 24000;
+
+      const frame = audioContextRef.current?.createBuffer(1, floats.length, ctxRate);
+      if (frame) {
+        frame.getChannelData(0).set(floats);
+        void scheduleAudioBuffer(frame, generationAtCall);
+      } else {
+        // Fallback path if ctx not initialized yet.
+        void (async () => {
+          const ctx = await ensureAudioGraph();
+          if (!ctx || generationRef.current !== generationAtCall) return;
+          const buf = ctx.createBuffer(1, floats.length, ctxRate);
+          buf.getChannelData(0).set(floats);
+          await scheduleAudioBuffer(buf, generationAtCall);
+        })();
+      }
+    },
+    [ensureAudioGraph, scheduleAudioBuffer],
+  );
 
   const enqueueBase64 = useCallback(
     (base64: string) => {
-      const url = base64ToObjectUrl(base64);
-      if (!url) return;
-      queueRef.current.push(url);
-      sync();
-      drainRef.current();
+      const generationAtCall = generationRef.current;
+      decodeChainRef.current = decodeChainRef.current
+        .catch(() => {})
+        .then(async () => {
+          if (generationRef.current !== generationAtCall) return;
+          const bytes = base64ToUint8Array(base64);
+          if (!bytes) return;
+          const ctx = await ensureAudioGraph();
+          if (!ctx || generationRef.current !== generationAtCall) return;
+          const decoded = await ctx.decodeAudioData(toArrayBuffer(bytes));
+          if (generationRef.current !== generationAtCall) return;
+          await scheduleAudioBuffer(decoded, generationAtCall);
+        });
     },
-    [sync],
+    [ensureAudioGraph, scheduleAudioBuffer],
   );
 
   /** Stop current playback and discard all queued audio (used on interrupt). */
   const clearQueue = useCallback(() => {
-    stopEnvelopeLoop();
+    generationRef.current += 1;
 
-    const current = currentAudioRef.current;
-    if (current) {
-      current.onended = null;
-      current.onerror = null;
-      current.pause();
+    if (idleTimerRef.current) {
+      clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = null;
+    }
+
+    for (const src of activeSourcesRef.current) {
       try {
-        current.src = "";
+        src.onended = null;
+        src.stop();
       } catch {
         /* ignore */
       }
-      currentAudioRef.current = null;
     }
+    activeSourcesRef.current.clear();
+    nextStartTimeRef.current = 0;
+    playbackNotifiedRef.current = false;
 
-    for (const url of queueRef.current) {
-      URL.revokeObjectURL(url);
-    }
-    queueRef.current = [];
+    stopEnvelopeLoop();
     playingRef.current = false;
     sync();
   }, [stopEnvelopeLoop, sync]);
 
-  return { enqueueBase64, clearQueue, voiceActive: playing, lipEnvelopeRef };
+  return { enqueueBase64, enqueuePcmChunk, clearQueue, voiceActive: playing, lipEnvelopeRef };
+}
+
+function base64ToUint8Array(base64: string): Uint8Array | null {
+  try {
+    const bin = atob(base64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const out = new Uint8Array(bytes.byteLength);
+  out.set(bytes);
+  return out.buffer;
+}
+
+function pcm16Base64ToFloat32(base64: string): Float32Array | null {
+  const bytes = base64ToUint8Array(base64);
+  if (!bytes || bytes.byteLength < 2) return null;
+  const sampleCount = Math.floor(bytes.byteLength / 2);
+  const out = new Float32Array(sampleCount);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (let i = 0; i < sampleCount; i++) {
+    const s = view.getInt16(i * 2, true);
+    out[i] = s < 0 ? s / 0x8000 : s / 0x7fff;
+  }
+  return out;
 }

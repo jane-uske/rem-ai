@@ -3,9 +3,9 @@ import { EventEmitter } from "events";
 export interface VadOptions {
   /** RMS energy threshold (0–1 for 16-bit PCM). Default: ~0.06 */
   energyThreshold?: number;
-  /** Consecutive silent frames before speech_end. Default: 10 (~500 ms if each client chunk ≈50 ms) */
+  /** Consecutive silent frames before speech_end. Default: 6 (~300 ms if each client chunk ≈50 ms) */
   silenceFrames?: number;
-  /** Minimum speech frames before triggering speech_start. Default: 6 (~300 ms at 50 ms chunks) */
+  /** Minimum speech frames before triggering speech_start. Default: 3 (~150 ms at 50 ms chunks) */
   minSpeechFrames?: number;
   /**
    * Max zero-crossing rate (0–1) for a frame to count as speech.
@@ -57,8 +57,8 @@ export class VadDetector extends EventEmitter {
     // Balance: too high → mic never crosses threshold (no reaction); too low
     // → false triggers. Tune with VAD_THRESHOLD / VAD_MIN_SPEECH_FRAMES.
     this.threshold = opts.energyThreshold ?? envThreshold ?? 0.06;
-    this.silenceLimit = opts.silenceFrames ?? envSilenceFrames ?? 10;
-    this.minSpeech = opts.minSpeechFrames ?? envMinSpeech ?? 6;
+    this.silenceLimit = opts.silenceFrames ?? envSilenceFrames ?? 6;
+    this.minSpeech = opts.minSpeechFrames ?? envMinSpeech ?? 3;
     this.maxZcr = opts.maxZcr ?? envMaxZcr ?? 0.45;
     this.maxCrest = opts.maxCrest ?? envMaxCrest ?? 22;
   }

@@ -52,3 +52,87 @@ export interface AvatarFrame {
   action?: ActionCommand;
   emotion?: Emotion;
 }
+
+export type AvatarPhase = "idle" | "speaking";
+
+export type AvatarCommand =
+  | {
+      kind: "set_emotion";
+      emotion: Emotion;
+      transitionMs?: number;
+    }
+  | {
+      kind: "play_action";
+      action: ActionCommand;
+    }
+  | {
+      kind: "set_phase";
+      phase: AvatarPhase;
+      reason?: "tts_start" | "tts_end" | "interrupt" | "startup";
+    };
+
+export type RemServerMessage =
+  | {
+      type: "emotion";
+      emotion: Emotion;
+    }
+  | {
+      type: "chat_chunk";
+      content: string;
+      generationId: number;
+    }
+  | {
+      type: "chat_end";
+      emotion?: Emotion;
+      content?: string;
+      generationId: number;
+    }
+  | {
+      type: "voice";
+      audio: string;
+      generationId: number;
+    }
+  | {
+      type: "voice_pcm_chunk";
+      audio: string;
+      sampleRate: number;
+      channels: 1;
+      bitsPerSample: 16;
+      generationId: number;
+    }
+  | {
+      type: "interrupt";
+      generationId?: number;
+    }
+  | {
+      type: "stt_partial";
+      content: string;
+    }
+  | {
+      type: "stt_final";
+      content: string;
+    }
+  | {
+      type: "vad_start";
+    }
+  | {
+      type: "vad_end";
+    }
+  | {
+      type: "avatar_frame";
+      frame: AvatarFrame;
+    }
+  | {
+      type: "avatar_command";
+      command: AvatarCommand;
+    }
+  | {
+      type: "avatar_state";
+      phase: AvatarPhase;
+    }
+  | {
+      type: "error";
+      content: string;
+    };
+
+export type RemServerMessageType = RemServerMessage["type"];

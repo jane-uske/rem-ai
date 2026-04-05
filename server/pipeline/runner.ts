@@ -5,6 +5,7 @@ import type { RemSessionContext } from "../../brains/rem_session_context";
 import { decayEmotion } from "../../emotion/decay_emotion";
 import { updateEmotion } from "../../emotion/emotion_engine";
 import { synthesize, isTtsEnabled } from "../../voice/tts_stream";
+import { canStreamTextToSpeech, streamTextToSpeech } from "../../voice/tts";
 import { SentenceChunker } from "../../utils/sentence_chunker";
 import { InterruptController } from "../../voice/interrupt_controller";
 import { AvatarController } from "../../avatar/avatar_controller";
@@ -28,11 +29,17 @@ export async function runPipeline(
   avatar: AvatarController,
   sessionId: string | null,
   ctx: RemSessionContext,
+  generationId: number,
+  traceId: string,
   options?: RunPipelineOptions,
 ): Promise<void> {
   const connId = ctx.connId;
   const signal = ic.begin();
   const latencyTracer = getLatencyTracer(connId);
+  const traceContext = options?.silenceNudge
+    ? { generationId, source: "silence_nudge" as const }
+    : { generationId };
+  latencyTracer.startTrace(traceId, traceContext);
 
   try {
     const replyEmotion = options?.silenceNudge
@@ -61,7 +68,7 @@ export async function runPipeline(
       void synthesize("嗯", signal, replyEmotion as any)
         .then((buf) => {
           if (!signal.aborted) {
-            send(ws, { type: "voice", audio: buf.toString("base64") });
+            send(ws, { type: "voice", audio: buf.toString("base64"), generationId });
           }
         })
         .catch(() => {});
@@ -106,11 +113,20 @@ export async function runPipeline(
           const sentence = sentenceQueue[sentenceIdx++];
           if (signal.aborted) break;
 
-          if (sentenceIdx === 1) latencyTracer.mark("tts_start");
+          if (sentenceIdx === 1) latencyTracer.mark("tts_start", traceId);
 
           try {
             ic.markSpeaking();
-            await ttsSend(ws, sentence, signal, replyEmotion, latencyTracer, !firstAudioSent);
+            await ttsSend(
+              ws,
+              sentence,
+              generationId,
+              traceId,
+              signal,
+              replyEmotion,
+              latencyTracer,
+              !firstAudioSent,
+            );
             if (!firstAudioSent) firstAudioSent = true;
           } catch (err) {
             if ((err as Error).name === "AbortError") break;
@@ -133,7 +149,7 @@ export async function runPipeline(
     let firstTokenReceived = false;
     let firstSentenceSent = false;
 
-    latencyTracer.mark("llm_request_start");
+    latencyTracer.mark("llm_request_start", traceId);
 
     for await (const token of chatStream(
       ctx,
@@ -146,11 +162,11 @@ export async function runPipeline(
 
       if (!firstTokenReceived) {
         firstTokenReceived = true;
-        latencyTracer.mark("llm_first_token");
+        latencyTracer.mark("llm_first_token", traceId);
       }
 
       full += token;
-      send(ws, { type: "chat_chunk", content: token });
+      send(ws, { type: "chat_chunk", content: token, generationId });
 
       for (const sentence of chunker.push(token)) {
         pushSentence(sentence);
@@ -161,7 +177,7 @@ export async function runPipeline(
       }
     }
 
-    latencyTracer.mark("llm_end");
+    latencyTracer.mark("llm_end", traceId);
 
     if (!signal.aborted) {
       const last = chunker.flush();
@@ -179,6 +195,7 @@ export async function runPipeline(
       type: "chat_end",
       emotion: replyEmotion,
       content: signal.aborted ? "[interrupted]" : undefined,
+      generationId,
     });
 
     if (isDbReady() && sessionId && full) {
@@ -208,8 +225,8 @@ export async function runPipeline(
 
     decayEmotion(ctx.emotion);
 
-    latencyTracer.mark("tts_end");
-    latencyTracer.log();
+    latencyTracer.mark("tts_end", traceId);
+    latencyTracer.log(traceId);
   } catch (err) {
     if ((err as Error).name !== "AbortError") {
       logger.error("[错误]", { error: err, connId });
@@ -223,6 +240,8 @@ export async function runPipeline(
 async function ttsSend(
   ws: WebSocket,
   sentence: string,
+  generationId: number,
+  traceId: string,
   signal?: AbortSignal,
   emotion?: string,
   latencyTracer?: ReturnType<typeof getLatencyTracer>,
@@ -231,12 +250,49 @@ async function ttsSend(
   if (!isTtsEnabled()) return;
   if (signal?.aborted) return;
   try {
+    if (canStreamTextToSpeech()) {
+      let firstChunkSent = false;
+      try {
+        await streamTextToSpeech(
+          sentence,
+          ({ pcm, sampleRate, channels, bitsPerSample }) => {
+            if (signal?.aborted) return;
+            if (!firstChunkSent) {
+              firstChunkSent = true;
+              if (isFirstSentence && latencyTracer) {
+                latencyTracer.mark("tts_first_audio", traceId);
+              }
+            }
+            send(ws, {
+              type: "voice_pcm_chunk",
+              audio: pcm.toString("base64"),
+              sampleRate,
+              channels,
+              bitsPerSample,
+              generationId,
+            });
+          },
+          signal,
+          emotion as any,
+        );
+        return;
+      } catch (err) {
+        if ((err as Error).name === "AbortError") throw err;
+        if (firstChunkSent) {
+          throw err;
+        }
+        logger.warn("[TTS] stream failed, fallback to buffered synth", {
+          error: (err as Error).message,
+        });
+      }
+    }
+
     const audio = await synthesize(sentence, signal, emotion as any);
     if (signal?.aborted) return;
     if (isFirstSentence && latencyTracer) {
-      latencyTracer.mark("tts_first_audio");
+      latencyTracer.mark("tts_first_audio", traceId);
     }
-    send(ws, { type: "voice", audio: audio.toString("base64") });
+    send(ws, { type: "voice", audio: audio.toString("base64"), generationId });
   } catch (err) {
     if ((err as Error).name !== "AbortError") {
       logger.warn("[TTS]", { error: (err as Error).message });

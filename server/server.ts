@@ -9,6 +9,7 @@ import { getMemoryRepository, setMemoryRepository } from "../memory/memory_store
 import { initDatabase, closeDatabase } from "../storage/database";
 import { initRedis, closeRedis } from "../storage/redis";
 import { getPgMemoryRepository } from "../storage/repositories/pg_memory_repository";
+import { shutdownWhisperServer, warmWhisperServer } from "../voice/stt_stream";
 import { createGateway, startServer, PORT } from "./gateway";
 import { createSession } from "./session";
 
@@ -52,20 +53,25 @@ async function bootstrap() {
     }
   }
 
-  process.on("SIGINT", () => {
-    logger.info("[Shutdown] Received SIGINT, cleaning up...");
-    stopDecayTimer(decayTimer);
-    if (dbInitialized) void closeDatabase().catch(() => {});
-    if (redisInitialized) void closeRedis().catch(() => {});
-    process.exit(0);
+  await warmWhisperServer().catch((err) => {
+    logger.warn("[STT] whisper-server warmup skipped", {
+      error: err instanceof Error ? err.message : String(err),
+    });
   });
-  process.on("SIGTERM", () => {
-    logger.info("[Shutdown] Received SIGTERM, cleaning up...");
+
+  let shuttingDown = false;
+  const cleanupAndExit = async (signal: "SIGINT" | "SIGTERM") => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info(`[Shutdown] Received ${signal}, cleaning up...`);
     stopDecayTimer(decayTimer);
-    if (dbInitialized) void closeDatabase().catch(() => {});
-    if (redisInitialized) void closeRedis().catch(() => {});
+    await shutdownWhisperServer().catch(() => {});
+    if (dbInitialized) await closeDatabase().catch(() => {});
+    if (redisInitialized) await closeRedis().catch(() => {});
     process.exit(0);
-  });
+  };
+  process.on("SIGINT", () => { void cleanupAndExit("SIGINT"); });
+  process.on("SIGTERM", () => { void cleanupAndExit("SIGTERM"); });
 
   function onConnection(ws: WebSocket, req: IncomingMessage): void {
     createSession(ws, req);

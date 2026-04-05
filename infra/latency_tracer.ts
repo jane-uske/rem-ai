@@ -27,6 +27,17 @@ export interface LatencyMetrics {
   tts_first_to_playback?: number;
 }
 
+export interface LatencyTraceContext {
+  generationId?: number;
+  source?: "voice" | "text" | "silence_nudge";
+}
+
+type TraceState = {
+  timestamps: LatencyTimestamps;
+  completed: boolean;
+  context?: LatencyTraceContext;
+};
+
 /**
  * Latency Tracer for tracking pipeline stage timestamps and computing durations.
  *
@@ -50,34 +61,63 @@ export interface LatencyMetrics {
  * - tts_first_audio → playback
  */
 export class LatencyTracer {
-  private timestamps: LatencyTimestamps = {};
+  private traces = new Map<string, TraceState>();
+  private readonly defaultTraceId = "legacy";
   private connId: string;
-  private completed = false;
 
   constructor(connId: string) {
     this.connId = connId;
   }
 
+  private ensureTrace(traceId: string): TraceState {
+    let trace = this.traces.get(traceId);
+    if (!trace) {
+      trace = {
+        timestamps: {},
+        completed: false,
+      };
+      this.traces.set(traceId, trace);
+    }
+    return trace;
+  }
+
+  startTrace(traceId: string, context?: LatencyTraceContext): void {
+    if (!traceId) return;
+    const trace = this.ensureTrace(traceId);
+    if (trace.completed) {
+      trace.timestamps = {};
+      trace.completed = false;
+    }
+    if (context) {
+      trace.context = {
+        ...(trace.context ?? {}),
+        ...context,
+      };
+    }
+  }
+
   /** Mark a timestamp with the current time. */
-  mark(key: keyof LatencyTimestamps): void {
-    if (this.completed) return;
-    this.timestamps[key] = Date.now();
+  mark(key: keyof LatencyTimestamps, traceId: string = this.defaultTraceId): void {
+    const trace = this.ensureTrace(traceId);
+    if (trace.completed) return;
+    trace.timestamps[key] = Date.now();
   }
 
   /** Set a timestamp with a specific value (for external events). */
-  set(key: keyof LatencyTimestamps, value: number): void {
-    if (this.completed) return;
-    this.timestamps[key] = value;
+  set(key: keyof LatencyTimestamps, value: number, traceId: string = this.defaultTraceId): void {
+    const trace = this.ensureTrace(traceId);
+    if (trace.completed) return;
+    trace.timestamps[key] = value;
   }
 
   /** Get a specific timestamp. */
-  get(key: keyof LatencyTimestamps): number | undefined {
-    return this.timestamps[key];
+  get(key: keyof LatencyTimestamps, traceId: string = this.defaultTraceId): number | undefined {
+    return this.traces.get(traceId)?.timestamps[key];
   }
 
   /** Get all timestamps. */
-  getAllTimestamps(): LatencyTimestamps {
-    return { ...this.timestamps };
+  getAllTimestamps(traceId: string = this.defaultTraceId): LatencyTimestamps {
+    return { ...(this.traces.get(traceId)?.timestamps ?? {}) };
   }
 
   /**
@@ -87,27 +127,29 @@ export class LatencyTracer {
   private duration(
     startKey: keyof LatencyTimestamps,
     endKey: keyof LatencyTimestamps,
+    timestamps: LatencyTimestamps,
   ): number | undefined {
-    const start = this.timestamps[startKey];
-    const end = this.timestamps[endKey];
+    const start = timestamps[startKey];
+    const end = timestamps[endKey];
     if (start === undefined || end === undefined) return undefined;
     return end - start;
   }
 
   /** Compute all latency metrics from the current timestamps. */
-  computeMetrics(): LatencyMetrics {
+  computeMetrics(traceId: string = this.defaultTraceId): LatencyMetrics {
+    const timestamps = this.traces.get(traceId)?.timestamps ?? {};
     return {
       // Legacy metrics for backward compatibility
-      stt_latency: this.duration("vad_speech_end", "stt_final"),
-      llm_first_token: this.duration("stt_final", "llm_first_token"),
-      tts_latency: this.duration("llm_first_token", "tts_first_audio"),
-      total_response: this.duration("vad_speech_end", "tts_first_audio"),
+      stt_latency: this.duration("vad_speech_end", "stt_final", timestamps),
+      llm_first_token: this.duration("stt_final", "llm_first_token", timestamps),
+      tts_latency: this.duration("llm_first_token", "tts_first_audio", timestamps),
+      total_response: this.duration("vad_speech_end", "tts_first_audio", timestamps),
 
       // Detailed metrics
-      speech_end_to_stt_final: this.duration("vad_speech_end", "stt_final"),
-      stt_final_to_llm_first: this.duration("stt_final", "llm_first_token"),
-      llm_first_to_tts_first: this.duration("llm_first_token", "tts_first_audio"),
-      tts_first_to_playback: this.duration("tts_first_audio", "playback_start"),
+      speech_end_to_stt_final: this.duration("vad_speech_end", "stt_final", timestamps),
+      stt_final_to_llm_first: this.duration("stt_final", "llm_first_token", timestamps),
+      llm_first_to_tts_first: this.duration("llm_first_token", "tts_first_audio", timestamps),
+      tts_first_to_playback: this.duration("tts_first_audio", "playback_start", timestamps),
     };
   }
 
@@ -115,29 +157,36 @@ export class LatencyTracer {
    * Log the latency metrics as structured JSON.
    * Call this after all stages are complete.
    */
-  log(): void {
-    if (this.completed) return;
-    this.completed = true;
+  log(traceId: string = this.defaultTraceId): void {
+    const trace = this.traces.get(traceId);
+    if (!trace || trace.completed) return;
+    trace.completed = true;
 
-    const metrics = this.computeMetrics();
+    const metrics = this.computeMetrics(traceId);
     const hasAnyMetric = Object.values(metrics).some((v) => v !== undefined);
 
     if (!hasAnyMetric) {
-      logger.debug("[Latency] No metrics available", { connId: this.connId });
+      logger.debug("[Latency] No metrics available", { connId: this.connId, traceId });
       return;
     }
 
     logger.info("[Latency]", {
       connId: this.connId,
+      traceId,
+      generationId: trace.context?.generationId,
+      source: trace.context?.source,
       metrics,
-      timestamps: this.timestamps,
+      timestamps: trace.timestamps,
     });
   }
 
   /** Reset the tracer for reuse. */
-  reset(): void {
-    this.timestamps = {};
-    this.completed = false;
+  reset(traceId?: string): void {
+    if (traceId) {
+      this.traces.delete(traceId);
+      return;
+    }
+    this.traces.clear();
   }
 }
 

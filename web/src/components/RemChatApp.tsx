@@ -72,6 +72,7 @@ export function RemChatApp() {
     connectionPhase,
     reconnectInSec,
     messages,
+    sttPartialText,
     streamingText,
     thinkingHint,
     waiting,
@@ -118,6 +119,7 @@ export function RemChatApp() {
         <aside className="rem-chat-panel rem-glass-edge flex min-h-0 w-full min-w-0 flex-1 flex-col border-t lg:w-[min(100%,clamp(320px,42vw,440px))] lg:max-w-[min(100%,440px)] lg:flex-none lg:border-l lg:border-t-0 lg:pt-14">
           <ChatWindow
             messages={messages}
+            sttPartialText={sttPartialText}
             streamingText={streamingText}
             thinkingHint={thinkingHint}
           />

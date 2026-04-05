@@ -10,6 +10,36 @@ function uid() {
   return crypto.randomUUID();
 }
 
+const AUDIO_FRAME_HEADER_BYTES = 16;
+
+function encodePcmAudioFrame(pcm16: ArrayBuffer, sampleRate: number): ArrayBuffer {
+  const payload = new Uint8Array(pcm16);
+  const frame = new ArrayBuffer(AUDIO_FRAME_HEADER_BYTES + payload.byteLength);
+  const out = new Uint8Array(frame);
+  const view = new DataView(frame);
+
+  // Magic: "RAUD" (Rem audio), version 1, codec 1=pcm16le mono
+  out[0] = 0x52;
+  out[1] = 0x41;
+  out[2] = 0x55;
+  out[3] = 0x44;
+  out[4] = 1;
+  out[5] = 1;
+  out[6] = 0;
+  out[7] = 0;
+  view.setUint32(8, sampleRate, true);
+  view.setUint32(12, payload.byteLength, true);
+  out.set(payload, AUDIO_FRAME_HEADER_BYTES);
+  return frame;
+}
+
+function arrayBufferToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
 /** WebSocket 断线后自动重连的延迟（与 UI 倒计时同源） */
 export const REM_WS_RECONNECT_DELAY_MS = 3000;
 
@@ -44,9 +74,6 @@ function loadPersistedMessages(): ChatMessage[] {
 }
 
 export function useRemChat() {
-  const { enqueueBase64, clearQueue, voiceActive, lipEnvelopeRef } =
-    useAudioBase64Queue();
-
   const [emotion, setEmotion] = useState("neutral");
   const [connected, setConnected] = useState(false);
   const [connectionPhase, setConnectionPhase] =
@@ -57,6 +84,7 @@ export function useRemChat() {
   const [connLabel, setConnLabel] = useState("连接中…");
   const [messages, setMessages] = useState<ChatMessage[]>(loadPersistedMessages);
   const [streamingText, setStreamingText] = useState("");
+  const [sttPartialText, setSttPartialText] = useState("");
   const [typing, setTyping] = useState(false);
   /** 首 token 前：展示「Rem 在想…」（S9） */
   const thinkingHint = typing && streamingText.length === 0;
@@ -74,8 +102,46 @@ export function useRemChat() {
   const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const streamingBufRef = useRef("");
   const mountedRef = useRef(true);
+  const activeGenerationRef = useRef<number | null>(null);
+  const blockedGenerationsRef = useRef<Set<number>>(new Set());
   /** 连接超时主动 close 时，onclose 不再刷「已断开」系统提示（避免与超时错误重复） */
   const suppressDisconnectSysMsgRef = useRef(false);
+
+  const clearGenerationState = useCallback(() => {
+    activeGenerationRef.current = null;
+    blockedGenerationsRef.current.clear();
+  }, []);
+
+  const blockGeneration = useCallback((id: number) => {
+    const blocked = blockedGenerationsRef.current;
+    blocked.add(id);
+    if (blocked.size > 128) {
+      const oldest = blocked.values().next();
+      if (!oldest.done) blocked.delete(oldest.value);
+    }
+    if (activeGenerationRef.current === id) {
+      activeGenerationRef.current = null;
+    }
+  }, []);
+
+  const parseGenerationId = useCallback((raw: unknown): number | null => {
+    if (raw == null) return null;
+    if (typeof raw === "number" && Number.isFinite(raw)) return Math.floor(raw);
+    if (typeof raw === "string") {
+      const n = Number(raw);
+      if (Number.isFinite(n)) return Math.floor(n);
+    }
+    return null;
+  }, []);
+
+  const { enqueueBase64, enqueuePcmChunk, clearQueue, voiceActive, lipEnvelopeRef } =
+    useAudioBase64Queue({
+      onPlaybackStart: () => {
+        const ws = wsRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        ws.send(JSON.stringify({ type: "playback_start" }));
+      },
+    });
 
   useEffect(() => {
     if (reconnectDeadline == null) return;
@@ -106,11 +172,42 @@ export function useRemChat() {
     setStreamingText("");
   }, []);
 
+  const allowServerGeneration = useCallback(
+    (type: string, rawGenerationId: unknown): boolean => {
+      const id = parseGenerationId(rawGenerationId);
+      if (id == null) return true; // Backward-compatible path for older servers.
+
+      if (blockedGenerationsRef.current.has(id)) {
+        return false;
+      }
+
+      const active = activeGenerationRef.current;
+      if (active == null) {
+        activeGenerationRef.current = id;
+        return true;
+      }
+      if (active === id) return true;
+
+      // Allow rollover only on token start; otherwise old/new chunks might interleave.
+      if (type === "chat_chunk") {
+        clearQueue();
+        resetStreaming();
+        activeGenerationRef.current = id;
+        return true;
+      }
+      return false;
+    },
+    [clearQueue, parseGenerationId, resetStreaming],
+  );
+
   /* ── Full-duplex voice（须在 WebSocket 回调之前定义）── */
 
   const startDuplex = useCallback(async () => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // Local pre-barge-in: stop any queued/playing TTS immediately.
+    clearQueue();
+    setSttPartialText("");
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -121,11 +218,25 @@ export function useRemChat() {
         },
       });
 
-      const capture = startPcmCapture(stream, (base64) => {
+      let pcmSampleRate = 16000;
+      const capture = await startPcmCapture(stream, (pcm16) => {
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "audio_stream", audio: base64 }));
+          const frame = encodePcmAudioFrame(pcm16, pcmSampleRate);
+          try {
+            ws.send(frame);
+          } catch {
+            // Compatibility fallback for servers that only parse JSON audio_stream.
+            ws.send(
+              JSON.stringify({
+                type: "audio_stream",
+                audio: arrayBufferToBase64(pcm16),
+                sampleRate: pcmSampleRate,
+              }),
+            );
+          }
         }
       });
+      pcmSampleRate = capture.sampleRate;
 
       pcmRef.current = capture;
       ws.send(JSON.stringify({ type: "duplex_start", sampleRate: capture.sampleRate }));
@@ -141,7 +252,7 @@ export function useRemChat() {
         { id: uid(), role: "error", text: "无法访问麦克风" },
       ]);
     }
-  }, []);
+  }, [clearQueue]);
 
   const stopVoiceSession = useCallback(() => {
     const ws = wsRef.current;
@@ -152,18 +263,21 @@ export function useRemChat() {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "duplex_stop" }));
     }
+    setSttPartialText("");
+    clearGenerationState();
     duplexRef.current = false;
     setDuplex(false);
     setRecording(false);
     recordingRef.current = false;
     setUserSpeaking(false);
     setInputPlaceholder("说点什么…");
-  }, []);
+  }, [clearGenerationState]);
 
   const toggleMic = useCallback(() => {
     if (recordingRef.current) {
       stopVoiceSession();
     } else {
+      activeGenerationRef.current = null;
       void startDuplex();
     }
   }, [startDuplex, stopVoiceSession]);
@@ -196,6 +310,7 @@ export function useRemChat() {
     }
 
     const ws = new WebSocket(url);
+    clearGenerationState();
     wsRef.current = ws;
 
     const connectTimer = window.setTimeout(() => {
@@ -243,40 +358,68 @@ export function useRemChat() {
           break;
 
         case "chat_chunk":
+          if (!allowServerGeneration("chat_chunk", data.generationId)) break;
+          setSttPartialText("");
           setTyping(false);
           appendStreaming(String(data.content ?? ""));
           break;
 
         case "chat_end": {
+          if (!allowServerGeneration("chat_end", data.generationId)) break;
           const text = streamingBufRef.current;
           resetStreaming();
           if (!duplexRef.current) {
             waitingRef.current = false;
             setWaiting(false);
           }
+          setSttPartialText("");
           setInputPlaceholder("说点什么…");
           if (text) {
             setMessages((m) => [...m, { id: uid(), role: "rem", text }]);
+          }
+          const endGenerationId = parseGenerationId(data.generationId);
+          if (endGenerationId != null && activeGenerationRef.current === endGenerationId) {
+            activeGenerationRef.current = null;
           }
           if (data.emotion != null) setEmotion(String(data.emotion));
           break;
         }
 
         case "voice":
+          if (!allowServerGeneration("voice", data.generationId)) break;
           if (typeof data.audio === "string") {
             enqueueBase64(data.audio);
           }
           break;
 
+        case "voice_chunk":
+        case "voice_pcm_chunk": {
+          if (!allowServerGeneration("voice_pcm_chunk", data.generationId)) break;
+          if (typeof data.audio === "string") {
+            const rate = Number(data.sampleRate);
+            enqueuePcmChunk(data.audio, Number.isFinite(rate) && rate > 0 ? rate : 24000);
+          }
+          break;
+        }
+
         /* ── Full-duplex events ── */
 
-        case "interrupt":
+        case "interrupt": {
+          const interruptedGeneration = parseGenerationId(data.generationId);
+          if (interruptedGeneration != null) {
+            blockGeneration(interruptedGeneration);
+          } else {
+            activeGenerationRef.current = null;
+          }
+          setSttPartialText("");
           clearQueue();
           resetStreaming();
           setTyping(false);
           break;
+        }
 
         case "vad_start":
+          setSttPartialText("");
           setUserSpeaking(true);
           setInputPlaceholder("正在听…");
           break;
@@ -286,10 +429,13 @@ export function useRemChat() {
           break;
 
         case "stt_partial":
+          setSttPartialText(String(data.content ?? "").trim());
           break;
 
         case "stt_final": {
           const content = String(data.content ?? "");
+          activeGenerationRef.current = null;
+          setSttPartialText("");
           setMessages((m) => [...m, { id: uid(), role: "user", text: content }]);
           setInputPlaceholder("说点什么…");
           if (!duplexRef.current) {
@@ -302,6 +448,7 @@ export function useRemChat() {
 
         case "error": {
           setTyping(false);
+          setSttPartialText("");
           resetStreaming();
           waitingRef.current = false;
           setWaiting(false);
@@ -330,6 +477,8 @@ export function useRemChat() {
       setConnLabel("已断开");
       waitingRef.current = false;
       setWaiting(false);
+      clearGenerationState();
+      setSttPartialText("");
       resetStreaming();
       setTyping(false);
       const quiet = suppressDisconnectSysMsgRef.current;
@@ -358,7 +507,7 @@ export function useRemChat() {
       if (reconnectRef.current) clearTimeout(reconnectRef.current);
       wsRef.current?.close();
     };
-  }, []);
+  }, [allowServerGeneration, appendStreaming, blockGeneration, clearGenerationState, clearQueue, enqueueBase64, enqueuePcmChunk, parseGenerationId, resetStreaming, stopVoiceSession]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -385,6 +534,10 @@ export function useRemChat() {
         ws.readyState !== WebSocket.OPEN
       )
         return;
+      // Sending a new user text should immediately stop current/queued playback.
+      clearQueue();
+      activeGenerationRef.current = null;
+      setSttPartialText("");
       setMessages((m) => [...m, { id: uid(), role: "user", text: trimmed }]);
       ws.send(JSON.stringify({ type: "chat", content: trimmed }));
       waitingRef.current = true;
@@ -392,7 +545,7 @@ export function useRemChat() {
       setTyping(true);
       resetStreaming();
     },
-    [resetStreaming],
+    [clearQueue, resetStreaming],
   );
 
   return {
@@ -403,6 +556,7 @@ export function useRemChat() {
     connLabel,
     messages,
     streamingText,
+    sttPartialText,
     typing,
     thinkingHint,
     waiting,

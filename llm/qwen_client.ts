@@ -24,6 +24,7 @@ function getClient(): OpenAI {
 export async function complete(
   messages: ChatMessage[],
   maxTokens = 512,
+  signal?: AbortSignal,
 ): Promise<string> {
   const openai = getClient();
   const model = process.env.model;
@@ -36,7 +37,7 @@ export async function complete(
         messages,
         temperature: 0.3,
         max_tokens: maxTokens,
-      }),
+      }, signal ? { signal } : undefined),
     { retries: 1, label: "complete" },
   );
 
@@ -64,7 +65,7 @@ export async function* streamTokens(
         temperature: 0.7,
         max_tokens: 1024,
         stream: true,
-      }),
+      }, signal ? { signal } : undefined),
     { retries: 1, label: "streamTokens" },
   )) as AsyncIterable<{ choices?: { delta?: { content?: string } }[] }>;
 

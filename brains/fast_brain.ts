@@ -1,4 +1,4 @@
-import { streamTokens } from "../llm/qwen_client";
+import { complete, streamTokens } from "../llm/qwen_client";
 import { buildPrompt, type PromptMessage } from "../brain/prompt_builder";
 import type { Emotion } from "../emotion/emotion_state";
 import type { Memory } from "../memory/memory_store";
@@ -54,7 +54,15 @@ export async function* fastBrainStream(
     }
     if (!hasContent) {
       logger.warn("LLM 返回内容为空（thinking 已过滤）");
-      yield "嗯…让我想想…";
+      const fallback = await complete(messages, 256, input.signal).catch((err) => {
+        logger.warn("LLM 空流 fallback 失败", { error: (err as Error).message });
+        return "";
+      });
+      if (fallback.trim()) {
+        yield fallback.trim();
+      } else {
+        yield "嗯…让我想想…";
+      }
     }
   } catch (err) {
     logger.warn("LLM 调用失败", { error: (err as Error).message });
