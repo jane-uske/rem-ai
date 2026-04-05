@@ -31,6 +31,7 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
   const analyserReadyRef = useRef(false);
   const envelopeRafRef = useRef(0);
   const fallbackAudioRef = useRef<HTMLAudioElement | null>(null);
+  const fallbackSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
   const stopFallbackRef = useRef<(() => void) | null>(null);
   /** Updated ~60fps while TTS plays; read by RemVrmViewer for mouth `aa` blend shape */
   const lipEnvelopeRef = useRef(0);
@@ -50,7 +51,6 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
       envelopeRafRef.current = 0;
     }
     lipEnvelopeRef.current = 0;
-    analyserRef.current = null;
   }, []);
 
   const runEnvelopeLoop = useCallback(() => {
@@ -203,65 +203,100 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
   const playBase64Fallback = useCallback(
     (base64: string, generationAtCall: number, serverGenerationId: number | null) => {
       if (typeof window === "undefined") return Promise.resolve();
-      const url = base64ToObjectUrl(base64);
-      if (!url) return Promise.resolve();
-      if (generationRef.current !== generationAtCall) {
-        URL.revokeObjectURL(url);
-        return Promise.resolve();
-      }
+      return (async () => {
+        const bytes = base64ToUint8Array(base64);
+        if (bytes) {
+          const decoded = await decodeAudioBufferFromBytes(bytes, ensureAudioGraph);
+          if (decoded && generationRef.current === generationAtCall) {
+            await scheduleAudioBuffer(decoded, generationAtCall, serverGenerationId);
+            return;
+          }
+        }
 
-      return new Promise<void>((resolve) => {
-        const audio = new Audio(url);
-        audio.preload = "auto";
-        audio.muted = false;
-        audio.volume = 1;
-        audio.setAttribute("playsinline", "");
-        fallbackAudioRef.current = audio;
-
-        const cleanup = () => {
-          if (fallbackAudioRef.current === audio) fallbackAudioRef.current = null;
-          if (stopFallbackRef.current === stop) stopFallbackRef.current = null;
+        const url = base64ToObjectUrl(base64);
+        if (!url) return;
+        if (generationRef.current !== generationAtCall) {
           URL.revokeObjectURL(url);
-          audio.onended = null;
-          audio.onerror = null;
-          audio.onplaying = null;
-        };
+          return;
+        }
 
-        const finish = () => {
-          cleanup();
-          if (generationRef.current === generationAtCall) {
-            playingRef.current = false;
-            playbackNotifiedRef.current = false;
-            stopEnvelopeLoop();
+        await new Promise<void>((resolve) => {
+          const audio = new Audio(url);
+          audio.preload = "auto";
+          audio.muted = false;
+          audio.volume = 1;
+          audio.setAttribute("playsinline", "");
+          fallbackAudioRef.current = audio;
+
+          const cleanup = () => {
+            if (fallbackAudioRef.current === audio) fallbackAudioRef.current = null;
+            if (stopFallbackRef.current === stop) stopFallbackRef.current = null;
+            audio.onended = null;
+            audio.onerror = null;
+            audio.onplaying = null;
+            try {
+              fallbackSourceRef.current?.disconnect();
+            } catch {
+              /* ignore */
+            }
+            fallbackSourceRef.current = null;
+            URL.revokeObjectURL(url);
+          };
+
+          const finish = () => {
+            cleanup();
+            if (generationRef.current === generationAtCall) {
+              playingRef.current = false;
+              playbackNotifiedRef.current = false;
+              stopEnvelopeLoop();
+              sync();
+            }
+            resolve();
+          };
+
+          const stop = () => {
+            cleanup();
+            resolve();
+          };
+
+          stopFallbackRef.current = stop;
+
+          void (async () => {
+            const ctx = await ensureAudioGraph();
+            const analyser = analyserRef.current;
+            if (ctx && analyser) {
+              try {
+                const source = ctx.createMediaElementSource(audio);
+                source.connect(analyser);
+                fallbackSourceRef.current = source;
+              } catch {
+                /* Some browsers reject re-wiring; keep plain media element fallback. */
+              }
+            }
+          })();
+
+          audio.onplaying = () => {
+            playingRef.current = true;
+            if (analyserRef.current) {
+              stopEnvelopeLoop();
+              runEnvelopeLoop();
+            }
             sync();
-          }
-          resolve();
-        };
+            if (!playbackNotifiedRef.current) {
+              playbackNotifiedRef.current = true;
+              onPlaybackStartRef.current?.(serverGenerationId);
+            }
+          };
+          audio.onended = finish;
+          audio.onerror = finish;
 
-        const stop = () => {
-          cleanup();
-          resolve();
-        };
-
-        stopFallbackRef.current = stop;
-
-        audio.onplaying = () => {
-          playingRef.current = true;
-          sync();
-          if (!playbackNotifiedRef.current) {
-            playbackNotifiedRef.current = true;
-            onPlaybackStartRef.current?.(serverGenerationId);
-          }
-        };
-        audio.onended = finish;
-        audio.onerror = finish;
-
-        void audio.play().catch(() => {
-          finish();
+          void audio.play().catch(() => {
+            finish();
+          });
         });
-      });
+      })();
     },
-    [stopEnvelopeLoop, sync],
+    [ensureAudioGraph, runEnvelopeLoop, scheduleAudioBuffer, stopEnvelopeLoop, sync],
   );
 
   const enqueueBase64 = useCallback(
@@ -310,6 +345,12 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
       fallbackAudioRef.current = null;
       stopFallbackRef.current = null;
     }
+    try {
+      fallbackSourceRef.current?.disconnect();
+    } catch {
+      /* ignore */
+    }
+    fallbackSourceRef.current = null;
     nextStartTimeRef.current = 0;
     playbackNotifiedRef.current = false;
 
@@ -339,10 +380,19 @@ function base64ToUint8Array(base64: string): Uint8Array | null {
   }
 }
 
-function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-  const out = new Uint8Array(bytes.byteLength);
-  out.set(bytes);
-  return out.buffer;
+async function decodeAudioBufferFromBytes(
+  bytes: Uint8Array,
+  ensureAudioGraph: () => Promise<AudioContext | null>,
+): Promise<AudioBuffer | null> {
+  const ctx = await ensureAudioGraph();
+  if (!ctx) return null;
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  try {
+    return await ctx.decodeAudioData(copy.buffer);
+  } catch {
+    return null;
+  }
 }
 
 function pcm16Base64ToFloat32(base64: string): Float32Array | null {

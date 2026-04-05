@@ -4,7 +4,6 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import type { VRM } from "@pixiv/three-vrm";
 import {
   VRMLoaderPlugin,
-  VRMExpressionPresetName,
   VRMHumanBoneName,
   VRMUtils,
 } from "@pixiv/three-vrm";
@@ -12,7 +11,12 @@ import type { RemState } from "@/types/avatar";
 
 /** 关闭每帧「归一化骨骼 → 蒙皮」的自动同步，改由我们直接写 raw 骨骼，否则摆好的手臂会被覆盖回 T-pose */
 const VRM_LOADER_OPTIONS = { autoUpdateHumanBones: false as const };
-import { applyEmotionToVrm } from "./emotionToVrm";
+import {
+  applyExpressionWeights,
+  getEmotionExpressionWeights,
+  mergeExpressionWeights,
+} from "./emotionToVrm";
+import { SpeechMotionController } from "./speechMotion";
 
 export type VrmViewerState = "loading" | "ready" | "error";
 
@@ -116,8 +120,6 @@ export class RemVrmViewer {
   /** 情绪切换时短暂增强头部动作 */
   private gestureT = 0;
   private loopStarted = false;
-  /** Smoothed 0–1 lip opening driven by TTS envelope */
-  private lipSmoothed = 0;
   private remState: RemState = "idle";
   private activeAction:
     | {
@@ -126,6 +128,7 @@ export class RemVrmViewer {
         endAtMs: number;
       }
     | null = null;
+  private readonly speechMotion = new SpeechMotionController();
 
   readonly onStateChange?: (s: VrmViewerState, err?: string) => void;
   private readonly getLipEnvelope?: () => number;
@@ -258,7 +261,7 @@ export class RemVrmViewer {
       if (yaw !== 0) vrm.scene.rotation.y = yaw;
       this.scene.add(vrm.scene);
       warmTintSkinMaterials(vrm.scene);
-      applyEmotionToVrm(vrm, this.currentEmotion);
+      applyExpressionWeights(vrm, getEmotionExpressionWeights(this.currentEmotion));
       // 先跑一帧 VRM，再采样骨骼作为「绑定姿势」，避免未初始化时误把抬手/T 姿当成 rest
       vrm.update(0);
       vrm.scene.updateMatrixWorld(true);
@@ -373,7 +376,7 @@ export class RemVrmViewer {
         // 先跑 VRM 内部（LookAt / 表情系统 / SpringBone…），再写 raw 骨骼与口型，避免被 humanoid 同步冲掉
         this.vrm.update(delta);
         this.applyIdlePose(t);
-        this.applyTtsLipSync();
+        this.applySpeechMotion(delta, t);
         this.vrm.expressionManager?.update();
       }
 
@@ -480,6 +483,42 @@ export class RemVrmViewer {
     }
   }
 
+  /** 说话态：嘴型、眨眼、眼神与轻量头胸部微动作统一从播放包络驱动。 */
+  private applySpeechMotion(delta: number, elapsed: number): void {
+    const vrm = this.vrm;
+    if (!vrm?.humanoid) return;
+
+    const speech = this.speechMotion.update({
+      delta,
+      elapsed,
+      emotion: this.currentEmotion,
+      remState: this.remState,
+      lipEnvelope: this.getLipEnvelope?.() ?? 0,
+      voiceActive: this.getVoiceActive?.() ?? false,
+    });
+
+    const chest = vrm.humanoid.getRawBoneNode(VRMHumanBoneName.Chest);
+    const neck = vrm.humanoid.getRawBoneNode(VRMHumanBoneName.Neck);
+    if (chest) {
+      chest.rotation.x += speech.chestPitch;
+      chest.rotation.y += speech.chestYaw;
+      chest.rotation.z += speech.chestRoll;
+    }
+    if (neck) {
+      neck.rotation.x += speech.neckPitch;
+      neck.rotation.y += speech.neckYaw;
+      neck.rotation.z += speech.neckRoll;
+    }
+
+    applyExpressionWeights(
+      vrm,
+      mergeExpressionWeights(
+        getEmotionExpressionWeights(this.currentEmotion),
+        speech.expressions,
+      ),
+    );
+  }
+
   /**
    * 上臂：在绑定姿势上，把「沿大臂指向」在世界系里转向接近「向下」（几何最短路径），再换算回局部四元数。
    * 不调用 rotateX/Y/Z 叠「假想前摆」——局部轴在每条骨骼上含义不同，Z 往往是内外翻（你遇到的情况）。
@@ -570,47 +609,11 @@ export class RemVrmViewer {
     if (rSh) rSh.quaternion.copy(this.armRest.rSh);
   }
 
-  /** Drive VRM `aa` mouth shape from TTS loudness so the face matches speech. */
-  private applyTtsLipSync(): void {
-    const vrm = this.vrm;
-    const em = vrm?.expressionManager;
-    if (!em) return;
-
-    let raw = Math.max(0, Math.min(1, this.getLipEnvelope?.() ?? 0));
-    const voice = this.getVoiceActive?.() ?? false;
-    // Web Audio 未连上或 RMS 极小时，仍随播放做轻微开合，避免「说话但嘴不动」
-    if (voice && raw < 0.06) {
-      const chatter = 0.42 + 0.38 * Math.sin(this.clock.elapsedTime * 13.5);
-      raw = Math.max(raw, chatter * 0.55);
-    }
-    this.lipSmoothed = this.lipSmoothed * 0.62 + raw * 0.38;
-    const w = Math.min(1, this.lipSmoothed * 1.15);
-
-    try {
-      em.setValue(VRMExpressionPresetName.Aa, w);
-      if (w > 0.08) {
-        em.setValue(VRMExpressionPresetName.Oh, w * 0.25);
-      } else {
-        em.setValue(VRMExpressionPresetName.Oh, 0);
-      }
-    } catch {
-      try {
-        em.setValue("aa", w);
-        em.setValue("oh", w > 0.08 ? w * 0.25 : 0);
-      } catch {
-        /* 无口型预设 */
-      }
-    }
-  }
-
   setEmotion(emotion: string): void {
     const next = String(emotion || "neutral").toLowerCase();
     if (next === this.currentEmotion) return;
     this.currentEmotion = next;
     this.gestureT = 1;
-    if (this.vrm) {
-      applyEmotionToVrm(this.vrm, next);
-    }
   }
 
   setState(state: RemState): void {
@@ -641,6 +644,7 @@ export class RemVrmViewer {
 
   dispose(): void {
     this.disposed = true;
+    this.speechMotion.reset();
     cancelAnimationFrame(this.raf);
     this.controls.dispose();
     if (this.vrm) {
