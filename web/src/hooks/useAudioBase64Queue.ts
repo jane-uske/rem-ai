@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
  * Queue server TTS audio. Supports:
@@ -31,6 +31,11 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
   const envelopeRafRef = useRef(0);
   /** Updated ~60fps while TTS plays; read by RemVrmViewer for mouth `aa` blend shape */
   const lipEnvelopeRef = useRef(0);
+  const onPlaybackStartRef = useRef(options?.onPlaybackStart);
+
+  useEffect(() => {
+    onPlaybackStartRef.current = options?.onPlaybackStart;
+  }, [options?.onPlaybackStart]);
 
   const sync = useCallback(() => {
     setPlaying(playingRef.current);
@@ -144,11 +149,11 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
       }
       if (!playbackNotifiedRef.current) {
         playbackNotifiedRef.current = true;
-        options?.onPlaybackStart?.();
+        onPlaybackStartRef.current?.();
       }
       scheduleIdleCheck();
     },
-    [ensureAudioGraph, options, runEnvelopeLoop, scheduleIdleCheck, stopEnvelopeLoop, sync],
+    [ensureAudioGraph, runEnvelopeLoop, scheduleIdleCheck, stopEnvelopeLoop, sync],
   );
 
   const enqueuePcmChunk = useCallback(

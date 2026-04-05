@@ -116,6 +116,7 @@ export function useRemChat() {
     activeGenerationRef.current = null;
     blockedGenerationsRef.current.clear();
   }, []);
+  const hasAnnouncedConnectedRef = useRef(false);
 
   const blockGeneration = useCallback((id: number) => {
     const blocked = blockedGenerationsRef.current;
@@ -139,13 +140,15 @@ export function useRemChat() {
     return null;
   }, []);
 
+  const handlePlaybackStart = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: "playback_start" }));
+  }, []);
+
   const { enqueueBase64, enqueuePcmChunk, clearQueue, voiceActive, lipEnvelopeRef } =
     useAudioBase64Queue({
-      onPlaybackStart: () => {
-        const ws = wsRef.current;
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        ws.send(JSON.stringify({ type: "playback_start" }));
-      },
+      onPlaybackStart: handlePlaybackStart,
     });
 
   useEffect(() => {
@@ -341,10 +344,13 @@ export function useRemChat() {
       setConnectionPhase("open");
       setReconnectDeadline(null);
       setConnLabel("在线");
-      setMessages((m) => [
-        ...m,
-        { id: uid(), role: "sys", text: "已连接，和 Rem 聊聊吧" },
-      ]);
+      if (!hasAnnouncedConnectedRef.current) {
+        hasAnnouncedConnectedRef.current = true;
+        setMessages((m) => [
+          ...m,
+          { id: uid(), role: "sys", text: "已连接，和 Rem 聊聊吧" },
+        ]);
+      }
     };
 
     ws.onmessage = (ev) => {
@@ -506,10 +512,13 @@ export function useRemChat() {
       const quiet = suppressDisconnectSysMsgRef.current;
       suppressDisconnectSysMsgRef.current = false;
       if (!quiet) {
-        setMessages((m) => [
-          ...m,
-          { id: uid(), role: "sys", text: "连接已断开，3 秒后重连…" },
-        ]);
+        setMessages((m) => {
+          const last = m[m.length - 1];
+          if (last?.role === "sys" && last.text === "连接已断开，3 秒后重连…") {
+            return m;
+          }
+          return [...m, { id: uid(), role: "sys", text: "连接已断开，3 秒后重连…" }];
+        });
       }
       reconnectRef.current = setTimeout(() => {
         if (mountedRef.current) connectRef.current?.();

@@ -18,12 +18,28 @@ export function ChatWindow({
   streamingText,
   thinkingHint,
 }: ChatWindowProps) {
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollerRef = useRef<HTMLDivElement>(null);
   const prevStreamingRef = useRef("");
+  const prevMessagesLenRef = useRef(messages.length);
+  const shouldStickRef = useRef(true);
   const [streamStatus, setStreamStatus] = useState("");
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    const distanceToBottom =
+      scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+    shouldStickRef.current = distanceToBottom < 72;
+  });
+
+  useEffect(() => {
+    if (!shouldStickRef.current) return;
+    const addedMessage = messages.length !== prevMessagesLenRef.current;
+    prevMessagesLenRef.current = messages.length;
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    const behavior: ScrollBehavior = addedMessage ? "smooth" : "auto";
+    scroller.scrollTo({ top: scroller.scrollHeight, behavior });
   }, [messages, sttPartialText, streamingText, thinkingHint]);
 
   useEffect(() => {
@@ -45,6 +61,7 @@ export function ChatWindow({
         {streamStatus}
       </div>
       <div
+        ref={scrollerRef}
         role="log"
         aria-label="对话消息"
         aria-live="off"
@@ -76,7 +93,6 @@ export function ChatWindow({
             </span>
           </div>
         ) : null}
-        <div ref={bottomRef} />
       </div>
     </section>
   );
