@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { base64ToObjectUrl } from "@/lib/audioBase64";
 
 /**
  * Queue server TTS audio. Supports:
@@ -29,6 +30,7 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const analyserReadyRef = useRef(false);
   const envelopeRafRef = useRef(0);
+  const fallbackAudioRef = useRef<HTMLAudioElement | null>(null);
   /** Updated ~60fps while TTS plays; read by RemVrmViewer for mouth `aa` blend shape */
   const lipEnvelopeRef = useRef(0);
   const onPlaybackStartRef = useRef(options?.onPlaybackStart);
@@ -101,6 +103,18 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
     }
     return ctx;
   }, []);
+
+  const unlockPlayback = useCallback(async (): Promise<void> => {
+    const ctx = await ensureAudioGraph();
+    if (!ctx) return;
+    if (ctx.state !== "running") {
+      try {
+        await ctx.resume();
+      } catch {
+        /* ignore */
+      }
+    }
+  }, [ensureAudioGraph]);
 
   const scheduleIdleCheck = useCallback(() => {
     if (idleTimerRef.current) {
@@ -191,13 +205,80 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
           const bytes = base64ToUint8Array(base64);
           if (!bytes) return;
           const ctx = await ensureAudioGraph();
-          if (!ctx || generationRef.current !== generationAtCall) return;
-          const decoded = await ctx.decodeAudioData(toArrayBuffer(bytes));
+          if (!ctx || generationRef.current !== generationAtCall) {
+            playBase64Fallback(base64, generationAtCall);
+            return;
+          }
+          let decoded: AudioBuffer;
+          try {
+            decoded = await ctx.decodeAudioData(toArrayBuffer(bytes));
+          } catch {
+            playBase64Fallback(base64, generationAtCall);
+            return;
+          }
           if (generationRef.current !== generationAtCall) return;
           await scheduleAudioBuffer(decoded, generationAtCall);
         });
     },
-    [ensureAudioGraph, scheduleAudioBuffer],
+    [ensureAudioGraph, playBase64Fallback, scheduleAudioBuffer],
+  );
+
+  const playBase64Fallback = useCallback(
+    (base64: string, generationAtCall: number) => {
+      if (typeof window === "undefined") return;
+      const url = base64ToObjectUrl(base64);
+      if (!url) return;
+      if (generationRef.current !== generationAtCall) {
+        URL.revokeObjectURL(url);
+        return;
+      }
+
+      const audio = new Audio(url);
+      audio.preload = "auto";
+      audio.setAttribute("playsinline", "");
+      fallbackAudioRef.current = audio;
+
+      const cleanup = () => {
+        if (fallbackAudioRef.current === audio) fallbackAudioRef.current = null;
+        URL.revokeObjectURL(url);
+        audio.onended = null;
+        audio.onerror = null;
+      };
+
+      audio.onended = () => {
+        cleanup();
+        if (generationRef.current !== generationAtCall) return;
+        playingRef.current = false;
+        playbackNotifiedRef.current = false;
+        stopEnvelopeLoop();
+        sync();
+      };
+      audio.onerror = () => {
+        cleanup();
+        if (generationRef.current !== generationAtCall) return;
+        playingRef.current = false;
+        playbackNotifiedRef.current = false;
+        stopEnvelopeLoop();
+        sync();
+      };
+
+      playingRef.current = true;
+      sync();
+      if (!playbackNotifiedRef.current) {
+        playbackNotifiedRef.current = true;
+        onPlaybackStartRef.current?.();
+      }
+
+      void audio.play().catch(() => {
+        cleanup();
+        if (generationRef.current !== generationAtCall) return;
+        playingRef.current = false;
+        playbackNotifiedRef.current = false;
+        stopEnvelopeLoop();
+        sync();
+      });
+    },
+    [stopEnvelopeLoop, sync],
   );
 
   /** Stop current playback and discard all queued audio (used on interrupt). */
@@ -218,6 +299,18 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
       }
     }
     activeSourcesRef.current.clear();
+    const fallback = fallbackAudioRef.current;
+    if (fallback) {
+      fallback.onended = null;
+      fallback.onerror = null;
+      fallback.pause();
+      try {
+        fallback.src = "";
+      } catch {
+        /* ignore */
+      }
+      fallbackAudioRef.current = null;
+    }
     nextStartTimeRef.current = 0;
     playbackNotifiedRef.current = false;
 
@@ -226,7 +319,14 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
     sync();
   }, [stopEnvelopeLoop, sync]);
 
-  return { enqueueBase64, enqueuePcmChunk, clearQueue, voiceActive: playing, lipEnvelopeRef };
+  return {
+    enqueueBase64,
+    enqueuePcmChunk,
+    clearQueue,
+    unlockPlayback,
+    voiceActive: playing,
+    lipEnvelopeRef,
+  };
 }
 
 function base64ToUint8Array(base64: string): Uint8Array | null {

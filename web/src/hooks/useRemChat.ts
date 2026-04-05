@@ -146,7 +146,7 @@ export function useRemChat() {
     ws.send(JSON.stringify({ type: "playback_start" }));
   }, []);
 
-  const { enqueueBase64, enqueuePcmChunk, clearQueue, voiceActive, lipEnvelopeRef } =
+  const { enqueueBase64, enqueuePcmChunk, clearQueue, unlockPlayback, voiceActive, lipEnvelopeRef } =
     useAudioBase64Queue({
       onPlaybackStart: handlePlaybackStart,
     });
@@ -216,6 +216,7 @@ export function useRemChat() {
     // Local pre-barge-in: stop any queued/playing TTS immediately.
     clearQueue();
     setSttPartialText("");
+    void unlockPlayback();
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -260,7 +261,7 @@ export function useRemChat() {
         { id: uid(), role: "error", text: "无法访问麦克风" },
       ]);
     }
-  }, [clearQueue]);
+  }, [clearQueue, unlockPlayback]);
 
   const stopVoiceSession = useCallback(() => {
     const ws = wsRef.current;
@@ -567,6 +568,7 @@ export function useRemChat() {
         return;
       // Sending a new user text should immediately stop current/queued playback.
       clearQueue();
+      void unlockPlayback();
       activeGenerationRef.current = null;
       setSttPartialText("");
       setMessages((m) => [...m, { id: uid(), role: "user", text: trimmed }]);
@@ -576,7 +578,7 @@ export function useRemChat() {
       setTyping(true);
       resetStreaming();
     },
-    [clearQueue, resetStreaming],
+    [clearQueue, resetStreaming, unlockPlayback],
   );
 
   return {
