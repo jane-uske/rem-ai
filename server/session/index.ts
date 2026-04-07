@@ -13,6 +13,7 @@ import { createSession as createDbSession, endSession } from "../../storage/repo
 import { RemSessionContext } from "../../brains/rem_session_context";
 import { runPipeline } from "../pipeline";
 import { send, getWsRateLimiter } from "../gateway";
+import { synthesize, isTtsEnabled } from "../../voice/tts_stream";
 
 const logger = createLogger("session");
 const AUDIO_BIN_MAGIC_V1 = Buffer.from([0x52, 0x41]); // "RA" (legacy)
@@ -147,6 +148,12 @@ function hesitationHoldMs(): number {
   return parseNonNegativeMs(process.env.VAD_UTTERANCE_GAP_HESITATION_MS, 980);
 }
 
+/** 随机选择打断反应音文本 */
+function randomInterruptReaction(): string {
+  const reactions = ["啊？", "嗯？", "怎么啦？"];
+  return reactions[Math.floor(Math.random() * reactions.length)];
+}
+
 export class ConnectionSession {
   readonly connId: string;
   readonly brain: RemSessionContext;
@@ -185,6 +192,14 @@ export class ConnectionSession {
   private traceSeq = 0;
   private pendingVoiceTraceId: string | null = null;
   private activeTraceId: string | null = null;
+
+  /** 连续对话相关配置 */
+  private lastInteractionAt: number = 0;
+  private recentInteractionCount: number = 0;
+  private readonly CONTINUOUS_CONVERSATION_THRESHOLD = 3; // 近3轮交互判定为连续对话
+  private readonly CONTINUOUS_CONVERSATION_TIMEOUT = 5 * 60 * 1000; // 5分钟无交互退出连续对话
+  private readonly VAD_CONTINUOUS_SILENCE_FRAMES = 8; // 连续对话场景静默帧阈值
+  private readonly VAD_DEFAULT_SILENCE_FRAMES = 10; // 默认静默帧阈值
 
   constructor(ws: WebSocket) {
     this.connId = randomUUID();
@@ -408,12 +423,32 @@ export class ConnectionSession {
     }
   }
 
-  /** 用户每次发文字或语音被识别后调用，重新计时沉默搭话 */
+  /** 判断是否处于连续对话状态（近3轮有交互且未超时） */
+  private isContinuousConversation(): boolean {
+    const now = Date.now();
+    return this.recentInteractionCount >= this.CONTINUOUS_CONVERSATION_THRESHOLD && 
+           (now - this.lastInteractionAt) < this.CONTINUOUS_CONVERSATION_TIMEOUT;
+  }
+
+  /** 同步VAD静默阈值到当前对话状态 */
+  private syncVadSilenceThreshold(): void {
+    const threshold = this.isContinuousConversation() 
+      ? this.VAD_CONTINUOUS_SILENCE_FRAMES 
+      : this.VAD_DEFAULT_SILENCE_FRAMES;
+    this.vad.setSpeakingSilenceFrames(threshold);
+  }
+
+  /** 用户每次发文字或语音被识别后调用，重新计时沉默搭话和连续对话状态 */
   private touchUserActivity(): void {
     this.clearSilenceNudgeTimer();
     const ms = silenceNudgeMs();
     if (ms <= 0) return;
     this.silenceNudgeTimer = setTimeout(() => this.fireSilenceNudge(), ms);
+
+    // 更新连续对话状态
+    this.lastInteractionAt = Date.now();
+    this.recentInteractionCount = Math.min(this.recentInteractionCount + 1, this.CONTINUOUS_CONVERSATION_THRESHOLD);
+    this.syncVadSilenceThreshold();
   }
 
   /**
@@ -517,12 +552,28 @@ export class ConnectionSession {
     this.vad.on("speech_start", () => {
       logger.info("[VAD] speech_start", { connId: this.connId });
 
-      // Always tell the client to stop TTS playback — the server pipeline may
-      // already be idle while audio is still playing from the queue.
-      this.sendInterrupt();
-      if (this.interrupt.active) {
+      const interruptReactionEnabled = process.env.interrupt_reaction !== "0" && isTtsEnabled();
+      if (this.interrupt.active && interruptReactionEnabled) {
+        // 先播放打断反应音，再停止当前播放
+        void synthesize(randomInterruptReaction(), undefined, this.brain.emotion.getEmotion() as any)
+          .then((buf) => {
+            send(this.ws, { type: "voice", audio: buf.toString("base64"), generationId: this.activeGenerationId ?? 0 });
+            // 发送反应音后再通知客户端停止之前的播放
+            this.sendInterrupt();
+          })
+          .catch(() => {
+            // 合成失败直接发中断
+            this.sendInterrupt();
+          });
         this.interrupt.interrupt();
-        logger.info("[VAD] → interrupted pipeline", { connId: this.connId });
+        logger.info("[VAD] → interrupted pipeline with reaction", { connId: this.connId });
+      } else {
+        // 没有反应音的情况直接发中断
+        this.sendInterrupt();
+        if (this.interrupt.active) {
+          this.interrupt.interrupt();
+          logger.info("[VAD] → interrupted pipeline", { connId: this.connId });
+        }
       }
 
       this.resetPreviewState();
@@ -673,6 +724,8 @@ export class ConnectionSession {
     this.clearPendingUtteranceTimer();
     this.resetPreviewState();
     this.pendingVoiceTraceId = null;
+    // 启动双工前同步VAD阈值
+    this.syncVadSilenceThreshold();
     logger.info(`[Duplex] 已启动`, { connId: this.connId, sampleRate: rate });
   }
 
@@ -904,10 +957,27 @@ export class ConnectionSession {
     logger.info(`[用户] ${content}`, { connId: this.connId });
     this.touchUserActivity();
 
-    // Always notify client to stop any queued/playing audio immediately.
-    this.sendInterrupt();
-    if (this.interrupt.active) {
+    const interruptReactionEnabled = process.env.interrupt_reaction !== "0" && isTtsEnabled();
+    if (this.interrupt.active && interruptReactionEnabled) {
+      // 先播放打断反应音，再停止当前播放
+      void synthesize(randomInterruptReaction(), undefined, this.brain.emotion.getEmotion() as any)
+        .then((buf) => {
+          send(this.ws, { type: "voice", audio: buf.toString("base64"), generationId: this.activeGenerationId ?? 0 });
+          // 发送反应音后再通知客户端停止之前的播放
+          this.sendInterrupt();
+        })
+        .catch(() => {
+          // 合成失败直接发中断
+          this.sendInterrupt();
+        });
       this.interrupt.interrupt();
+      logger.info("[Chat] → interrupted pipeline with reaction", { connId: this.connId });
+    } else {
+      // 没有反应音的情况直接发中断
+      this.sendInterrupt();
+      if (this.interrupt.active) {
+        this.interrupt.interrupt();
+      }
     }
 
     const generationId = this.nextGenerationId();

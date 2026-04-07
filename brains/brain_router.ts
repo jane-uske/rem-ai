@@ -37,6 +37,13 @@ export async function* routeMessage(
 ): AsyncGenerator<string> {
   ctx.cancelSlowBrain();
 
+  // 处理「刚才说到哪了」查询
+  const interruptedQueryRegex = /^(刚才|刚刚|刚刚|刚才)(说到哪|说什么|在说啥|讲到哪)/i;
+  if (interruptedQueryRegex.test(userMessage.trim()) && ctx.lastInterruptedReply) {
+    yield `我刚才说到：${ctx.lastInterruptedReply}`;
+    return;
+  }
+
   if (!opts?.systemTriggered) {
     extractMemory(userMessage, ctx.memory);
   }
@@ -54,6 +61,7 @@ export async function* routeMessage(
     slowBrainContext,
     strategyHints: ctx.slowBrain.buildConversationStrategyHints(userMessage),
     signal,
+    persona: ctx.persona,
   })) {
     fullReply += token;
     yield token;
@@ -62,11 +70,19 @@ export async function* routeMessage(
   const historyUserContent = opts?.systemTriggered
     ? "［你主动开口陪对方聊天］"
     : userMessage;
+  // Update history
   ctx.history.push({ role: "user", content: historyUserContent });
   ctx.history.push({ role: "assistant", content: fullReply });
   while (ctx.history.length > MAX_HISTORY) {
     ctx.history.shift();
   }
+
+  // Update live persona state after interaction
+  ctx.updateLiveState(
+    emotion,
+    userMessage,
+    fullReply
+  );
 
   if (!opts?.systemTriggered) {
     const slowBrainSignal = ctx.beginSlowBrain();

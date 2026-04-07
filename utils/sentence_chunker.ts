@@ -1,11 +1,15 @@
 const SENTENCE_END = /[。！？.!?\n]/;
 
+/** 支持的首句 eager 阈值方案：12/14/16 字，默认 14（速度与自然度平衡） */
+type EagerThresholdOption = 12 | 14 | 16;
+
 export interface SentenceChunkerOptions {
   /**
    * Eager mode: emit first TTS chunk when this many characters are buffered
    * and no sentence end yet (does NOT split on commas).
+   * Supported values: 12/14/16 (default: 14, balance of speed and naturalness)
    */
-  eagerCharThreshold?: number;
+  eagerCharThreshold?: EagerThresholdOption | number;
   /**
    * While eager mode is on, allow a shorter minimum chunk so the first audio
    * can start earlier. Falls back to minTtsChars when not provided.
@@ -53,13 +57,22 @@ export class SentenceChunker {
     const envEagerChunk = process.env.TTS_EAGER_CHUNK_CHARS
       ? Number(process.env.TTS_EAGER_CHUNK_CHARS)
       : NaN;
+    const envEagerThreshold = process.env.TTS_EAGER_THRESHOLD
+      ? Number(process.env.TTS_EAGER_THRESHOLD) as EagerThresholdOption
+      : 14;
     const envMax = process.env.TTS_CHUNK_MAX_CHARS
       ? Number(process.env.TTS_CHUNK_MAX_CHARS)
       : NaN;
     const envTtsMin = process.env.TTS_MIN_CHARS ? Number(process.env.TTS_MIN_CHARS) : NaN;
-    this.eagerCharThreshold =
-      opts.eagerCharThreshold ??
-      (Number.isFinite(envEagerChunk) && envEagerChunk > 0 ? envEagerChunk : 24);
+
+    // 优先使用显式传入的 eagerCharThreshold，否则检查 envEagerChunk，再用默认 14
+    const desiredThreshold = opts.eagerCharThreshold ??
+      (Number.isFinite(envEagerChunk) && envEagerChunk > 0 ? envEagerChunk : envEagerThreshold);
+    // 强制阈值落在 12/14/16 范围内，避免不合理值
+    this.eagerCharThreshold = [12,14,16].includes(desiredThreshold as EagerThresholdOption)
+      ? desiredThreshold
+      : 14;
+
     this.maxChunkChars =
       opts.maxChunkChars ?? (Number.isFinite(envMax) && envMax > 0 ? envMax : 120);
     if (opts.minTtsChars !== undefined) {
@@ -91,6 +104,7 @@ export class SentenceChunker {
     this.buffer += token;
     const sentences: string[] = [];
 
+    // 优先按自然短句标点（。！？…）触发合成，优先级高于字数阈值
     let match: RegExpExecArray | null;
     while ((match = SENTENCE_END.exec(this.buffer)) !== null) {
       const idx = match.index + match[0].length;
@@ -100,7 +114,8 @@ export class SentenceChunker {
       if (sentence) sentences.push(sentence);
     }
 
-    if (this._eager && this.buffer.length >= this.eagerCharThreshold) {
+    // 只有当没有标点触发时，才使用字数阈值强制输出首句
+    if (this._eager && this.buffer.length >= this.eagerCharThreshold && sentences.length === 0) {
       sentences.push(this.buffer.trim());
       this.buffer = "";
     } else if (!this._eager) {

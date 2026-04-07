@@ -10,6 +10,7 @@ import { initDatabase, closeDatabase } from "../storage/database";
 import { initRedis, closeRedis } from "../storage/redis";
 import { getPgMemoryRepository } from "../storage/repositories/pg_memory_repository";
 import { shutdownWhisperServer, warmWhisperServer } from "../voice/stt_stream";
+import { warmupEdgeTtsConnections } from "../voice/tts";
 import { createGateway, startServer, PORT } from "./gateway";
 import { createSession } from "./session";
 
@@ -58,6 +59,14 @@ async function bootstrap() {
       error: err instanceof Error ? err.message : String(err),
     });
   });
+
+  // 预热 Edge TTS 连接池，提前建立 2 个空闲连接
+  await warmupEdgeTtsConnections(2).catch((err) => {
+    logger.warn("[TTS] Edge TTS 连接预热跳过", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+  logger.info("[TTS] Edge TTS 连接预热完成");
 
   let shuttingDown = false;
   const cleanupAndExit = async (signal: "SIGINT" | "SIGTERM") => {

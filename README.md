@@ -11,6 +11,7 @@
 - **语音输出（TTS）** — 支持 Edge TTS / Piper / OpenAI TTS 三种后端，逐句流式合成
 - **虚拟形象** — VRM 三维角色（Three.js）+ 情绪驱动；旧版含 SVG 表情头像
 - **实时通信** — WebSocket 全双工通信，支持打断控制、流式 token 推送、音频流传输
+- **3D Demo** — 独立 `/demo` 路由可离线切换模型、情绪、状态和动作，便于人工验收
 
 ## 技术栈
 
@@ -79,6 +80,7 @@ npm run typecheck
 | `REM_NEXT_HOSTNAME` | 传给 Next 的主机名（勿含端口）；见 `.env.example`。 |
 
 前端排障与实现细节见 **`web/docs/FRONTEND_PITFALLS.md`**。
+独立 3D 验收页见 **`/demo`**。
 
 ## 项目目录
 

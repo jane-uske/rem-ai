@@ -4,6 +4,7 @@ import type { Emotion } from "../emotion/emotion_state";
 import type { Memory } from "../memory/memory_store";
 import { createLogger } from "../infra/logger";
 import { estimateTextTokens } from "./history_budget";
+import type { PersonaState } from "../persona";
 
 const logger = createLogger("fast_brain");
 
@@ -16,6 +17,8 @@ export interface FastBrainInput {
   strategyHints?: string;
   slowBrainContext?: string;
   signal?: AbortSignal;
+  /** Optional structured persona state for v1 personality system */
+  persona?: PersonaState;
 }
 
 /**
@@ -37,6 +40,7 @@ export async function* fastBrainStream(
     history: input.history,
     userMessage: input.userMessage,
     priorityContext,
+    persona: input.persona,
   });
   const promptText = messages.map((m) => m.content).join("\n");
   const promptChars = messages.reduce((sum, msg) => sum + msg.content.length, 0);

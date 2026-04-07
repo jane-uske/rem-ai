@@ -207,7 +207,15 @@ export function useRemChat() {
     ws.send(JSON.stringify(payload));
   }, []);
 
-  const { enqueueBase64, enqueuePcmChunk, clearQueue, unlockPlayback, voiceActive, lipEnvelopeRef } =
+  const {
+    enqueueBase64,
+    enqueuePcmChunk,
+    clearQueue,
+    unlockPlayback,
+    voiceActive,
+    lipEnvelopeRef,
+    lipSignalRef,
+  } =
     useAudioBase64Queue({
       onPlaybackStart: handlePlaybackStart,
     });
@@ -689,6 +697,8 @@ export function useRemChat() {
     voiceActive,
     /** TTS 音量包络 0–1，供 3D 口型同步 */
     lipEnvelopeRef,
+    /** 统一口型信号，后续可接 viseme。 */
+    lipSignalRef,
     hasMic,
     sendText,
     toggleMic,

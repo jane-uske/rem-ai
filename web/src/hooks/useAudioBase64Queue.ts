@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { base64ToObjectUrl } from "@/lib/audioBase64";
+import type { LipSignal } from "@/types/avatar";
 
 /**
  * Queue server TTS audio. Supports:
@@ -35,6 +36,11 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
   const stopFallbackRef = useRef<(() => void) | null>(null);
   /** Updated ~60fps while TTS plays; read by RemVrmViewer for mouth `aa` blend shape */
   const lipEnvelopeRef = useRef(0);
+  const lipSignalRef = useRef<LipSignal>({
+    envelope: 0,
+    active: false,
+    viseme: null,
+  });
   const onPlaybackStartRef = useRef(options?.onPlaybackStart);
 
   useEffect(() => {
@@ -45,13 +51,22 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
     setPlaying(playingRef.current);
   }, []);
 
+  const updateLipSignal = useCallback((patch: Partial<LipSignal>) => {
+    Object.assign(lipSignalRef.current, patch);
+    lipEnvelopeRef.current = lipSignalRef.current.envelope;
+  }, []);
+
   const stopEnvelopeLoop = useCallback(() => {
     if (envelopeRafRef.current) {
       cancelAnimationFrame(envelopeRafRef.current);
       envelopeRafRef.current = 0;
     }
-    lipEnvelopeRef.current = 0;
-  }, []);
+    updateLipSignal({
+      envelope: 0,
+      active: false,
+      viseme: null,
+    });
+  }, [updateLipSignal]);
 
   const runEnvelopeLoop = useCallback(() => {
     const analyser = analyserRef.current;
@@ -59,7 +74,11 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
     const buf = new Float32Array(analyser.fftSize);
     const tick = () => {
       if (!analyserRef.current || !playingRef.current) {
-        lipEnvelopeRef.current = 0;
+        updateLipSignal({
+          envelope: 0,
+          active: false,
+          viseme: null,
+        });
         return;
       }
       analyser.getFloatTimeDomainData(buf);
@@ -71,11 +90,14 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
       const rms = Math.sqrt(sum / buf.length);
       // Boost speech RMS into a visible mouth range; clamp
       const level = Math.min(1, Math.pow(rms * 7.2, 0.82));
-      lipEnvelopeRef.current = level;
+      updateLipSignal({
+        envelope: level,
+        active: true,
+      });
       envelopeRafRef.current = requestAnimationFrame(tick);
     };
     envelopeRafRef.current = requestAnimationFrame(tick);
-  }, []);
+  }, [updateLipSignal]);
 
   const ensureAudioGraph = useCallback(async (): Promise<AudioContext | null> => {
     if (typeof window === "undefined") return null;
@@ -162,6 +184,9 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
 
       if (!playingRef.current) {
         playingRef.current = true;
+        updateLipSignal({
+          active: true,
+        });
         stopEnvelopeLoop();
         runEnvelopeLoop();
         sync();
@@ -172,7 +197,14 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
       }
       scheduleIdleCheck();
     },
-    [ensureAudioGraph, runEnvelopeLoop, scheduleIdleCheck, stopEnvelopeLoop, sync],
+    [
+      ensureAudioGraph,
+      runEnvelopeLoop,
+      scheduleIdleCheck,
+      stopEnvelopeLoop,
+      sync,
+      updateLipSignal,
+    ],
   );
 
   const enqueuePcmChunk = useCallback(
@@ -204,15 +236,6 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
     (base64: string, generationAtCall: number, serverGenerationId: number | null) => {
       if (typeof window === "undefined") return Promise.resolve();
       return (async () => {
-        const bytes = base64ToUint8Array(base64);
-        if (bytes) {
-          const decoded = await decodeAudioBufferFromBytes(bytes, ensureAudioGraph);
-          if (decoded && generationRef.current === generationAtCall) {
-            await scheduleAudioBuffer(decoded, generationAtCall, serverGenerationId);
-            return;
-          }
-        }
-
         const url = base64ToObjectUrl(base64);
         if (!url) return;
         if (generationRef.current !== generationAtCall) {
@@ -227,13 +250,33 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
           audio.volume = 1;
           audio.setAttribute("playsinline", "");
           fallbackAudioRef.current = audio;
+          let finishTimer: ReturnType<typeof setTimeout> | null = null;
+
+          const clearFinishTimer = () => {
+            if (finishTimer) {
+              clearTimeout(finishTimer);
+              finishTimer = null;
+            }
+          };
+
+          const armFinishTimer = () => {
+            clearFinishTimer();
+            const duration = Number(audio.duration);
+            if (!Number.isFinite(duration) || duration <= 0) return;
+            finishTimer = setTimeout(() => {
+              finish();
+            }, duration * 1000 + 320);
+          };
 
           const cleanup = () => {
             if (fallbackAudioRef.current === audio) fallbackAudioRef.current = null;
             if (stopFallbackRef.current === stop) stopFallbackRef.current = null;
+            clearFinishTimer();
             audio.onended = null;
             audio.onerror = null;
             audio.onplaying = null;
+            audio.onloadedmetadata = null;
+            audio.ondurationchange = null;
             try {
               fallbackSourceRef.current?.disconnect();
             } catch {
@@ -261,32 +304,18 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
 
           stopFallbackRef.current = stop;
 
-          void (async () => {
-            const ctx = await ensureAudioGraph();
-            const analyser = analyserRef.current;
-            if (ctx && analyser) {
-              try {
-                const source = ctx.createMediaElementSource(audio);
-                source.connect(analyser);
-                fallbackSourceRef.current = source;
-              } catch {
-                /* Some browsers reject re-wiring; keep plain media element fallback. */
-              }
-            }
-          })();
-
           audio.onplaying = () => {
             playingRef.current = true;
-            if (analyserRef.current) {
-              stopEnvelopeLoop();
-              runEnvelopeLoop();
-            }
+            updateLipSignal({ active: true });
+            armFinishTimer();
             sync();
             if (!playbackNotifiedRef.current) {
               playbackNotifiedRef.current = true;
               onPlaybackStartRef.current?.(serverGenerationId);
             }
           };
+          audio.onloadedmetadata = armFinishTimer;
+          audio.ondurationchange = armFinishTimer;
           audio.onended = finish;
           audio.onerror = finish;
 
@@ -296,7 +325,7 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
         });
       })();
     },
-    [ensureAudioGraph, runEnvelopeLoop, scheduleAudioBuffer, stopEnvelopeLoop, sync],
+    [stopEnvelopeLoop, sync, updateLipSignal],
   );
 
   const enqueueBase64 = useCallback(
@@ -366,6 +395,7 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
     unlockPlayback,
     voiceActive: playing,
     lipEnvelopeRef,
+    lipSignalRef,
   };
 }
 
@@ -375,21 +405,6 @@ function base64ToUint8Array(base64: string): Uint8Array | null {
     const out = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
     return out;
-  } catch {
-    return null;
-  }
-}
-
-async function decodeAudioBufferFromBytes(
-  bytes: Uint8Array,
-  ensureAudioGraph: () => Promise<AudioContext | null>,
-): Promise<AudioBuffer | null> {
-  const ctx = await ensureAudioGraph();
-  if (!ctx) return null;
-  const copy = new Uint8Array(bytes.byteLength);
-  copy.set(bytes);
-  try {
-    return await ctx.decodeAudioData(copy.buffer);
   } catch {
     return null;
   }

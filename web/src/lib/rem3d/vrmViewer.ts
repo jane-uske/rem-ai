@@ -145,6 +145,13 @@ export class RemVrmViewer {
     rSh: new THREE.Quaternion(),
   };
   private hasArmRest = false;
+  /** 躯干静止四元数；每帧先回正再叠微动作，避免长时间累加扭曲。 */
+  private readonly torsoRest = {
+    hips: new THREE.Quaternion(),
+    spine: new THREE.Quaternion(),
+    chest: new THREE.Quaternion(),
+    neck: new THREE.Quaternion(),
+  };
 
   /** 上臂「朝世界下垂」计算复用（见 applyUpperHangTowardWorldDown） */
   private readonly _armHang = {
@@ -265,6 +272,7 @@ export class RemVrmViewer {
       // 先跑一帧 VRM，再采样骨骼作为「绑定姿势」，避免未初始化时误把抬手/T 姿当成 rest
       vrm.update(0);
       vrm.scene.updateMatrixWorld(true);
+      this.captureTorsoRestPose(vrm);
       this.captureArmRestPose(vrm);
       this.applyIdlePose(0);
       vrm.scene.updateMatrixWorld(true);
@@ -363,6 +371,19 @@ export class RemVrmViewer {
       !!h.getRawBoneNode(VRMHumanBoneName.RightUpperArm);
   }
 
+  private captureTorsoRestPose(vrm: VRM): void {
+    const h = vrm.humanoid;
+    if (!h) return;
+    const q = (name: VRMHumanBoneName, target: THREE.Quaternion) => {
+      const n = h.getRawBoneNode(name);
+      if (n) target.copy(n.quaternion);
+    };
+    q(VRMHumanBoneName.Hips, this.torsoRest.hips);
+    q(VRMHumanBoneName.Spine, this.torsoRest.spine);
+    q(VRMHumanBoneName.Chest, this.torsoRest.chest);
+    q(VRMHumanBoneName.Neck, this.torsoRest.neck);
+  }
+
   startLoop(): void {
     if (this.loopStarted) return;
     this.loopStarted = true;
@@ -400,6 +421,12 @@ export class RemVrmViewer {
     const rlArm = vrm.humanoid.getRawBoneNode(VRMHumanBoneName.RightLowerArm);
     const lSh = vrm.humanoid.getRawBoneNode(VRMHumanBoneName.LeftShoulder);
     const rSh = vrm.humanoid.getRawBoneNode(VRMHumanBoneName.RightShoulder);
+    const neck = vrm.humanoid.getRawBoneNode(VRMHumanBoneName.Neck);
+
+    if (hips) hips.quaternion.copy(this.torsoRest.hips);
+    if (spine) spine.quaternion.copy(this.torsoRest.spine);
+    if (chest) chest.quaternion.copy(this.torsoRest.chest);
+    if (neck) neck.quaternion.copy(this.torsoRest.neck);
 
     const breath = Math.sin(t * 1.35) * 0.024;
     const sway = Math.sin(t * 0.38) * 0.018;

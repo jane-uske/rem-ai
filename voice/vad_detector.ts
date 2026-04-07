@@ -7,7 +7,7 @@ export interface VadOptions {
   silenceFrames?: number;
   /**
    * While already speaking, allow a longer silence hangover before speech_end.
-   * Default: 14 (~280 ms at 20 ms chunks, ~700 ms at 50 ms chunks).
+   * Default: 10 (~200 ms at 20 ms chunks, ~500 ms at 50 ms chunks). 可通过 VAD_SPEAKING_SILENCE_FRAMES 环境变量回退到旧值
    */
   speakingSilenceFrames?: number;
   /** Minimum speech frames before triggering speech_start. Default: 3 (~150 ms at 50 ms chunks) */
@@ -89,7 +89,7 @@ export class VadDetector extends EventEmitter {
     this.threshold = opts.energyThreshold ?? envThreshold ?? 0.06;
     this.silenceLimit = opts.silenceFrames ?? envSilenceFrames ?? 6;
     this.speakingSilenceLimit =
-      opts.speakingSilenceFrames ?? envSpeakingSilenceFrames ?? Math.max(this.silenceLimit, 14);
+      opts.speakingSilenceFrames ?? envSpeakingSilenceFrames ?? Math.max(this.silenceLimit, 10);
     this.minSpeech = opts.minSpeechFrames ?? envMinSpeech ?? 3;
     this.continueEnergyRatio = opts.continueEnergyRatio ?? envContinueEnergyRatio ?? 0.55;
     this.maxZcr = opts.maxZcr ?? envMaxZcr ?? 0.45;
@@ -147,6 +147,11 @@ export class VadDetector extends EventEmitter {
     this._speaking = false;
     this.speechCount = 0;
     this.silentCount = 0;
+  }
+
+  /** Update speaking silence frame threshold dynamically */
+  setSpeakingSilenceFrames(frames: number): void {
+    this.speakingSilenceLimit = Math.max(this.silenceLimit, frames);
   }
 }
 

@@ -18,3 +18,4 @@
 *.ckpt
 *.safetensors
 *.gguf
+*.vrm

@@ -198,6 +198,14 @@ export async function runPipeline(
       generationId,
     });
 
+    // 保存被打断的回复内容，用于后续查询「刚才说到哪了」
+    if (signal.aborted && full) {
+      ctx.lastInterruptedReply = full;
+    } else if (!signal.aborted) {
+      // 正常完成的话清空上次被打断的内容
+      ctx.lastInterruptedReply = null;
+    }
+
     if (isDbReady() && sessionId && full) {
       try {
         await saveMessage(sessionId, "assistant", full);

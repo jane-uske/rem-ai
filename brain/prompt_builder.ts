@@ -1,6 +1,8 @@
 import type { Emotion } from "../emotion/emotion_state";
 import { buildCharacterRulesPrompt } from "./character_rules";
 import { buildPersonalityPrompt } from "./personality";
+import type { PersonaState } from "../persona";
+import { buildPersonaPrompt } from "../persona";
 
 export interface PromptMessage {
   role: "system" | "user" | "assistant";
@@ -19,6 +21,8 @@ interface BuildPromptInput {
   userMessage: string;
   /** 慢脑画像、对话策略等，置于 system 最前以便模型优先注意 */
   priorityContext?: string;
+  /** Optional structured persona state for v1 personality system */
+  persona?: PersonaState;
 }
 
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
@@ -44,7 +48,18 @@ function buildSystemPrompt(
   memory: MemoryEntry[],
   emotion: Emotion,
   priorityContext?: string,
+  persona?: PersonaState,
 ): string {
+  // Use new persona system if provided
+  if (persona) {
+    // Convert memory entries to string for injection
+    const memoryStr = memory.length > 0
+      ? memory.map(m => `- ${m.key}: ${m.value}`).join('\n')
+      : undefined;
+    return buildPersonaPrompt(persona, memoryStr);
+  }
+
+  // Fallback to original system prompt logic
   const sections: string[] = [];
   const maxPriorityChars = parsePositiveInt(process.env.MAX_PRIORITY_CONTEXT_CHARS, 700);
   const maxMemoryEntries = parsePositiveInt(process.env.MAX_PROMPT_MEMORY_ENTRIES, 6);
@@ -81,9 +96,10 @@ export function buildPrompt({
   history,
   userMessage,
   priorityContext,
+  persona,
 }: BuildPromptInput): PromptMessage[] {
   return [
-    { role: "system", content: buildSystemPrompt(memory, emotion, priorityContext) },
+    { role: "system", content: buildSystemPrompt(memory, emotion, priorityContext, persona) },
     ...history,
     { role: "user", content: userMessage },
   ];

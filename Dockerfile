@@ -36,6 +36,7 @@ COPY --from=frontend-build /app/web/.next ./web/.next
 COPY --from=frontend-build /app/web/node_modules ./web/node_modules
 COPY --from=frontend-build /app/web/package.json ./web/package.json
 COPY --from=frontend-build /app/web/next.config.ts ./web/next.config.ts
+COPY --from=frontend-build /app/web/public ./web/public
 COPY avatar/assets ./avatar/assets
 COPY public ./public
 EXPOSE 3000

@@ -1,6 +1,5 @@
 "use client";
 
-import { useRef } from "react";
 import dynamic from "next/dynamic";
 import { ChatWindow } from "@/components/ChatWindow";
 import { InputBar } from "@/components/InputBar";
@@ -84,14 +83,11 @@ export function RemChatApp() {
     recording,
     userSpeaking,
     voiceActive,
-    lipEnvelopeRef,
+    lipSignalRef,
     hasMic,
     sendText,
     toggleMic,
   } = useRemChat();
-
-  const voiceActiveRef = useRef(false);
-  voiceActiveRef.current = voiceActive;
   const remState: RemState = userSpeaking || recording
     ? "listening"
     : voiceActive
@@ -117,8 +113,7 @@ export function RemChatApp() {
               emotion={emotion}
               remState={remState}
               actionSignal={avatarAction}
-              lipEnvelopeRef={lipEnvelopeRef}
-              voiceActiveRef={voiceActiveRef}
+              lipSignalRef={lipSignalRef}
               variant="stage"
               className="min-h-0 min-w-0 flex-1"
             />

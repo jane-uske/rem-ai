@@ -16,12 +16,19 @@ npm run web:dev
 |------|------|
 | [docs/FRONTEND_PITFALLS.md](./docs/FRONTEND_PITFALLS.md) | 网关、WebSocket、VRM、布局等踩坑与处理方式 |
 | [VIBE_PLAN.md](./VIBE_PLAN.md) | 前端迭代计划（连接态、情绪 UI 等） |
+| [docs/REM_VRM_WEB_POC.md](./docs/REM_VRM_WEB_POC.md) | Web-first VRM 运行时收口方案 |
+| [docs/REM_VRM_WEB_POC_ACCEPTANCE_2026-04-06.md](./docs/REM_VRM_WEB_POC_ACCEPTANCE_2026-04-06.md) | 本轮 POC 非视觉验收记录 |
 
 ## 技术栈摘要
 
 Next.js 15、React 19、Tailwind CSS v4、`@pixiv/three-vrm` + Three.js（VRM 形象）。
 
 更多见仓库根目录 [README.md](../README.md)。
+
+## Demo
+
+- 主聊天页：`/`
+- 独立 3D demo：`/demo`
 
 ## 参考（Next.js 官方）
 

@@ -103,7 +103,7 @@ function getPiperModel(): string | null {
 }
 
 /**
- * Remove parenthetical stage directions (e.g. 表情、动作) so TTS does not read them aloud.
+ * Remove parenthetical stage directions (e.g. 表情、动作、括号内思考内容) so TTS does not read them aloud.
  * Full reply text is unchanged upstream — only used at synthesize time.
  * Set tts_strip_parenthetical=0 to disable. Iterates to peel simple nesting.
  */
@@ -113,8 +113,13 @@ function stripParentheticalStageDirections(text: string): string {
   let prev = "";
   while (out !== prev) {
     prev = out;
-    out = out.replace(/（[^）]*）/g, "");
-    out = out.replace(/\([^)]*\)/g, "");
+    out = out.replace(/（[^）]*）/g, ""); // 全角圆括号
+    out = out.replace(/\([^)]*\)/g, ""); // 半角圆括号
+    out = out.replace(/\[[^\]]*\]/g, ""); // 半角方括号
+    out = out.replace(/【[^】]*】/g, ""); // 全角方括号
+    out = out.replace(/<[^>]*>/g, ""); // 半角尖括号
+    out = out.replace(/《[^》]*》/g, ""); // 全角书名号/尖括号
+    out = out.replace(/\{[^}]*\}/g, ""); // 半角花括号
   }
   return out;
 }
@@ -885,7 +890,60 @@ export async function textToSpeech(
 }
 
 export function canStreamTextToSpeech(): boolean {
-  return getProvider() === "edge" && isTtsEnabled() && !isEdgeStreamTemporarilyBlocked();
+  const streamingEnabled =
+    process.env.rem_tts_stream === "1" || process.env.REM_TTS_STREAM === "1";
+  return (
+    streamingEnabled &&
+    getProvider() === "edge" &&
+    isTtsEnabled() &&
+    !isEdgeStreamTemporarilyBlocked()
+  );
+}
+
+/** 服务启动时预热 Edge TTS 连接池：提前建立 1-2 个空闲连接，避免首次请求 TLS 握手延迟 */
+export async function warmupEdgeTtsConnections(count: number = 2): Promise<void> {
+  if (EDGE_POOL_OFF || getProvider() !== "edge" || !isTtsEnabled()) return;
+  if (count < 1 || count > 4) count = 2;
+
+  const voice = process.env.tts_voice || "zh-CN-XiaoyiNeural";
+  const lang = process.env.tts_lang || "zh-CN";
+  const fmt = "audio-24khz-48kbitrate-mono-mp3";
+  const defaultRate = process.env.tts_rate || "default";
+  const defaultPitch = process.env.tts_pitch || "default";
+
+  // 预热默认情绪（neutral）的连接，以及常用情绪如 happy/soft 可选
+  const commonEmotions: Emotion[] = ["neutral", "happy"];
+  const warmupCount = Math.min(count, commonEmotions.length);
+
+  for (let i = 0; i < warmupCount; i++) {
+    const emotion = commonEmotions[i];
+    const { rate, pitch } = emotion === "neutral"
+      ? { rate: defaultRate, pitch: defaultPitch }
+      : getEmotionVoiceParams(emotion);
+    const poolKey = edgeConnKey(voice, lang, rate, pitch, fmt);
+    if (edgePoolSlots.has(poolKey)) continue;
+
+    try {
+      // 合成一个极短的空文本占位，仅用于建立连接
+      await runEdgePooled(poolKey, async () => {
+        const { ws } = await edgeTtsFirstOpenKeepAlive(
+          "嗯",
+          voice,
+          lang,
+          rate,
+          pitch,
+          fmt,
+          undefined
+        );
+        edgePoolSlots.set(poolKey, { ws, lastUsed: Date.now() });
+        const placed = edgePoolSlots.get(poolKey);
+        if (placed) scheduleEdgePoolIdleClose(poolKey, placed);
+        logger.debug("Edge TTS 连接预热完成", { emotion, poolKey });
+      });
+    } catch (err) {
+      logger.warn("Edge TTS 连接预热失败", { error: (err as Error).message });
+    }
+  }
 }
 
 export async function streamTextToSpeech(

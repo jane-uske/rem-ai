@@ -3,85 +3,96 @@
 import type { MutableRefObject } from "react";
 import { useEffect, useRef, useState } from "react";
 import { getEmotionLabel } from "@/lib/emotionLabels";
-import { RemVrmViewer, type VrmViewerState } from "@/lib/rem3d/vrmViewer";
-import type { AvatarActionCommand, RemState } from "@/types/avatar";
+import {
+  createAvatarRuntime,
+  type AvatarRuntimeAdapter,
+  type CreateAvatarRuntimeOptions,
+} from "@/lib/rem3d/runtimeAdapter";
+import type {
+  AvatarActionCommand,
+  AvatarEngine,
+  AvatarModelPreset,
+  LipSignal,
+  RemState,
+} from "@/types/avatar";
+import type { VrmViewerState } from "@/lib/rem3d/vrmViewer";
 
 export type Rem3DAvatarProps = {
-  /** 与 WebSocket `emotion` 一致：neutral / happy / curious / shy / sad */
   emotion: string;
   remState?: RemState;
   actionSignal?: { action: AvatarActionCommand; nonce: number } | null;
-  /** TTS 实时音量包络 0–1（useAudioBase64Queue） */
-  lipEnvelopeRef: MutableRefObject<number>;
-  /** 是否正在播放 TTS（口型在 Web Audio 不可用时回退） */
-  voiceActiveRef?: MutableRefObject<boolean>;
+  lipSignalRef: MutableRefObject<LipSignal>;
   className?: string;
-  /** stage：嵌入大屏舞台；card：独立卡片（默认） */
   variant?: "card" | "stage";
+  engine?: AvatarEngine;
+  modelPreset?: AvatarModelPreset;
+  modelUrl?: string;
+  onRuntimeStateChange?: CreateAvatarRuntimeOptions["onStateChange"];
 };
 
-/**
- * 网页端 VRM 3D 角色（默认见 `getDefaultVrmUrl()`，可用 NEXT_PUBLIC_VRM_URL 覆盖）。
- */
 export function Rem3DAvatar({
   emotion,
   remState = "idle",
   actionSignal = null,
-  lipEnvelopeRef,
-  voiceActiveRef,
+  lipSignalRef,
   className = "",
   variant = "card",
+  engine = "vrm",
+  modelPreset = "rem",
+  modelUrl,
+  onRuntimeStateChange,
 }: Rem3DAvatarProps) {
   const hostRef = useRef<HTMLDivElement>(null);
-  const viewerRef = useRef<RemVrmViewer | null>(null);
+  const runtimeRef = useRef<AvatarRuntimeAdapter | null>(null);
+  const runtimeStateChangeRef = useRef(onRuntimeStateChange);
   const [state, setState] = useState<VrmViewerState>("loading");
   const [err, setErr] = useState<string | null>(null);
 
   const isStage = variant === "stage";
 
   useEffect(() => {
+    runtimeStateChangeRef.current = onRuntimeStateChange;
+  }, [onRuntimeStateChange]);
+
+  useEffect(() => {
     const el = hostRef.current;
     if (!el) return;
 
-    const lipRef = lipEnvelopeRef;
-    const voiceRef = voiceActiveRef;
-    const v = new RemVrmViewer(el, {
-      getLipEnvelope: () => lipRef.current,
-      getVoiceActive: voiceRef ? () => voiceRef.current : undefined,
-      onStateChange: (s, e) => {
-        setState(s);
-        setErr(s === "error" ? e ?? "load error" : null);
-        if (s === "ready") v.startLoop();
+    const runtime = createAvatarRuntime(el, {
+      engine,
+      modelPreset,
+      modelUrl,
+      onStateChange: (next, error) => {
+        setState(next);
+        setErr(next === "error" ? error ?? "load error" : null);
+        runtimeStateChangeRef.current?.(next, error);
       },
     });
-    viewerRef.current = v;
+    runtime.setLipSignal(lipSignalRef.current);
+    runtime.load();
+    runtimeRef.current = runtime;
 
-    const ro = new ResizeObserver(() => v.resize());
+    const ro = new ResizeObserver(() => runtime.resize());
     ro.observe(el);
 
     return () => {
       ro.disconnect();
-      v.dispose();
-      viewerRef.current = null;
+      runtime.dispose();
+      runtimeRef.current = null;
     };
-  }, [lipEnvelopeRef, voiceActiveRef]);
+  }, [engine, lipSignalRef, modelPreset, modelUrl]);
 
   useEffect(() => {
-    viewerRef.current?.setEmotion(emotion);
+    runtimeRef.current?.setEmotion(emotion);
   }, [emotion]);
 
   useEffect(() => {
-    viewerRef.current?.setState(remState);
+    runtimeRef.current?.setState(remState);
   }, [remState]);
 
   useEffect(() => {
     if (!actionSignal) return;
-    const { action } = actionSignal;
-    viewerRef.current?.playAction(
-      action.action,
-      action.intensity,
-      action.duration,
-    );
+    runtimeRef.current?.playAction(actionSignal.action);
   }, [actionSignal]);
 
   const shell =
@@ -107,13 +118,17 @@ export function Rem3DAvatar({
           3D 加载失败：{err}
         </p>
       )}
-      {/* stage：情绪在 RemChatApp 顶栏展示，此处不再占画布高度 */}
       {state === "ready" && !isStage && (
         <div className="flex items-center justify-between border-t border-white/10 bg-transparent px-3 py-2 text-xs text-[var(--rem-dim)]">
           <span>当前情绪</span>
-          <span className="font-medium text-[var(--rem-accent)]">
-            {getEmotionLabel(emotion)}
-          </span>
+          <div className="flex items-center gap-2">
+            <span className="font-medium text-[var(--rem-accent)]">
+              {getEmotionLabel(emotion)}
+            </span>
+            <span className="rounded-full border border-white/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-[var(--rem-dim)]">
+              {engine}
+            </span>
+          </div>
         </div>
       )}
     </div>
