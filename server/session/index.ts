@@ -14,6 +14,9 @@ import { RemSessionContext } from "../../brains/rem_session_context";
 import { runPipeline } from "../pipeline";
 import { send, getWsRateLimiter } from "../gateway";
 import { synthesize, isTtsEnabled } from "../../voice/tts_stream";
+import { fastBrainPredictOnly } from "../../brains/fast_brain";
+import { retrieveMemory } from "../../memory/memory_agent";
+import { trimHistoryToTokenBudget } from "../../brains/history_budget";
 
 const logger = createLogger("session");
 const AUDIO_BIN_MAGIC_V1 = Buffer.from([0x52, 0x41]); // "RA" (legacy)
@@ -201,6 +204,15 @@ export class ConnectionSession {
   private readonly VAD_CONTINUOUS_SILENCE_FRAMES = 8; // 连续对话场景静默帧阈值
   private readonly VAD_DEFAULT_SILENCE_FRAMES = 10; // 默认静默帧阈值
 
+  // --- 增量STT预判相关 --- 
+  private predictionEnabled: boolean = process.env.STT_PARTIAL_PREDICTION_ENABLED === "1";
+  private predictionPushEnabled: boolean = process.env.STT_PREDICTION_PUSH_ENABLED === "1";
+  private predictionDebounceMs: number = parseNonNegativeMs(process.env.STT_PREDICTION_DEBOUNCE_MS, 300);
+  private predictionTimer: ReturnType<typeof setTimeout> | null = null;
+  private predictionAbort: AbortController | null = null;
+  private currentPartialText: string = "";
+  private predictedReply: string = "";
+
   constructor(ws: WebSocket) {
     this.connId = randomUUID();
     this.brain = new RemSessionContext(this.connId);
@@ -260,6 +272,21 @@ export class ConnectionSession {
     }
   }
 
+  private cancelPrediction(): void {
+    if (this.predictionTimer) {
+      clearTimeout(this.predictionTimer);
+      this.predictionTimer = null;
+    }
+    if (this.predictionAbort) {
+      try {
+        this.predictionAbort.abort();
+      } catch {}
+      this.predictionAbort = null;
+    }
+    this.currentPartialText = "";
+    this.predictedReply = "";
+  }
+
   private resetPreviewState(): void {
     this.clearPreviewTimer();
     this.stt.cancelPreview();
@@ -268,6 +295,49 @@ export class ConnectionSession {
     this.lastPreviewText = "";
     this.lastPartialEmitAt = 0;
     this.lastPartialContent = "";
+    // 同时取消正在进行的预判
+    this.cancelPrediction();
+  }
+
+  private async runPrediction(text: string): Promise<void> {
+    if (!this.predictionEnabled || !text.trim()) return;
+    // 文本和当前partial不一致，已经过时了，跳过
+    if (text !== this.currentPartialText) return;
+    // 取消之前的预判
+    this.cancelPrediction();
+    this.currentPartialText = text;
+    const abort = new AbortController();
+    this.predictionAbort = abort;
+    try {
+      logger.debug("[预判] 开始预判", { text: text.slice(0, 30) });
+      // 和正常回复一样组装输入，但是不更新状态
+      const memory = await retrieveMemory(this.brain.memory);
+      const slowBrainContext = this.brain.slowBrain.synthesizeContext();
+      const historyForPrompt = trimHistoryToTokenBudget([...this.brain.history]);
+      const reply = await fastBrainPredictOnly({
+        userMessage: text,
+        emotion: this.brain.emotion.getEmotion(),
+        memory,
+        history: historyForPrompt,
+        strategyHints: this.brain.slowBrain.buildConversationStrategyHints(text),
+        slowBrainContext,
+        signal: abort.signal,
+        persona: this.brain.persona,
+      });
+      if (abort.signal.aborted) return;
+      this.predictedReply = reply;
+      logger.debug("[预判] 完成", { preview: reply.slice(0, 30) });
+      // 如果开启推送，把预判结果推到前端（调试用）
+      if (this.predictionPushEnabled && reply) {
+        send(this.ws, { type: "stt_prediction", status: "finished", preview: reply.slice(0, 50) });
+      }
+    } catch (err) {
+      logger.debug("[预判] 失败", { error: (err as Error).message });
+    } finally {
+      if (this.predictionAbort === abort) {
+        this.predictionAbort = null;
+      }
+    }
   }
 
   private emitSttPartial(content: string): void {
@@ -282,6 +352,19 @@ export class ConnectionSession {
     send(this.ws, { type: "stt_partial", content });
     this.lastPartialEmitAt = now;
     this.lastPartialContent = content;
+
+    // 开启预判功能的话，防抖触发预判
+    if (this.predictionEnabled && content.trim() && content !== this.currentPartialText) {
+      // 取消之前的防抖定时器
+      if (this.predictionTimer) {
+        clearTimeout(this.predictionTimer);
+      }
+      this.currentPartialText = content;
+      this.predictionTimer = setTimeout(() => {
+        this.predictionTimer = null;
+        void this.runPrediction(content);
+      }, this.predictionDebounceMs);
+    }
   }
 
   private nextGenerationId(): number {
@@ -530,16 +613,48 @@ export class ConnectionSession {
           send(this.ws, { type: "stt_final", content: text });
           logger.info(`[用户·语音] ${text}`, { connId: this.connId });
           this.touchUserActivity();
-          await runPipeline(
-            this.ws,
-            text,
-            this.interrupt,
-            this.avatar,
-            this.sessionId,
-            this.brain,
-            generationId,
-            traceId,
-          );
+
+          // 优先使用预判结果，如果存在且匹配
+          const hasValidPrediction = this.predictedReply && 
+            text.startsWith(this.currentPartialText) && 
+            this.currentPartialText.length > 3;
+          if (hasValidPrediction) {
+            logger.info("[预判] 命中，复用提前生成的回复", { 
+              partial: this.currentPartialText.slice(0, 30),
+              final: text.slice(0, 30),
+              replyPreview: this.predictedReply.slice(0, 30)
+            });
+            // 直接把预判结果传给管线，跳过LLM调用
+            await runPipeline(
+              this.ws,
+              text,
+              this.interrupt,
+              this.avatar,
+              this.sessionId,
+              this.brain,
+              generationId,
+              traceId,
+              { pregeneratedReply: this.predictedReply }
+            );
+          } else {
+            logger.debug("[预判] 未命中，走正常生成流程", {
+              hasPrediction: !!this.predictedReply,
+              partialLength: this.currentPartialText.length
+            });
+            // 没有预判结果，走正常流程
+            await runPipeline(
+              this.ws,
+              text,
+              this.interrupt,
+              this.avatar,
+              this.sessionId,
+              this.brain,
+              generationId,
+              traceId,
+            );
+          }
+          // 用完清空预判状态
+          this.cancelPrediction();
         } catch (err) {
           logger.warn("[STT]", { error: (err as Error).message, connId: this.connId });
           send(this.ws, { type: "error", content: "语音识别失败：" + (err as Error).message });
@@ -1000,26 +1115,72 @@ export class ConnectionSession {
       .catch((err) => logger.error("[pipeline]", { error: err, connId: this.connId }));
   }
 
-  private setupCloseHandlers(): void {
-    this.ws.on("close", () => {
+  /** 全面的资源清理方法 */
+  private cleanupAllResources(): void {
+    try {
       this.duplexActive = false;
-      this.vad.reset();
+
+      // 清理 VAD 检测器
+      try {
+        this.vad.reset();
+      } catch (e) {
+        logger.warn("[Cleanup] VAD reset failed", { error: e, connId: this.connId });
+      }
+
+      // 清理所有定时器
       this.clearPendingUtteranceTimer();
       this.clearSilenceNudgeTimer();
       this.resetPreviewState();
-      this.interrupt.interrupt();
-      logger.info("[Rem] 客户端已断开", { connId: this.connId });
 
+      // 发送中断信号给正在运行的 pipeline
+      try {
+        this.interrupt.interrupt();
+      } catch (e) {
+        logger.warn("[Cleanup] Interrupt failed", { error: e, connId: this.connId });
+      }
+
+      // 清理 STT 流
+      try {
+        this.stt.reset();
+      } catch (e) {
+        logger.warn("[Cleanup] STT reset failed", { error: e, connId: this.connId });
+      }
+
+      // 清理语音缓冲区
+      this.clearSpeechBuffer();
+      this.preRollChunks = [];
+      this.preRollBytes = 0;
+
+      // 清理数据库会话
       if (isDbReady() && this.sessionId) {
         void endSession(this.sessionId).catch((err) => {
           logger.warn("[Storage] Failed to end session", { error: err, sessionId: this.sessionId });
         });
       }
 
+      // 清理延迟追踪器
       removeLatencyTracer(this.connId);
+
+      logger.debug("[Cleanup] All resources released", { connId: this.connId });
+    } catch (e) {
+      logger.error("[Cleanup] Unexpected error during cleanup", {
+        error: e,
+        connId: this.connId,
+      });
+    }
+  }
+
+  private setupCloseHandlers(): void {
+    this.ws.on("close", () => {
+      logger.info("[Rem] 客户端已断开", { connId: this.connId });
+      this.cleanupAllResources();
     });
 
-    this.ws.on("error", (err) => logger.error("[WebSocket 错误]", { error: err, connId: this.connId }));
+    this.ws.on("error", (err) => {
+      logger.error("[WebSocket 错误]", { error: err, connId: this.connId });
+      // WebSocket 错误后也清理资源
+      this.cleanupAllResources();
+    });
   }
 }
 

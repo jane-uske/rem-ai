@@ -84,3 +84,59 @@ export async function* fastBrainStream(
     yield "啊…出了点问题，等我缓缓再试试…";
   }
 }
+
+/**
+ * Fast Brain Prediction Only: 仅做LLM生成，不对外输出、不更新状态，用于partial transcript预判
+ * 返回完整生成的文本，不会推送任何事件，仅用于缓存提前生成的内容
+ */
+export async function fastBrainPredictOnly(
+  input: FastBrainInput,
+): Promise<string> {
+  const priorityParts = [input.strategyHints, input.slowBrainContext].filter(
+    (s): s is string => Boolean(s?.trim()),
+  );
+  const priorityContext =
+    priorityParts.length > 0 ? priorityParts.join("\n\n") : undefined;
+
+  const messages = buildPrompt({
+    memory: input.memory,
+    emotion: input.emotion,
+    history: input.history,
+    userMessage: input.userMessage,
+    priorityContext,
+    persona: input.persona,
+  });
+  const promptText = messages.map((m) => m.content).join("\n");
+  const promptChars = messages.reduce((sum, msg) => sum + msg.content.length, 0);
+  logger.debug("[预判] LLM prompt stats", {
+    messages: messages.length,
+    estimatedTokens: estimateTextTokens(promptText),
+    promptChars,
+    memoryCount: input.memory.length,
+    historyMessages: input.history.length,
+    priorityChars: priorityContext?.length ?? 0,
+  });
+
+  const configured =
+    process.env.key && process.env.base_url && process.env.model;
+
+  if (!configured) {
+    return `嗯…我听到了「${input.userMessage.trim()}」，不过我现在还没连上大脑…等一下就好。`;
+  }
+
+  let fullReply = "";
+  try {
+    for await (const token of streamTokens(messages, input.signal)) {
+      fullReply += token;
+    }
+    if (!fullReply.trim()) {
+      logger.warn("[预判] LLM 返回内容为空");
+      return "";
+    }
+    logger.debug("[预判] 生成完成", { textLength: fullReply.length, preview: fullReply.slice(0, 30) });
+    return fullReply.trim();
+  } catch (err) {
+    logger.debug("[预判] 调用失败或被中断", { error: (err as Error).message });
+    return "";
+  }
+}
