@@ -23,3 +23,19 @@ export {
 } from "./action_triggers";
 
 export { AvatarController } from "./avatar_controller";
+
+export type {
+  AvatarCommand,
+  Emotion as AvatarEmotion,
+  Motion,
+  RemState,
+} from "./command_types";
+
+export {
+  EMOTIONS,
+  MOTIONS,
+  REM_STATES,
+  isEmotion,
+  isMotion,
+  isRemState,
+} from "./command_types";
