@@ -16,8 +16,66 @@ import { createSession } from "./session";
 
 const logger = createLogger("server");
 
+// 资源监控配置
+const MONITOR_INTERVAL = 30_000; // 每30秒检查一次
+const MEMORY_WARNING_THRESHOLD = 0.8; // 内存使用率80%警告
+const CONNECTIONS_WARNING_THRESHOLD = 20; // 20个连接警告
+
 let dbInitialized = false;
 let redisInitialized = false;
+let sessionCount = 0;
+let monitorInterval: NodeJS.Timeout | null = null;
+let decayTimer: ReturnType<typeof startDecayTimer> | null = null;
+
+// 资源监控函数
+function startResourceMonitoring(): void {
+  logger.info("资源监控已启动");
+
+  monitorInterval = setInterval(() => {
+    // 内存使用监控
+    const memUsage = process.memoryUsage();
+    const memUsagePercent = (memUsage.heapUsed / memUsage.heapTotal) * 100;
+
+    // 会话数监控
+    logger.debug("资源使用统计", {
+      memory: {
+        heapUsed: `${(memUsage.heapUsed / 1024 / 1024).toFixed(2)} MB`,
+        heapTotal: `${(memUsage.heapTotal / 1024 / 1024).toFixed(2)} MB`,
+        external: `${(memUsage.external / 1024 / 1024).toFixed(2)} MB`,
+        usagePercent: `${memUsagePercent.toFixed(1)}%`,
+      },
+      sessions: sessionCount,
+      timestamp: new Date().toISOString(),
+    });
+
+    // 内存使用警告
+    if (memUsage.heapUsed / memUsage.heapTotal > MEMORY_WARNING_THRESHOLD) {
+      logger.warn("内存使用警告", {
+        message: `内存使用率已达到 ${memUsagePercent.toFixed(1)}%，接近限制`,
+        memory: {
+          heapUsed: `${(memUsage.heapUsed / 1024 / 1024).toFixed(2)} MB`,
+          heapTotal: `${(memUsage.heapTotal / 1024 / 1024).toFixed(2)} MB`,
+        },
+      });
+    }
+
+    // 会话数警告
+    if (sessionCount > CONNECTIONS_WARNING_THRESHOLD) {
+      logger.warn("会话数警告", {
+        message: `当前会话数已达 ${sessionCount}，接近限制`,
+        sessions: sessionCount,
+      });
+    }
+  }, MONITOR_INTERVAL);
+}
+
+function stopResourceMonitoring(): void {
+  if (monitorInterval) {
+    clearInterval(monitorInterval);
+    monitorInterval = null;
+    logger.info("资源监控已停止");
+  }
+}
 
 async function bootstrap() {
   let memoryRepo = getMemoryRepository();
@@ -39,7 +97,7 @@ async function bootstrap() {
     logger.info("[Storage] DATABASE_URL not set, using in-memory only");
   }
 
-  const decayTimer = startDecayTimer(memoryRepo);
+  decayTimer = startDecayTimer(memoryRepo);
   logger.info("[Memory] Decay timer started");
 
   if (process.env.REDIS_URL) {
@@ -69,31 +127,71 @@ async function bootstrap() {
   logger.info("[TTS] Edge TTS 连接预热完成");
 
   let shuttingDown = false;
-  const cleanupAndExit = async (signal: "SIGINT" | "SIGTERM") => {
+  const cleanupAndExitWrapper = async (signal: "SIGINT" | "SIGTERM") => {
     if (shuttingDown) return;
     shuttingDown = true;
-    logger.info(`[Shutdown] Received ${signal}, cleaning up...`);
-    stopDecayTimer(decayTimer);
-    await shutdownWhisperServer().catch(() => {});
-    if (dbInitialized) await closeDatabase().catch(() => {});
-    if (redisInitialized) await closeRedis().catch(() => {});
-    process.exit(0);
+    await cleanupAndExit(signal);
   };
-  process.on("SIGINT", () => { void cleanupAndExit("SIGINT"); });
-  process.on("SIGTERM", () => { void cleanupAndExit("SIGTERM"); });
+  process.on("SIGINT", () => { void cleanupAndExitWrapper("SIGINT"); });
+  process.on("SIGTERM", () => { void cleanupAndExitWrapper("SIGTERM"); });
 
   function onConnection(ws: WebSocket, req: IncomingMessage): void {
-    createSession(ws, req);
+    sessionCount++;
+    logger.debug("会话建立", { totalSessions: sessionCount });
+
+    const session = createSession(ws, req);
+
+    // 监听会话关闭
+    ws.on("close", () => {
+      sessionCount--;
+      logger.debug("会话关闭", { totalSessions: sessionCount });
+    });
+
+    ws.on("error", () => {
+      sessionCount--;
+      logger.debug("会话异常关闭", { totalSessions: sessionCount });
+    });
   }
 
   const server = await createGateway({ onConnection });
   startServer(server);
+
+  // 启动资源监控
+  startResourceMonitoring();
+
+  logger.info("Rem AI 系统初始化完成");
+}
+
+async function cleanupAndExit(signal: "SIGINT" | "SIGTERM"): Promise<void> {
+  logger.info(`[Shutdown] Received ${signal}, cleaning up resources...`);
+
+  // 停止资源监控
+  stopResourceMonitoring();
+
+  // 停止所有定时器
+  if (decayTimer) {
+    stopDecayTimer(decayTimer);
+  }
+
+  // 关闭服务
+  await shutdownWhisperServer().catch(() => {});
+  if (dbInitialized) await closeDatabase().catch(() => {});
+  if (redisInitialized) await closeRedis().catch(() => {});
+
+  logger.info("所有资源清理完成，服务已停止");
+  process.exit(0);
 }
 
 bootstrap().catch((err: unknown) => {
   const message = err instanceof Error ? err.message : String(err);
   const stack = err instanceof Error ? err.stack : undefined;
   logger.error("[Rem AI] 启动失败", { err: message, stack });
+
+  // 确保失败时也能正确清理
+  if (monitorInterval) {
+    clearInterval(monitorInterval);
+  }
+
   process.exit(1);
 });
 

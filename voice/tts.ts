@@ -347,6 +347,7 @@ function escapeXml(s: string): string {
 
 const EDGE_POOL_OFF = process.env.edge_tts_pool === "0";
 const EDGE_POOL_IDLE_MS = Number(process.env.edge_tts_pool_idle_ms ?? 45_000);
+const EDGE_POOL_MAX_SIZE = Number(process.env.edge_tts_pool_max_size ?? 10);
 
 type EdgePoolSlot = {
   ws: WebSocket;
@@ -356,6 +357,9 @@ type EdgePoolSlot = {
 
 const edgePoolSlots = new Map<string, EdgePoolSlot>();
 const edgePoolSerial = new Map<string, Promise<unknown>>();
+
+// 全局连接计数器和最大限制
+let totalActiveConnections = 0;
 
 function edgeConnKey(
   voice: string,
@@ -399,6 +403,11 @@ function evictEdgePoolSlot(key: string): void {
     /* ignore */
   }
   edgePoolSlots.delete(key);
+  totalActiveConnections--;
+  logger.debug("TTS 连接池移除", {
+    activeCount: totalActiveConnections,
+    poolKey: key,
+  });
 }
 
 function buildEdgeSsml(
@@ -696,22 +705,56 @@ async function speakWithEdge(
         return out;
       } catch {
         evictEdgePoolSlot(poolKey);
+        totalActiveConnections--;
       }
     }
 
-    const { buf: firstBuf, ws } = await edgeTtsFirstOpenKeepAlive(
-      text,
-      voice,
-      lang,
-      rate,
-      pitch,
-      fmt,
-      signal,
-    );
-    edgePoolSlots.set(poolKey, { ws, lastUsed: Date.now() });
-    const placed = edgePoolSlots.get(poolKey);
-    if (placed) scheduleEdgePoolIdleClose(poolKey, placed);
-    return firstBuf;
+    // 检查连接数是否已达上限
+    if (totalActiveConnections >= EDGE_POOL_MAX_SIZE) {
+      logger.warn("TTS 连接池已达最大限制，使用缓冲模式", {
+        poolSize: totalActiveConnections,
+        maxSize: EDGE_POOL_MAX_SIZE,
+      });
+      // 已达上限时使用缓冲模式，不使用连接池
+      const buf = await edgeTtsBuffer(text, voice, lang, rate, pitch, fmt, signal);
+      return buf;
+    }
+
+    totalActiveConnections++;
+    try {
+      const { buf: firstBuf, ws } = await edgeTtsFirstOpenKeepAlive(
+        text,
+        voice,
+        lang,
+        rate,
+        pitch,
+        fmt,
+        signal,
+      );
+      // 添加关闭时的清理逻辑
+      ws.on("close", () => {
+        totalActiveConnections--;
+        logger.debug("TTS 连接关闭", {
+          activeCount: totalActiveConnections,
+          poolKey,
+        });
+      });
+      edgePoolSlots.set(poolKey, { ws, lastUsed: Date.now() });
+      const placed = edgePoolSlots.get(poolKey);
+      if (placed) scheduleEdgePoolIdleClose(poolKey, placed);
+      logger.debug("TTS 连接创建", {
+        activeCount: totalActiveConnections,
+        poolKey,
+      });
+      return firstBuf;
+    } catch (err) {
+      totalActiveConnections--;
+      logger.warn("TTS 连接创建失败", {
+        error: (err as Error).message,
+        activeCount: totalActiveConnections,
+      });
+      throw err;
+    }
   });
 
   logger.info("edge 合成完成", { duration: Date.now() - t0, text: text.slice(0, 30) });

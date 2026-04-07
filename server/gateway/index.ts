@@ -6,10 +6,11 @@ import next from "next";
 import { WebSocketServer, WebSocket } from "ws";
 import type { Server as HttpServer } from "http";
 import type { IncomingMessage } from "http";
+import type { Request, Response } from "express";
 
 import { createLogger } from "../../infra/logger";
 import { verifyToken, wsAuthenticateOnce } from "../../infra/auth";
-import { createWsRateLimiter } from "../../infra/rate_limiter";
+import { createWsRateLimiter, createRateLimiter } from "../../infra/rate_limiter";
 import type { ServerMessage } from "./types";
 
 const logger = createLogger("gateway");
@@ -61,25 +62,9 @@ function requestPathname(req: IncomingMessage): string {
   return parseRequestUrl(req).pathname ?? "/";
 }
 
-// ── HTTP rate limiter with periodic GC ──
+// ── HTTP rate limiter using unified implementation ──
 
-interface HttpBucket {
-  count: number;
-  windowStart: number;
-}
-const httpBuckets = new Map<string, HttpBucket>();
-const HTTP_WINDOW_MS = 60_000;
-const HTTP_MAX_REQUESTS = 100;
-
-const gcInterval = setInterval(() => {
-  const now = Date.now();
-  for (const [key, bucket] of httpBuckets) {
-    if (now - bucket.windowStart > HTTP_WINDOW_MS * 2) {
-      httpBuckets.delete(key);
-    }
-  }
-}, HTTP_WINDOW_MS);
-if (typeof gcInterval.unref === "function") gcInterval.unref();
+const httpRateLimiter = createRateLimiter();
 
 function getClientIp(req: IncomingMessage): string {
   const forwarded = req.headers["x-forwarded-for"];
@@ -87,21 +72,6 @@ function getClientIp(req: IncomingMessage): string {
     return forwarded.split(",")[0].trim();
   }
   return req.socket.remoteAddress ?? "unknown";
-}
-
-function checkHttpRateLimit(req: IncomingMessage): boolean {
-  const key = getClientIp(req);
-  const now = Date.now();
-  let bucket = httpBuckets.get(key);
-  if (!bucket || now - bucket.windowStart >= HTTP_WINDOW_MS) {
-    bucket = { count: 0, windowStart: now };
-    httpBuckets.set(key, bucket);
-  }
-  if (bucket.count >= HTTP_MAX_REQUESTS) {
-    return false;
-  }
-  bucket.count += 1;
-  return true;
 }
 
 function extractAuthToken(req: IncomingMessage): string | null {
@@ -163,11 +133,12 @@ export async function createGateway(config: GatewayConfig): Promise<HttpServer> 
 
   const server = http.createServer(async (req, res) => {
     try {
-      if (!checkHttpRateLimit(req)) {
-        logger.warn("[RateLimit] HTTP rate limit exceeded", { ip: getClientIp(req) });
-        res.statusCode = 429;
-        res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify({ error: "Too many requests" }));
+      // Use Express rate limiter
+      // @ts-ignore - Using Express middleware with Node.js http server
+      httpRateLimiter(req, res, () => {});
+
+      // If rate limiter already sent a 429 response, don't proceed
+      if (res.headersSent) {
         return;
       }
 

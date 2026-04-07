@@ -1,6 +1,7 @@
 import { WebSocket } from "ws";
 
 import { chatStream } from "../../agents/conversation_agent";
+import { inferAvatarIntentFromReply } from "../../agents/avatar_intent_agent";
 import type { RemSessionContext } from "../../brains/rem_session_context";
 import { decayEmotion } from "../../emotion/decay_emotion";
 import { updateEmotion } from "../../emotion/emotion_engine";
@@ -186,6 +187,13 @@ export async function runPipeline(
       chunker.reset();
     }
 
+    const avatarIntentTask =
+      full && !signal.aborted
+        ? inferAvatarIntentFromReply(full, replyEmotion as any, signal)
+            .then((result) => (signal.aborted ? null : result))
+            .catch(() => null)
+        : Promise.resolve(null);
+
     endProducer();
     signal.removeEventListener("abort", onAbort);
 
@@ -219,6 +227,15 @@ export async function runPipeline(
       for (const frame of actionFrames) {
         send(ws, { type: "avatar_frame", frame });
       }
+    }
+
+    const avatarIntentEnvelope = await avatarIntentTask;
+    if (avatarIntentEnvelope && !signal.aborted) {
+      send(ws, {
+        type: "avatar_intent",
+        intent: avatarIntentEnvelope.intent,
+        beats: avatarIntentEnvelope.beats,
+      });
     }
 
     if (full) {

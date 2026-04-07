@@ -11,6 +11,8 @@ import {
 import type {
   AvatarActionCommand,
   AvatarEngine,
+  AvatarFrameState,
+  AvatarIntent,
   AvatarModelPreset,
   LipSignal,
   RemState,
@@ -20,6 +22,8 @@ import type { VrmViewerState } from "@/lib/rem3d/vrmViewer";
 export type Rem3DAvatarProps = {
   emotion: string;
   remState?: RemState;
+  avatarIntent?: AvatarIntent | null;
+  avatarFrame?: AvatarFrameState | null;
   actionSignal?: { action: AvatarActionCommand; nonce: number } | null;
   lipSignalRef: MutableRefObject<LipSignal>;
   className?: string;
@@ -33,6 +37,8 @@ export type Rem3DAvatarProps = {
 export function Rem3DAvatar({
   emotion,
   remState = "idle",
+  avatarIntent = null,
+  avatarFrame = null,
   actionSignal = null,
   lipSignalRef,
   className = "",
@@ -89,6 +95,14 @@ export function Rem3DAvatar({
   useEffect(() => {
     runtimeRef.current?.setState(remState);
   }, [remState]);
+
+  useEffect(() => {
+    runtimeRef.current?.setIntent(avatarIntent);
+  }, [avatarIntent]);
+
+  useEffect(() => {
+    runtimeRef.current?.setFrame(avatarFrame);
+  }, [avatarFrame]);
 
   useEffect(() => {
     if (!actionSignal) return;

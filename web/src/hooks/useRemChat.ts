@@ -1,11 +1,18 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getRemWsUrl } from "@/lib/wsUrl";
 import type { ChatMessage } from "@/types/chat";
-import type { AvatarActionCommand } from "@/types/avatar";
+import type {
+  AvatarActionCommand,
+  AvatarFrameState,
+  AvatarIntentBeat,
+  AvatarIntent,
+} from "@/types/avatar";
 import { useAudioBase64Queue } from "@/hooks/useAudioBase64Queue";
 import { startPcmCapture, type PcmCapture } from "@/lib/pcmCapture";
+import { deriveAvatarIntent } from "@/lib/rem3d/avatarIntent";
+import { pushAvatarDevtoolsLog } from "@/lib/rem3d/devtoolsStore";
 
 function uid() {
   return crypto.randomUUID();
@@ -120,6 +127,8 @@ export function useRemChat() {
     action: AvatarActionCommand;
     nonce: number;
   } | null>(null);
+  const [avatarFrame, setAvatarFrame] = useState<AvatarFrameState | null>(null);
+  const [avatarIntentOverride, setAvatarIntentOverride] = useState<AvatarIntent | null>(null);
   const [inputPlaceholder, setInputPlaceholder] = useState("说点什么…");
   const [recording, setRecording] = useState(false);
   const [duplex, setDuplex] = useState(false);
@@ -137,8 +146,10 @@ export function useRemChat() {
   const mountedRef = useRef(true);
   const activeGenerationRef = useRef<number | null>(null);
   const blockedGenerationsRef = useRef<Set<number>>(new Set());
+  const loggedVoiceGenerationsRef = useRef<Set<number>>(new Set());
   /** 连接超时主动 close 时，onclose 不再刷「已断开」系统提示（避免与超时错误重复） */
   const suppressDisconnectSysMsgRef = useRef(false);
+  const avatarBeatTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
 
   const clearGenerationState = useCallback(() => {
     activeGenerationRef.current = null;
@@ -152,6 +163,47 @@ export function useRemChat() {
       userSpeakingEndTimerRef.current = null;
     }
   }, []);
+
+  const clearAvatarIntentSchedule = useCallback(() => {
+    for (const timer of avatarBeatTimersRef.current) clearTimeout(timer);
+    avatarBeatTimersRef.current = [];
+  }, []);
+
+  const triggerIntentGestureAction = useCallback((intent: AvatarIntent | null) => {
+    if (!intent) return;
+    switch (intent.gesture) {
+      case "nod":
+      case "shake_head":
+      case "wave":
+      case "tilt_head":
+      case "shrug":
+        setAvatarAction({
+          action: {
+            action: intent.gesture,
+            intensity: 0.45 + intent.gestureIntensity * 0.18,
+            duration: Math.max(260, intent.holdMs),
+          },
+          nonce: Date.now() + Math.floor(Math.random() * 1000),
+        });
+        break;
+      default:
+        break;
+    }
+  }, []);
+
+  const mergeIntentBeat = useCallback(
+    (base: AvatarIntent, beat: AvatarIntentBeat): AvatarIntent => ({
+      emotion: beat.emotion ?? base.emotion,
+      gesture: beat.gesture ?? base.gesture,
+      gestureIntensity: beat.gestureIntensity ?? base.gestureIntensity,
+      facialAccent: beat.facialAccent ?? base.facialAccent,
+      energy: beat.energy ?? base.energy,
+      holdMs: beat.holdMs ?? base.holdMs,
+      source: base.source,
+      reason: beat.reason ?? base.reason,
+    }),
+    [],
+  );
 
   const appendUserTranscript = useCallback((content: string) => {
     const trimmed = content.trim();
@@ -197,6 +249,18 @@ export function useRemChat() {
     return null;
   }, []);
 
+  const rememberLoggedVoiceGeneration = useCallback((id: number | null): boolean => {
+    if (id == null) return false;
+    const seen = loggedVoiceGenerationsRef.current;
+    if (seen.has(id)) return false;
+    seen.add(id);
+    if (seen.size > 48) {
+      const oldest = seen.values().next();
+      if (!oldest.done) seen.delete(oldest.value);
+    }
+    return true;
+  }, []);
+
   const handlePlaybackStart = useCallback((generationId: number | null) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -236,6 +300,36 @@ export function useRemChat() {
   const hasMic =
     typeof navigator !== "undefined" &&
     !!navigator.mediaDevices?.getUserMedia;
+
+  const derivedAvatarIntent = useMemo<AvatarIntent>(
+    () =>
+      deriveAvatarIntent({
+        emotion,
+        action: avatarAction?.action ?? null,
+        face: avatarFrame?.face ?? null,
+        source: "server",
+        reason: avatarAction?.action.action ?? "emotion",
+      }),
+    [avatarAction, avatarFrame, emotion],
+  );
+  const avatarIntent = avatarIntentOverride ?? derivedAvatarIntent;
+
+  const lastIntentKeyRef = useRef("");
+
+  useEffect(() => {
+    const key = JSON.stringify(avatarIntent);
+    if (key === lastIntentKeyRef.current) return;
+    lastIntentKeyRef.current = key;
+    pushAvatarDevtoolsLog("intent", "avatar intent updated", avatarIntent);
+  }, [avatarIntent]);
+
+  useEffect(() => {
+    if (!avatarAction) return;
+    const timer = setTimeout(() => {
+      setAvatarAction((current) => (current?.nonce === avatarAction.nonce ? null : current));
+    }, Math.max(200, avatarAction.action.duration + 80));
+    return () => clearTimeout(timer);
+  }, [avatarAction]);
 
   /* ── Streaming text helpers ── */
 
@@ -377,6 +471,9 @@ export function useRemChat() {
     if (!url) {
       setConnectionPhase("closed");
       setConnLabel("无法解析 WS 地址");
+      pushAvatarDevtoolsLog("system", "ws unavailable", {
+        reason: "empty-url",
+      });
       setMessages((m) => [
         ...m,
         {
@@ -389,6 +486,7 @@ export function useRemChat() {
     }
 
     const ws = new WebSocket(url);
+    pushAvatarDevtoolsLog("system", "ws connecting", { url });
     clearGenerationState();
     wsRef.current = ws;
 
@@ -415,6 +513,7 @@ export function useRemChat() {
       setConnectionPhase("open");
       setReconnectDeadline(null);
       setConnLabel("在线");
+      pushAvatarDevtoolsLog("system", "ws open", { url });
       if (!hasAnnouncedConnectedRef.current) {
         hasAnnouncedConnectedRef.current = true;
         setMessages((m) => [
@@ -436,7 +535,11 @@ export function useRemChat() {
 
       switch (t) {
         case "emotion":
-          if (data.emotion != null) setEmotion(String(data.emotion));
+          if (data.emotion != null) {
+            const nextEmotion = String(data.emotion);
+            setEmotion(nextEmotion);
+            pushAvatarDevtoolsLog("ws", "emotion", { emotion: nextEmotion });
+          }
           break;
 
         case "chat_chunk":
@@ -470,7 +573,14 @@ export function useRemChat() {
         case "voice":
           if (!allowServerGeneration("voice", data.generationId)) break;
           if (typeof data.audio === "string") {
-            enqueueBase64(data.audio, parseGenerationId(data.generationId));
+            const generationId = parseGenerationId(data.generationId);
+            enqueueBase64(data.audio, generationId);
+            if (rememberLoggedVoiceGeneration(generationId)) {
+              pushAvatarDevtoolsLog("ws", "voice start", {
+                generationId,
+                transport: "voice",
+              });
+            }
           }
           break;
 
@@ -479,11 +589,19 @@ export function useRemChat() {
           if (!allowServerGeneration("voice_pcm_chunk", data.generationId)) break;
           if (typeof data.audio === "string") {
             const rate = Number(data.sampleRate);
+            const generationId = parseGenerationId(data.generationId);
             enqueuePcmChunk(
               data.audio,
               Number.isFinite(rate) && rate > 0 ? rate : 24000,
-              parseGenerationId(data.generationId),
+              generationId,
             );
+            if (rememberLoggedVoiceGeneration(generationId)) {
+              pushAvatarDevtoolsLog("ws", "voice start", {
+                generationId,
+                transport: "voice_pcm_chunk",
+                sampleRate: Number.isFinite(rate) && rate > 0 ? rate : 24000,
+              });
+            }
           }
           break;
         }
@@ -493,14 +611,69 @@ export function useRemChat() {
             | {
                 action?: AvatarActionCommand;
                 emotion?: string;
+                face?: AvatarFrameState["face"];
+                lipSync?: AvatarFrameState["lipSync"];
               }
             | undefined;
+          const receivedAtMs = Date.now();
           if (frame?.emotion) setEmotion(String(frame.emotion));
+          if (frame?.face || frame?.lipSync || frame?.emotion) {
+            setAvatarFrame((prev) => ({
+              emotion: (frame?.emotion as AvatarFrameState["emotion"]) ?? prev?.emotion,
+              face: frame?.face ?? prev?.face,
+              lipSync: frame?.lipSync ?? prev?.lipSync,
+              lipSyncAtMs: frame?.lipSync ? receivedAtMs : prev?.lipSyncAtMs,
+            }));
+          }
           if (frame?.action) {
             setAvatarAction({
               action: frame.action,
               nonce: Date.now() + Math.floor(Math.random() * 1000),
             });
+          }
+          pushAvatarDevtoolsLog("ws", "avatar_frame", {
+            hasEmotion: !!frame?.emotion,
+            hasAction: !!frame?.action,
+            hasFace: !!frame?.face,
+            hasLipSync: !!frame?.lipSync,
+            action: frame?.action?.action,
+          });
+          break;
+        }
+
+        case "avatar_intent": {
+          const intent =
+            data.intent && typeof data.intent === "object"
+              ? (data.intent as AvatarIntent)
+              : null;
+          const beats = Array.isArray(data.beats)
+            ? (data.beats as AvatarIntentBeat[])
+            : [];
+          clearAvatarIntentSchedule();
+          if (intent) {
+            setAvatarIntentOverride(intent);
+            triggerIntentGestureAction(intent);
+            pushAvatarDevtoolsLog("ws", "avatar_intent", {
+              intent,
+              beats: beats.length,
+            });
+            let endAt = Date.now() + Math.max(260, intent.holdMs);
+            for (const beat of beats) {
+              const merged = mergeIntentBeat(intent, beat);
+              const timer = setTimeout(() => {
+                setAvatarIntentOverride(merged);
+                triggerIntentGestureAction(merged);
+              }, Math.max(0, beat.delayMs));
+              avatarBeatTimersRef.current.push(timer);
+              endAt = Math.max(
+                endAt,
+                Date.now() + Math.max(0, beat.delayMs) + Math.max(260, merged.holdMs),
+              );
+            }
+            const resetTimer = setTimeout(() => {
+              setAvatarIntentOverride(intent);
+            }, Math.max(0, endAt - Date.now()));
+            avatarBeatTimersRef.current.push(resetTimer);
           }
           break;
         }
@@ -516,8 +689,13 @@ export function useRemChat() {
           }
           setSttPartialText("");
           clearQueue();
+          clearAvatarIntentSchedule();
+          setAvatarIntentOverride(null);
           resetStreaming();
           setTyping(false);
+          pushAvatarDevtoolsLog("ws", "interrupt", {
+            generationId: interruptedGeneration,
+          });
           break;
         }
 
@@ -601,11 +779,17 @@ export function useRemChat() {
       waitingRef.current = false;
       setWaiting(false);
       clearGenerationState();
+      clearAvatarIntentSchedule();
+      setAvatarIntentOverride(null);
       setSttPartialText("");
       resetStreaming();
       setTyping(false);
       const quiet = suppressDisconnectSysMsgRef.current;
       suppressDisconnectSysMsgRef.current = false;
+      pushAvatarDevtoolsLog("system", "ws closed", {
+        quiet,
+        reconnectInMs: REM_WS_RECONNECT_DELAY_MS,
+      });
       if (!quiet) {
         setMessages((m) => {
           const last = m[m.length - 1];
@@ -622,6 +806,7 @@ export function useRemChat() {
 
     ws.onerror = () => {
       window.clearTimeout(connectTimer);
+      pushAvatarDevtoolsLog("system", "ws error");
     };
   };
 
@@ -630,11 +815,12 @@ export function useRemChat() {
     connectRef.current?.();
     return () => {
       mountedRef.current = false;
+      clearAvatarIntentSchedule();
       clearUserSpeakingEndTimer();
       if (reconnectRef.current) clearTimeout(reconnectRef.current);
       wsRef.current?.close();
     };
-  }, [allowServerGeneration, appendStreaming, appendUserTranscript, blockGeneration, clearGenerationState, clearQueue, clearUserSpeakingEndTimer, enqueueBase64, enqueuePcmChunk, parseGenerationId, resetStreaming, stopVoiceSession]);
+  }, [allowServerGeneration, appendStreaming, appendUserTranscript, blockGeneration, clearAvatarIntentSchedule, clearGenerationState, clearQueue, clearUserSpeakingEndTimer, enqueueBase64, enqueuePcmChunk, mergeIntentBeat, parseGenerationId, resetStreaming, stopVoiceSession, triggerIntentGestureAction]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -654,30 +840,37 @@ export function useRemChat() {
     (text: string) => {
       const ws = wsRef.current;
       const trimmed = text.trim();
-      if (
-        !trimmed ||
-        waitingRef.current ||
-        !ws ||
-        ws.readyState !== WebSocket.OPEN
-      )
-        return;
+      if (!trimmed || !ws || ws.readyState !== WebSocket.OPEN) return;
       // Sending a new user text should immediately stop current/queued playback.
       clearQueue();
       void unlockPlayback();
-      activeGenerationRef.current = null;
+      const interruptedGeneration = activeGenerationRef.current;
+      if (interruptedGeneration != null) {
+        blockGeneration(interruptedGeneration);
+      } else {
+        activeGenerationRef.current = null;
+      }
+      clearAvatarIntentSchedule();
+      setAvatarIntentOverride(null);
       setSttPartialText("");
       setMessages((m) => [...m, { id: uid(), role: "user", text: trimmed }]);
+      pushAvatarDevtoolsLog("system", "chat send", {
+        interruptedGeneration,
+        contentLength: trimmed.length,
+      });
       ws.send(JSON.stringify({ type: "chat", content: trimmed }));
       waitingRef.current = true;
       setWaiting(true);
       setTyping(true);
       resetStreaming();
     },
-    [clearQueue, resetStreaming, unlockPlayback],
+    [blockGeneration, clearAvatarIntentSchedule, clearQueue, resetStreaming, unlockPlayback],
   );
 
   return {
     emotion,
+    avatarFrame,
+    avatarIntent,
     connected,
     connectionPhase,
     reconnectInSec,

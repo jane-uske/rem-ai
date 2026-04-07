@@ -53,6 +53,7 @@ export function getEmotionExpressionWeights(emotion: string): VrmExpressionWeigh
       return {
         [VRMExpressionPresetName.Happy]: 1,
         [VRMExpressionPresetName.Relaxed]: 0.25,
+        [VRMExpressionPresetName.Surprised]: 0.08,
       };
     case "curious":
       return {
@@ -69,6 +70,7 @@ export function getEmotionExpressionWeights(emotion: string): VrmExpressionWeigh
     case "sad":
       return {
         [VRMExpressionPresetName.Sad]: 1,
+        [VRMExpressionPresetName.Angry]: 0.22,
         [VRMExpressionPresetName.LookDown]: 0.25,
       };
     case "neutral":

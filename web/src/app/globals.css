@@ -2,6 +2,12 @@
 
 /* 默认：现代深色 + 青绿点缀（可随系统切换浅色） */
 :root {
+  --font-geist-sans:
+    "SF Pro Display", "SF Pro Text", "Segoe UI", "Noto Sans SC", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-geist-mono:
+    "SF Mono", "JetBrains Mono", "Cascadia Code", "Fira Code", "Menlo",
+    "Monaco", monospace;
   --background: #0a0f14;
   --foreground: #e6f0f0;
   --rem-surface: rgba(255, 255, 255, 0.06);

@@ -4,10 +4,17 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import type { VRM } from "@pixiv/three-vrm";
 import {
   VRMLoaderPlugin,
+  VRMExpressionPresetName,
   VRMHumanBoneName,
   VRMUtils,
 } from "@pixiv/three-vrm";
-import type { RemState } from "@/types/avatar";
+import type {
+  AvatarActionCommand,
+  AvatarFrameState,
+  AvatarIntent,
+  LipSignal,
+  RemState,
+} from "@/types/avatar";
 
 /** 关闭每帧「归一化骨骼 → 蒙皮」的自动同步，改由我们直接写 raw 骨骼，否则摆好的手臂会被覆盖回 T-pose */
 const VRM_LOADER_OPTIONS = { autoUpdateHumanBones: false as const };
@@ -15,7 +22,14 @@ import {
   applyExpressionWeights,
   getEmotionExpressionWeights,
   mergeExpressionWeights,
+  type VrmExpressionWeights,
 } from "./emotionToVrm";
+import { publishAvatarRuntimeSnapshot, pushAvatarDevtoolsLog } from "./devtoolsStore";
+import {
+  faceToExpressionWeights,
+  lipSyncToExpressionWeights,
+  visemeSignalToExpressionWeights,
+} from "./faceToVrm";
 import { SpeechMotionController } from "./speechMotion";
 
 export type VrmViewerState = "loading" | "ready" | "error";
@@ -84,6 +98,10 @@ const ARM_HANG_DOWN_BLEND = 0.94;
  * 肘部前屈（弧度）：在「前臂」骨骼局部空间用 rotateX，多数 VRM 肘铰链接近绕局部 X；约 0.45–0.55。
  */
 const ELBOW_RELAX_FLEX_RAD = 0.5;
+const HAPPY_HOP_DURATION_MS = 820;
+const HAPPY_HOP_HEIGHT = 0.1;
+const FRAME_LIPSYNC_MAX_AGE_MS = 220;
+const DEBUG_PUBLISH_INTERVAL_MS = 180;
 
 /** 轻微偏暖的 albedo，减轻 ACES 下肤色发灰（衣物会一起略变暖，幅度很小） */
 function warmTintSkinMaterials(root: THREE.Object3D): void {
@@ -121,19 +139,26 @@ export class RemVrmViewer {
   private gestureT = 0;
   private loopStarted = false;
   private remState: RemState = "idle";
-  private activeAction:
+  private activeAction: (AvatarActionCommand & { endAtMs: number }) | null = null;
+  private currentIntent: AvatarIntent | null = null;
+  private currentFrame: AvatarFrameState | null = null;
+  private emotionCue:
     | {
-        name: string;
-        intensity: number;
-        endAtMs: number;
+        kind: "happy_hop";
+        startAtMs: number;
+        durationMs: number;
       }
     | null = null;
+  private sceneRestY = 0;
   private readonly speechMotion = new SpeechMotionController();
 
   readonly onStateChange?: (s: VrmViewerState, err?: string) => void;
   private readonly getLipEnvelope?: () => number;
   /** 与 TTS 播放同步；在 Web Audio 包络不可用时用于口型回退 */
   private readonly getVoiceActive?: () => boolean;
+  private readonly getLipViseme?: () => LipSignal["viseme"] | null;
+  private runtimeState: VrmViewerState = "loading";
+  private lastDebugPublishAt = 0;
 
   /** 模型文件里的上臂/前臂静止四元数（T/A pose），每帧在此基础上做局部旋转，避免与绑定姿势冲突 */
   private readonly armRest = {
@@ -181,12 +206,15 @@ export class RemVrmViewer {
       getLipEnvelope?: () => number;
       /** 是否正在播放 TTS（用于口型回退） */
       getVoiceActive?: () => boolean;
+      /** 上层 lip signal 内的 viseme 提示 */
+      getLipViseme?: () => LipSignal["viseme"] | null;
     },
   ) {
     this.container = container;
     this.onStateChange = options?.onStateChange;
     this.getLipEnvelope = options?.getLipEnvelope;
     this.getVoiceActive = options?.getVoiceActive;
+    this.getLipViseme = options?.getLipViseme;
 
     const w = container.clientWidth || 320;
     const h = container.clientHeight || 360;
@@ -245,7 +273,9 @@ export class RemVrmViewer {
   }
 
   private async load(url: string): Promise<void> {
+    this.runtimeState = "loading";
     this.onStateChange?.("loading");
+    pushAvatarDevtoolsLog("runtime", "viewer loading", { url });
     const loader = new GLTFLoader();
     loader.register((parser) => new VRMLoaderPlugin(parser, VRM_LOADER_OPTIONS));
 
@@ -266,6 +296,7 @@ export class RemVrmViewer {
       }
       const yaw = getVrmYawRadians();
       if (yaw !== 0) vrm.scene.rotation.y = yaw;
+      this.sceneRestY = vrm.scene.position.y;
       this.scene.add(vrm.scene);
       warmTintSkinMaterials(vrm.scene);
       applyExpressionWeights(vrm, getEmotionExpressionWeights(this.currentEmotion));
@@ -279,10 +310,14 @@ export class RemVrmViewer {
       this.frameCameraToModelUpperBody();
       this.controls.update();
       this.renderer.render(this.scene, this.camera);
+      this.runtimeState = "ready";
       this.onStateChange?.("ready");
+      pushAvatarDevtoolsLog("runtime", "viewer ready", { url });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
+      this.runtimeState = "error";
       this.onStateChange?.("error", msg);
+      pushAvatarDevtoolsLog("runtime", "viewer error", { url, msg });
     }
   }
 
@@ -411,6 +446,7 @@ export class RemVrmViewer {
   private applyIdlePose(t: number): void {
     const vrm = this.vrm;
     if (!vrm?.humanoid) return;
+    vrm.scene.position.y = this.sceneRestY;
 
     const hips = vrm.humanoid.getRawBoneNode(VRMHumanBoneName.Hips);
     const spine = vrm.humanoid.getRawBoneNode(VRMHumanBoneName.Spine);
@@ -430,15 +466,31 @@ export class RemVrmViewer {
 
     const breath = Math.sin(t * 1.35) * 0.024;
     const sway = Math.sin(t * 0.38) * 0.018;
+    const energyFactor =
+      this.currentIntent?.energy === 3 ? 1.3
+      : this.currentIntent?.energy === 2 ? 1.12
+      : this.currentIntent?.energy === 0 ? 0.72
+      : 1;
+    const inwardFactor =
+      this.currentIntent?.gesture === "shrink_in" || this.currentEmotion === "sad"
+        ? 1
+        : 0;
     if (hips) {
-      hips.rotation.y = sway;
-      hips.rotation.z = Math.sin(t * 0.31) * 0.012;
+      hips.rotation.y = sway * energyFactor * (1 - inwardFactor * 0.25);
+      hips.rotation.z = Math.sin(t * 0.31) * 0.012 * energyFactor;
     }
     if (spine) {
-      spine.rotation.x = breath;
-      spine.rotation.y = Math.sin(t * 0.42) * 0.025;
+      spine.rotation.x = breath * energyFactor - inwardFactor * 0.045;
+      spine.rotation.y = Math.sin(t * 0.42) * 0.025 * energyFactor;
     }
-    if (chest) chest.rotation.x = breath * 0.62;
+    if (chest) {
+      chest.rotation.x = breath * 0.62 * energyFactor - inwardFactor * 0.075;
+      chest.rotation.z = inwardFactor * -0.035;
+    }
+    if (neck && inwardFactor > 0) {
+      neck.rotation.x -= 0.038;
+      neck.rotation.z -= 0.018;
+    }
 
     if (this.gestureT > 0) {
       this.gestureT = Math.max(0, this.gestureT - 0.02);
@@ -448,6 +500,9 @@ export class RemVrmViewer {
 
     if (this.activeAction && now >= this.activeAction.endAtMs) {
       this.activeAction = null;
+    }
+    if (this.emotionCue && now >= this.emotionCue.startAtMs + this.emotionCue.durationMs) {
+      this.emotionCue = null;
     }
     const action = this.activeAction;
 
@@ -477,8 +532,8 @@ export class RemVrmViewer {
         lr = 0.45;
         rr = 0.45;
       } else if (e === "sad") {
-        lr = -0.1;
-        rr = -0.1;
+        lr = -0.18;
+        rr = -0.18;
       }
       const armWiggle = Math.sin(t * 1.05) * 0.028;
       ruArm.rotation.z = rr + armWiggle;
@@ -495,17 +550,46 @@ export class RemVrmViewer {
       chest.rotation.y += Math.sin(t * 1.8) * 0.045;
     }
 
+    if (this.emotionCue?.kind === "happy_hop") {
+      const hopT = Math.max(
+        0,
+        Math.min(1, (now - this.emotionCue.startAtMs) / this.emotionCue.durationMs),
+      );
+      const lift = Math.sin(Math.PI * hopT);
+      const settle = hopT > 0.68 ? Math.sin((hopT - 0.68) * Math.PI * 3.125) * 0.01 : 0;
+      vrm.scene.position.y = this.sceneRestY + HAPPY_HOP_HEIGHT * lift + settle;
+      if (hips) hips.rotation.x -= 0.11 * lift;
+      if (chest) {
+        chest.rotation.x += 0.16 * lift;
+        chest.rotation.y += Math.sin(hopT * Math.PI * 2) * 0.03;
+      }
+      if (luArm && ruArm) {
+        luArm.rotation.z -= 0.16 + 0.24 * lift;
+        ruArm.rotation.z += 0.16 + 0.24 * lift;
+        luArm.rotation.x += 0.06 * lift;
+        ruArm.rotation.x += 0.06 * lift;
+      }
+      if (llArm && rlArm) {
+        llArm.rotation.x += 0.08 * lift;
+        rlArm.rotation.x += 0.08 * lift;
+      }
+    }
+
     if (action && ruArm && luArm && chest) {
       const k = Math.max(0.2, Math.min(1, action.intensity || 0.6));
-      if (action.name === "nod") {
+      if (action.action === "nod") {
         chest.rotation.x += Math.sin(t * 7.5) * 0.06 * k;
-      } else if (action.name === "shake_head") {
+      } else if (action.action === "shake_head") {
         chest.rotation.y += Math.sin(t * 8.2) * 0.11 * k;
-      } else if (action.name === "wave") {
+      } else if (action.action === "wave") {
         ruArm.rotation.z += 0.5 * k;
         ruArm.rotation.x += Math.sin(t * 10.5) * 0.28 * k;
-      } else if (action.name === "tilt_head") {
+      } else if (action.action === "tilt_head") {
         chest.rotation.z += 0.12 * k;
+      } else if (action.action === "shrug") {
+        chest.rotation.y += Math.sin(t * 8.4) * 0.06 * k;
+        if (lSh) lSh.rotation.z -= 0.22 * k;
+        if (rSh) rSh.rotation.z += 0.22 * k;
       }
     }
   }
@@ -537,13 +621,97 @@ export class RemVrmViewer {
       neck.rotation.z += speech.neckRoll;
     }
 
-    applyExpressionWeights(
-      vrm,
-      mergeExpressionWeights(
-        getEmotionExpressionWeights(this.currentEmotion),
-        speech.expressions,
-      ),
+    const expressionWeights = mergeExpressionWeights(
+      getEmotionExpressionWeights(this.currentEmotion),
+      this.getFrameExpressionWeights(),
+      this.getIntentAccentWeights(),
+      this.getActionExpressionWeights(),
+      speech.expressions,
+      this.getLipOverrideWeights(),
     );
+
+    applyExpressionWeights(vrm, expressionWeights);
+    this.publishDebugSnapshot(expressionWeights);
+  }
+
+  private getActionExpressionWeights(): VrmExpressionWeights | null {
+    const action = this.activeAction;
+    if (!action) return null;
+    const k = Math.max(0.18, Math.min(1, action.intensity || 0.6));
+    if (action.action === "eyebrow_raise") {
+      return {
+        [VRMExpressionPresetName.Surprised]: 0.2 + 0.32 * k,
+        [VRMExpressionPresetName.LookUp]: 0.04 + 0.08 * k,
+      };
+    }
+    return null;
+  }
+
+  private getIntentAccentWeights(): VrmExpressionWeights | null {
+    switch (this.currentIntent?.facialAccent) {
+      case "brow_furrow":
+        return {
+          [VRMExpressionPresetName.Angry]: 0.28,
+          [VRMExpressionPresetName.Sad]: 0.22,
+        };
+      case "brow_raise":
+        return {
+          [VRMExpressionPresetName.Surprised]: 0.24,
+        };
+      case "soft_smile":
+        return {
+          [VRMExpressionPresetName.Happy]: 0.16,
+          [VRMExpressionPresetName.Relaxed]: 0.08,
+        };
+      case "sad_mouth":
+        return {
+          [VRMExpressionPresetName.Sad]: 0.3,
+        };
+      default:
+        return null;
+    }
+  }
+
+  private getFrameExpressionWeights(): VrmExpressionWeights | null {
+    return faceToExpressionWeights(this.currentFrame?.face);
+  }
+
+  private getLipOverrideWeights(): VrmExpressionWeights | null {
+    const now = Date.now();
+    if (
+      this.currentFrame?.lipSync &&
+      this.currentFrame.lipSyncAtMs != null &&
+      now - this.currentFrame.lipSyncAtMs <= FRAME_LIPSYNC_MAX_AGE_MS
+    ) {
+      return lipSyncToExpressionWeights(this.currentFrame.lipSync);
+    }
+    return visemeSignalToExpressionWeights(this.getLipViseme?.() ?? null);
+  }
+
+  private publishDebugSnapshot(expressionWeights: VrmExpressionWeights): void {
+    const now = Date.now();
+    if (now - this.lastDebugPublishAt < DEBUG_PUBLISH_INTERVAL_MS) return;
+    this.lastDebugPublishAt = now;
+    publishAvatarRuntimeSnapshot({
+      ts: now,
+      emotion: this.currentEmotion,
+      remState: this.remState,
+      voiceActive: this.getVoiceActive?.() ?? false,
+      lipEnvelope: this.getLipEnvelope?.() ?? 0,
+      expressionWeights,
+      activeAction: this.activeAction,
+      activeCue: this.emotionCue?.kind ?? null,
+      runtimeState: this.runtimeState,
+      intent: this.currentIntent,
+    });
+  }
+
+  private triggerEmotionCue(kind: "happy_hop", durationMs: number): void {
+    this.emotionCue = {
+      kind,
+      startAtMs: Date.now(),
+      durationMs,
+    };
   }
 
   /**
@@ -641,10 +809,29 @@ export class RemVrmViewer {
     if (next === this.currentEmotion) return;
     this.currentEmotion = next;
     this.gestureT = 1;
+    if (next === "happy") {
+      this.triggerEmotionCue("happy_hop", HAPPY_HOP_DURATION_MS);
+    }
   }
 
   setState(state: RemState): void {
     this.remState = state;
+  }
+
+  setIntent(intent: AvatarIntent | null): void {
+    const prevGesture = this.currentIntent?.gesture;
+    const prevEmotion = this.currentIntent?.emotion;
+    this.currentIntent = intent;
+    if (
+      intent?.gesture === "happy_hop" &&
+      (prevGesture !== "happy_hop" || prevEmotion !== intent.emotion)
+    ) {
+      this.triggerEmotionCue("happy_hop", intent.holdMs || HAPPY_HOP_DURATION_MS);
+    }
+  }
+
+  setFrame(frame: AvatarFrameState | null): void {
+    this.currentFrame = frame;
   }
 
   playAction(action: string, intensity: number, duration: number): void {
@@ -652,8 +839,9 @@ export class RemVrmViewer {
       ? Math.max(200, Math.min(duration, 4000))
       : 700;
     this.activeAction = {
-      name: action,
+      action,
       intensity: Number.isFinite(intensity) ? intensity : 0.6,
+      duration: safeDuration,
       endAtMs: Date.now() + safeDuration,
     };
     this.gestureT = 1;

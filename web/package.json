@@ -3,10 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev --turbopack",
+    "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint src",
+    "test": "TS_NODE_PROJECT=tsconfig.test.json mocha --require ts-node/register --require tsconfig-paths/register \"test/**/*.test.ts\""
   },
   "dependencies": {
     "@pixiv/three-vrm": "^3.5.1",

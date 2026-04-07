@@ -46,6 +46,49 @@ export interface ActionCommand {
   duration: number;
 }
 
+export type AvatarIntentGesture =
+  | "none"
+  | "happy_hop"
+  | "nod"
+  | "shake_head"
+  | "wave"
+  | "tilt_head"
+  | "shrug"
+  | "lean_in"
+  | "recoil"
+  | "shrink_in";
+
+export type AvatarIntentFacialAccent =
+  | "none"
+  | "brow_furrow"
+  | "brow_raise"
+  | "soft_smile"
+  | "sad_mouth";
+
+export type AvatarIntentSource = "llm" | "rule" | "debug" | "server";
+
+export interface AvatarIntent {
+  emotion: Emotion;
+  gesture: AvatarIntentGesture;
+  gestureIntensity: 0 | 1 | 2 | 3;
+  facialAccent: AvatarIntentFacialAccent;
+  energy: 0 | 1 | 2 | 3;
+  holdMs: number;
+  source: AvatarIntentSource;
+  reason?: string;
+}
+
+export interface AvatarIntentBeat {
+  delayMs: number;
+  emotion?: Emotion;
+  gesture?: AvatarIntentGesture;
+  facialAccent?: AvatarIntentFacialAccent;
+  gestureIntensity?: 0 | 1 | 2 | 3;
+  energy?: 0 | 1 | 2 | 3;
+  holdMs?: number;
+  reason?: string;
+}
+
 export interface AvatarFrame {
   face?: Partial<FaceParams>;
   lipSync?: LipSyncFrame;
@@ -129,6 +172,11 @@ export type RemServerMessage =
   | {
       type: "avatar_state";
       phase: AvatarPhase;
+    }
+  | {
+      type: "avatar_intent";
+      intent: AvatarIntent;
+      beats?: AvatarIntentBeat[];
     }
   | {
       type: "error";

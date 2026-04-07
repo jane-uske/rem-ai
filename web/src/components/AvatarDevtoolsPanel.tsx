@@ -1,0 +1,383 @@
+"use client";
+
+import {
+  type PointerEvent as ReactPointerEvent,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { clearAvatarDevtoolsLogs, useAvatarDevtoolsState } from "@/lib/rem3d/devtoolsStore";
+
+type AvatarDevtoolsPanelProps = {
+  title?: string;
+  className?: string;
+  onClose?: () => void;
+  draggable?: boolean;
+};
+
+const MAX_RENDERED_LOGS = 60;
+const DEFAULT_FLOAT_WIDTH = 448;
+const DEFAULT_FLOAT_HEIGHT = 620;
+const MIN_FLOAT_WIDTH = 320;
+const MIN_FLOAT_HEIGHT = 360;
+const MAX_FLOAT_WIDTH = 720;
+const MAX_FLOAT_HEIGHT = 840;
+
+function formatTs(ts: number): string {
+  return new Date(ts).toLocaleTimeString("zh-CN", {
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+export function AvatarDevtoolsPanel({
+  title = "Avatar DevTools",
+  className = "",
+  onClose,
+  draggable = false,
+}: AvatarDevtoolsPanelProps) {
+  const { logs, snapshot } = useAvatarDevtoolsState();
+  const deferredLogs = useDeferredValue(logs);
+  const deferredSnapshot = useDeferredValue(snapshot);
+  const dragOriginRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+  } | null>(null);
+  const resizeOriginRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originWidth: number;
+    originHeight: number;
+  } | null>(null);
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+  const [floatingSize, setFloatingSize] = useState({
+    width: DEFAULT_FLOAT_WIDTH,
+    height: DEFAULT_FLOAT_HEIGHT,
+  });
+
+  useEffect(() => {
+    if (!draggable || typeof window === "undefined") return;
+    try {
+      const raw = window.sessionStorage.getItem("rem-avatar-devtools-offset");
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as { x?: number; y?: number };
+      const nextX = typeof parsed.x === "number" && Number.isFinite(parsed.x) ? parsed.x : 0;
+      const nextY = typeof parsed.y === "number" && Number.isFinite(parsed.y) ? parsed.y : 0;
+      setOffset({
+        x: nextX,
+        y: nextY,
+      });
+    } catch {
+      /* ignore persisted drag state */
+    }
+  }, [draggable]);
+
+  useEffect(() => {
+    if (!draggable || typeof window === "undefined") return;
+    try {
+      const raw = window.sessionStorage.getItem("rem-avatar-devtools-size");
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as { width?: number; height?: number };
+      const width =
+        typeof parsed.width === "number" && Number.isFinite(parsed.width)
+          ? Math.max(MIN_FLOAT_WIDTH, Math.min(MAX_FLOAT_WIDTH, parsed.width))
+          : DEFAULT_FLOAT_WIDTH;
+      const height =
+        typeof parsed.height === "number" && Number.isFinite(parsed.height)
+          ? Math.max(MIN_FLOAT_HEIGHT, Math.min(MAX_FLOAT_HEIGHT, parsed.height))
+          : DEFAULT_FLOAT_HEIGHT;
+      setFloatingSize({ width, height });
+    } catch {
+      /* ignore persisted size */
+    }
+  }, [draggable]);
+
+  useEffect(() => {
+    if (!draggable || typeof window === "undefined") return;
+    window.sessionStorage.setItem("rem-avatar-devtools-offset", JSON.stringify(offset));
+  }, [draggable, offset]);
+
+  useEffect(() => {
+    if (!draggable || typeof window === "undefined") return;
+    window.sessionStorage.setItem(
+      "rem-avatar-devtools-size",
+      JSON.stringify(floatingSize),
+    );
+  }, [draggable, floatingSize]);
+
+  const visibleLogs = useMemo(
+    () => deferredLogs.slice(-MAX_RENDERED_LOGS).slice().reverse(),
+    [deferredLogs],
+  );
+  const snapshotIntentJson = useMemo(
+    () => safeStringify(deferredSnapshot?.intent ?? null),
+    [deferredSnapshot],
+  );
+  const expressionWeightsJson = useMemo(
+    () => safeStringify(deferredSnapshot?.expressionWeights ?? {}),
+    [deferredSnapshot],
+  );
+
+  const handlePointerMove = useCallback((event: PointerEvent) => {
+    const drag = dragOriginRef.current;
+    if (drag && drag.pointerId === event.pointerId) {
+      setOffset({
+        x: drag.originX + event.clientX - drag.startX,
+        y: drag.originY + event.clientY - drag.startY,
+      });
+      return;
+    }
+
+    const resize = resizeOriginRef.current;
+    if (resize && resize.pointerId === event.pointerId) {
+      setFloatingSize({
+        width: Math.max(
+          MIN_FLOAT_WIDTH,
+          Math.min(MAX_FLOAT_WIDTH, resize.originWidth + event.clientX - resize.startX),
+        ),
+        height: Math.max(
+          MIN_FLOAT_HEIGHT,
+          Math.min(MAX_FLOAT_HEIGHT, resize.originHeight + event.clientY - resize.startY),
+        ),
+      });
+    }
+  }, []);
+
+  const stopDragging = useCallback((pointerId?: number) => {
+    if (pointerId != null && dragOriginRef.current?.pointerId !== pointerId) return;
+    dragOriginRef.current = null;
+    setDragging(false);
+  }, []);
+
+  const stopResizing = useCallback((pointerId?: number) => {
+    if (pointerId != null && resizeOriginRef.current?.pointerId !== pointerId) return;
+    resizeOriginRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    if (!draggable) return;
+    const onPointerMove = (event: PointerEvent) => handlePointerMove(event);
+    const onPointerUp = (event: PointerEvent) => {
+      stopDragging(event.pointerId);
+      stopResizing(event.pointerId);
+    };
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
+    };
+  }, [draggable, handlePointerMove, stopDragging, stopResizing]);
+
+  const handleDragStart = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (!draggable) return;
+      const target = event.target as HTMLElement;
+      if (target.closest("button, summary, pre, details")) return;
+      dragOriginRef.current = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        originX: offset.x,
+        originY: offset.y,
+      };
+      setDragging(true);
+    },
+    [draggable, offset.x, offset.y],
+  );
+
+  const handleResizeStart = useCallback(
+    (event: ReactPointerEvent<HTMLButtonElement>) => {
+      if (!draggable) return;
+      event.preventDefault();
+      event.stopPropagation();
+      resizeOriginRef.current = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        originWidth: floatingSize.width,
+        originHeight: floatingSize.height,
+      };
+    },
+    [draggable, floatingSize.height, floatingSize.width],
+  );
+
+  return (
+    <section
+      style={
+        draggable
+          ? {
+              position: "fixed",
+              right: "12px",
+              bottom: "12px",
+              zIndex: 20,
+              transform: `translate3d(${offset.x}px, ${offset.y}px, 0)`,
+              width: `${floatingSize.width}px`,
+              height: `${floatingSize.height}px`,
+              maxWidth: "min(92vw, 720px)",
+              maxHeight: "80vh",
+              pointerEvents: "auto",
+            }
+          : undefined
+      }
+      className={`flex min-h-0 flex-col overflow-hidden rounded-2xl border border-white/10 bg-black/55 text-[var(--foreground)] shadow-[0_18px_80px_rgba(0,0,0,0.28)] backdrop-blur-xl ${className}`}
+    >
+      <header
+        onPointerDown={handleDragStart}
+        className={`flex items-center justify-between gap-3 border-b border-white/10 px-4 py-3 ${draggable ? (dragging ? "cursor-grabbing select-none" : "cursor-grab select-none") : ""}`}
+      >
+        <div>
+          <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--rem-dim)]">
+            Debug Surface
+          </p>
+          <h2 className="text-sm font-semibold">{title}</h2>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => clearAvatarDevtoolsLogs()}
+            className="rounded-full border border-white/10 px-3 py-1 text-[11px] text-[var(--rem-dim)] transition hover:border-white/20 hover:text-[var(--foreground)]"
+          >
+            清日志
+          </button>
+          {onClose ? (
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-full border border-white/10 px-3 py-1 text-[11px] text-[var(--rem-dim)] transition hover:border-white/20 hover:text-[var(--foreground)]"
+            >
+              关闭
+            </button>
+          ) : null}
+        </div>
+      </header>
+
+      <div className="grid gap-3 p-3 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+        <div className="space-y-3">
+          <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
+            <div className="mb-2 text-xs font-medium text-[var(--rem-dim)]">当前快照</div>
+            {deferredSnapshot ? (
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">
+                  <div className="text-[10px] text-[var(--rem-dim)]">Emotion</div>
+                  <div className="mt-1 font-medium">{deferredSnapshot.emotion}</div>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">
+                  <div className="text-[10px] text-[var(--rem-dim)]">State</div>
+                  <div className="mt-1 font-medium">{deferredSnapshot.remState}</div>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">
+                  <div className="text-[10px] text-[var(--rem-dim)]">Lip</div>
+                  <div className="mt-1 font-medium">{deferredSnapshot.lipEnvelope.toFixed(2)}</div>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">
+                  <div className="text-[10px] text-[var(--rem-dim)]">Voice</div>
+                  <div className="mt-1 font-medium">{deferredSnapshot.voiceActive ? "active" : "idle"}</div>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">
+                  <div className="text-[10px] text-[var(--rem-dim)]">Cue</div>
+                  <div className="mt-1 font-medium">{deferredSnapshot.activeCue ?? "none"}</div>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">
+                  <div className="text-[10px] text-[var(--rem-dim)]">Action</div>
+                  <div className="mt-1 font-medium">{deferredSnapshot.activeAction?.action ?? "none"}</div>
+                </div>
+              </div>
+            ) : (
+              <p className="text-xs text-[var(--rem-dim)]">还没有 runtime 快照。</p>
+            )}
+          </div>
+
+          <details className="rounded-xl border border-white/10 bg-white/[0.03] p-3" open>
+            <summary className="cursor-pointer text-xs font-medium text-[var(--rem-dim)]">
+              Latest Intent
+            </summary>
+            <pre className="mt-3 overflow-auto rounded-lg bg-black/25 p-3 text-[11px] leading-5 text-[var(--foreground)]/85">
+              {snapshotIntentJson}
+            </pre>
+          </details>
+
+          <details className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
+            <summary className="cursor-pointer text-xs font-medium text-[var(--rem-dim)]">
+              Expression Merge
+            </summary>
+            <pre className="mt-3 max-h-56 overflow-auto rounded-lg bg-black/25 p-3 text-[11px] leading-5 text-[var(--foreground)]/85">
+              {expressionWeightsJson}
+            </pre>
+          </details>
+        </div>
+
+        <div className="min-h-0 rounded-xl border border-white/10 bg-white/[0.03] p-3">
+          <div className="mb-2 flex items-center justify-between">
+            <div className="text-xs font-medium text-[var(--rem-dim)]">事件流</div>
+            <div className="text-[10px] text-[var(--rem-dim)]">
+              {visibleLogs.length}/{deferredLogs.length} entries
+            </div>
+          </div>
+          <div className="max-h-[32rem] space-y-2 overflow-auto pr-1">
+            {visibleLogs.length === 0 ? (
+              <p className="text-xs text-[var(--rem-dim)]">暂无日志。</p>
+            ) : (
+              visibleLogs.map((entry) => (
+                  <details
+                    key={entry.id}
+                    className="rounded-lg border border-white/10 bg-black/20 px-3 py-2"
+                  >
+                    <summary className="cursor-pointer list-none">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <div className="text-[11px] font-medium">{entry.summary}</div>
+                          <div className="mt-1 text-[10px] uppercase tracking-[0.16em] text-[var(--rem-dim)]">
+                            {entry.kind}
+                          </div>
+                        </div>
+                        <div className="shrink-0 text-[10px] text-[var(--rem-dim)]">
+                          {formatTs(entry.ts)}
+                        </div>
+                      </div>
+                    </summary>
+                    {entry.data !== undefined ? (
+                      <pre className="mt-3 overflow-auto rounded-lg bg-black/25 p-3 text-[11px] leading-5 text-[var(--foreground)]/80">
+                        {safeStringify(entry.data)}
+                      </pre>
+                    ) : null}
+                  </details>
+                ))
+            )}
+          </div>
+        </div>
+      </div>
+
+      {draggable ? (
+        <button
+          type="button"
+          aria-label="调整日志窗口大小"
+          onPointerDown={handleResizeStart}
+          className="absolute bottom-0 right-0 h-5 w-5 cursor-se-resize rounded-tl-xl border-l border-t border-white/10 bg-white/[0.04]"
+        >
+          <span className="pointer-events-none absolute bottom-1 right-1 h-2.5 w-2.5 border-b-2 border-r-2 border-white/35" />
+        </button>
+      ) : null}
+    </section>
+  );
+}

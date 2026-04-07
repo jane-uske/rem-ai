@@ -1,6 +1,8 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import dynamic from "next/dynamic";
+import { AvatarDevtoolsPanel } from "@/components/AvatarDevtoolsPanel";
 import { ChatWindow } from "@/components/ChatWindow";
 import { InputBar } from "@/components/InputBar";
 import { VoiceIndicator } from "@/components/VoiceIndicator";
@@ -68,6 +70,8 @@ function remConnectionDotClass(
 export function RemChatApp() {
   const {
     emotion,
+    avatarFrame,
+    avatarIntent,
     connected,
     connectionPhase,
     reconnectInSec,
@@ -88,6 +92,7 @@ export function RemChatApp() {
     sendText,
     toggleMic,
   } = useRemChat();
+  const [showDevtools, setShowDevtools] = useState(false);
   const remState: RemState = userSpeaking || recording
     ? "listening"
     : voiceActive
@@ -96,13 +101,23 @@ export function RemChatApp() {
         ? "thinking"
         : "idle";
 
-  const inputDisabled = !connected || waiting || recording;
+  const inputDisabled = !connected || recording;
   const micDisabled = !connected || !hasMic;
 
   const connectionStatusLabel = remConnectionStatusText(
     connectionPhase,
     reconnectInSec,
   );
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const query = new URLSearchParams(window.location.search);
+    const enabled =
+      query.get("remDevtools") === "1" ||
+      query.get("avatarDevtools") === "1" ||
+      process.env.NEXT_PUBLIC_REM_DEVTOOLS === "1";
+    setShowDevtools(enabled);
+  }, []);
 
   return (
     <div className="rem-app-shell relative flex h-svh min-h-0 w-full flex-col overflow-hidden bg-transparent text-[var(--foreground)]">
@@ -112,6 +127,8 @@ export function RemChatApp() {
             <Rem3DAvatar
               emotion={emotion}
               remState={remState}
+              avatarIntent={avatarIntent}
+              avatarFrame={avatarFrame}
               actionSignal={avatarAction}
               lipSignalRef={lipSignalRef}
               variant="stage"
@@ -176,6 +193,15 @@ export function RemChatApp() {
           <span className="truncate">{connectionStatusLabel}</span>
         </div>
       </header>
+
+      {showDevtools ? (
+        <AvatarDevtoolsPanel
+          title="Avatar DevTools"
+          className="max-h-[80vh] w-[min(92vw,28rem)]"
+          draggable
+          onClose={() => setShowDevtools(false)}
+        />
+      ) : null}
     </div>
   );
 }
