@@ -8,6 +8,7 @@ import { startDecayTimer, stopDecayTimer } from "../memory/memory_decay";
 import { getMemoryRepository, setMemoryRepository } from "../memory/memory_store";
 import { initDatabase, closeDatabase } from "../storage/database";
 import { initRedis, closeRedis } from "../storage/redis";
+import { ensureDevUser } from "../storage/repositories/dev_identity";
 import { getPgMemoryRepository } from "../storage/repositories/pg_memory_repository";
 import { shutdownWhisperServer, warmWhisperServer } from "../voice/stt_stream";
 import { warmupEdgeTtsConnections } from "../voice/tts";
@@ -85,7 +86,8 @@ async function bootstrap() {
       await initDatabase();
       dbInitialized = true;
       setDbReady(true);
-      const pgRepo = getPgMemoryRepository("dev");
+      const devUserId = await ensureDevUser();
+      const pgRepo = getPgMemoryRepository(devUserId);
       setMemoryRepository(pgRepo);
       memoryRepo = pgRepo;
       logger.info("[Storage] PostgreSQL initialized, using PG memory repo");

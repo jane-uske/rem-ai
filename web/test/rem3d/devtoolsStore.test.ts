@@ -2,6 +2,7 @@ const { expect } = require("chai");
 const {
   clearAvatarDevtoolsLogs,
   getAvatarDevtoolsState,
+  mergeAvatarRuntimeSnapshot,
   publishAvatarRuntimeSnapshot,
   pushAvatarDevtoolsLog,
 } = require("../../src/lib/rem3d/devtoolsStore");
@@ -82,5 +83,26 @@ describe("devtoolsStore", () => {
     });
     expect(state.snapshot?.activeAction?.action).to.equal("wave");
     expect(state.snapshot?.intent?.gesture).to.equal("happy_hop");
+  });
+
+  it("merges turn-state fields into the latest runtime snapshot", () => {
+    mergeAvatarRuntimeSnapshot({
+      ts: 456,
+      turnState: "assistant_entering",
+      turnReason: "tts_prepare",
+      turnStateAtMs: 420,
+      sttPredictionPreview: "我刚刚在想",
+      interruptionType: "continuation",
+    });
+
+    const state = getAvatarDevtoolsState();
+    expect(state.snapshot).to.deep.include({
+      ts: 456,
+      turnState: "assistant_entering",
+      turnReason: "tts_prepare",
+      turnStateAtMs: 420,
+      sttPredictionPreview: "我刚刚在想",
+      interruptionType: "continuation",
+    });
   });
 });

@@ -89,6 +89,32 @@ export interface AvatarIntentBeat {
   reason?: string;
 }
 
+export type RemTurnState =
+  | "listening_active"
+  | "listening_hold"
+  | "likely_end"
+  | "confirmed_end"
+  | "assistant_entering"
+  | "assistant_speaking"
+  | "interrupted_by_user";
+
+export type RemTurnStateReason =
+  | "speech_start"
+  | "partial_growth"
+  | "semantic_hold"
+  | "likely_end"
+  | "confirmed_end"
+  | "tts_prepare"
+  | "playback_start"
+  | "user_interrupt";
+
+export type InterruptionType =
+  | "continuation"
+  | "correction"
+  | "topic_switch"
+  | "emotional_interrupt"
+  | "unknown";
+
 export interface AvatarFrame {
   face?: Partial<FaceParams>;
   lipSync?: LipSyncFrame;
@@ -133,7 +159,7 @@ export type RemServerMessage =
   | {
       type: "voice";
       audio: string;
-      generationId: number;
+      generationId?: number;
     }
   | {
       type: "voice_pcm_chunk";
@@ -150,6 +176,19 @@ export type RemServerMessage =
   | {
       type: "stt_partial";
       content: string;
+    }
+  | {
+      type: "stt_prediction";
+      status: "finished";
+      preview: string;
+    }
+  | {
+      type: "turn_state";
+      state: RemTurnState;
+      reason: RemTurnStateReason;
+      generationId?: number;
+      preview?: string;
+      interruptionType?: InterruptionType;
     }
   | {
       type: "stt_final";

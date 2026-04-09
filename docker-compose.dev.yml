@@ -1,0 +1,89 @@
+services:
+  app-dev:
+    profiles: ["app"]
+    image: node:20-bookworm
+    working_dir: /workspace/rem-ai
+    command: sh -lc "npm run dev"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: development
+      PORT: ${PORT:-3000}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://rem:rem_password@postgres:5432/rem_ai}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+    volumes:
+      - .:/workspace/rem-ai
+      - rem_root_node_modules:/workspace/rem-ai/node_modules
+      - rem_web_node_modules:/workspace/rem-ai/web/node_modules
+    ports:
+      - "127.0.0.1:${PORT:-3000}:${PORT:-3000}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: rem_ai
+      POSTGRES_USER: rem
+      POSTGRES_PASSWORD: rem_password
+    volumes:
+      - rem_pgdata:/var/lib/postgresql/data
+      - ./storage/schema.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rem -d rem_ai"]
+      interval: 5s
+      timeout: 5s
+      retries: 8
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - rem_redisdata:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 8
+    restart: unless-stopped
+
+  code-server:
+    image: lscr.io/linuxserver/code-server:latest
+    profiles: ["ide"]
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-Asia/Shanghai}
+      PASSWORD: ${CODE_SERVER_PASSWORD:-changeme}
+      SUDO_PASSWORD: ${CODE_SERVER_SUDO_PASSWORD:-changeme}
+      DEFAULT_WORKSPACE: /workspace/rem-ai
+    volumes:
+      - .:/workspace/rem-ai
+      - rem_code_server_config:/config
+    ports:
+      - "127.0.0.1:${CODE_SERVER_PORT:-8443}:8443"
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    restart: unless-stopped
+
+volumes:
+  rem_pgdata:
+  rem_redisdata:
+  rem_root_node_modules:
+  rem_web_node_modules:
+  rem_code_server_config:

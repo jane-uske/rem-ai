@@ -141,30 +141,42 @@ async function ensureWhisperServerReady(): Promise<boolean> {
   const cmd = process.env.whisper_server_cmd || process.env.WHISPER_SERVER_CMD || "whisper-server";
   const args = buildWhisperServerArgs();
   whisperServerState.startPromise = (async () => {
-    const proc = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-    whisperServerState.proc = proc;
-
     let stderrTail = "";
-    proc.stderr?.on("data", (d) => {
-      stderrTail = (stderrTail + d.toString()).slice(-4000);
-    });
-    proc.on("exit", (code, signal) => {
-      whisperServerState.proc = null;
-      if (code !== 0 && code !== null) {
-        logger.warn("whisper-server exited", { code, signal });
-      }
-    });
+    await new Promise<void>((resolve, reject) => {
+      const proc = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+      whisperServerState.proc = proc;
 
-    try {
-      await waitWhisperServerReady();
-      logger.info("whisper-server ready", { url: whisperServerInferenceUrl() });
-    } catch (err) {
-      try { proc.kill("SIGKILL"); } catch {}
-      whisperServerState.proc = null;
+      proc.stderr?.on("data", (d) => {
+        stderrTail = (stderrTail + d.toString()).slice(-4000);
+      });
+
+      proc.once("error", (err) => {
+        whisperServerState.proc = null;
+        reject(err);
+      });
+
+      proc.on("exit", (code, signal) => {
+        whisperServerState.proc = null;
+        if (code !== 0 && code !== null) {
+          logger.warn("whisper-server exited", { code, signal });
+        }
+      });
+
+      void waitWhisperServerReady()
+        .then(() => {
+          logger.info("whisper-server ready", { url: whisperServerInferenceUrl() });
+          resolve();
+        })
+        .catch((err) => {
+          try { proc.kill("SIGKILL"); } catch {}
+          whisperServerState.proc = null;
+          reject(err);
+        });
+    }).catch((err) => {
       throw new Error(
         `whisper-server 启动失败: ${(err as Error).message}${stderrTail ? ` | ${stderrTail.slice(-300)}` : ""}`,
       );
-    }
+    });
   })();
 
   try {

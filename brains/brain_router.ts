@@ -13,6 +13,10 @@ const logger = createLogger("brain_router");
 export interface RouteMessageOptions {
   /** 服务端触发的陪伴搭话：不跑记忆提取与慢脑，历史中 user 用短占位 */
   systemTriggered?: boolean;
+  /** 阶段1增量输入命中预判时，复用已生成回复，避免再次触发LLM。 */
+  pregeneratedReply?: string;
+  /** 打断承接提示，帮助快脑把新一轮回复接在正确的会话分支上。 */
+  carryForwardHint?: string;
 }
 
 /**
@@ -51,20 +55,36 @@ export async function* routeMessage(
 
   const slowBrainContext = ctx.slowBrain.synthesizeContext();
   const historyForPrompt = trimHistoryToTokenBudget([...ctx.history]);
+  const pregeneratedReply = opts?.pregeneratedReply?.trim();
+  const carryForwardHint = opts?.carryForwardHint?.trim();
 
   let fullReply = "";
-  for await (const token of fastBrainStream({
-    userMessage,
-    emotion,
-    memory,
-    history: historyForPrompt,
-    slowBrainContext,
-    strategyHints: ctx.slowBrain.buildConversationStrategyHints(userMessage),
-    signal,
-    persona: ctx.persona,
-  })) {
-    fullReply += token;
-    yield token;
+  if (pregeneratedReply) {
+    logger.info("复用 partial transcript 预判回复", {
+      replyChars: pregeneratedReply.length,
+      userChars: userMessage.length,
+    });
+    fullReply = pregeneratedReply;
+    yield pregeneratedReply;
+  } else {
+    for await (const token of fastBrainStream({
+      userMessage,
+      emotion,
+      memory,
+      history: historyForPrompt,
+      slowBrainContext,
+      strategyHints: [
+        ctx.slowBrain.buildConversationStrategyHints(userMessage),
+        carryForwardHint,
+      ]
+        .filter((part): part is string => Boolean(part?.trim()))
+        .join("\n\n"),
+      signal,
+      persona: ctx.persona,
+    })) {
+      fullReply += token;
+      yield token;
+    }
   }
 
   const historyUserContent = opts?.systemTriggered

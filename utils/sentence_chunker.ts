@@ -1,4 +1,5 @@
-const SENTENCE_END = /[。！？.!?\n]/;
+export const SENTENCE_END = /[。！？.!?\n]/;
+export const SOFT_BREAK_RE = /[，,、；;：:~～…]/;
 
 /** 支持的首句 eager 阈值方案：12/14/16 字，默认 14（速度与自然度平衡） */
 type EagerThresholdOption = 12 | 14 | 16;
@@ -26,6 +27,8 @@ export interface SentenceChunkerOptions {
    * Set to 0 to disable. Default from env TTS_MIN_CHARS or 16.
    */
   minTtsChars?: number;
+  /** In eager mode, allow a small lookahead for a softer boundary before forcing the first chunk. */
+  eagerLookaheadChars?: number;
 }
 
 /**
@@ -46,6 +49,7 @@ export class SentenceChunker {
   private readonly eagerMinTtsChars: number;
   private readonly maxChunkChars: number;
   private readonly minTtsChars: number;
+  private readonly eagerLookaheadChars: number;
 
   constructor(opts: SentenceChunkerOptions = {}) {
     const envMin = process.env.TTS_CHUNK_MIN_CHARS
@@ -64,6 +68,9 @@ export class SentenceChunker {
       ? Number(process.env.TTS_CHUNK_MAX_CHARS)
       : NaN;
     const envTtsMin = process.env.TTS_MIN_CHARS ? Number(process.env.TTS_MIN_CHARS) : NaN;
+    const envEagerLookahead = process.env.TTS_EAGER_LOOKAHEAD_CHARS
+      ? Number(process.env.TTS_EAGER_LOOKAHEAD_CHARS)
+      : NaN;
 
     // 优先使用显式传入的 eagerCharThreshold，否则检查 envEagerChunk，再用默认 14
     const desiredThreshold = opts.eagerCharThreshold ??
@@ -89,6 +96,9 @@ export class SentenceChunker {
     } else {
       this.eagerMinTtsChars = 8;
     }
+    this.eagerLookaheadChars =
+      opts.eagerLookaheadChars ??
+      (Number.isFinite(envEagerLookahead) && envEagerLookahead >= 0 ? envEagerLookahead : 8);
   }
 
   /**
@@ -116,8 +126,10 @@ export class SentenceChunker {
 
     // 只有当没有标点触发时，才使用字数阈值强制输出首句
     if (this._eager && this.buffer.length >= this.eagerCharThreshold && sentences.length === 0) {
-      sentences.push(this.buffer.trim());
-      this.buffer = "";
+      const eagerChunk = this.takeEagerChunk();
+      if (eagerChunk) {
+        sentences.push(eagerChunk);
+      }
     } else if (!this._eager) {
       while (this.buffer.length >= this.maxChunkChars) {
         const chunk = this.buffer.slice(0, this.maxChunkChars).trim();
@@ -127,6 +139,55 @@ export class SentenceChunker {
     }
 
     return this.applyMinTtsLength(sentences);
+  }
+
+  private takeEagerChunk(): string {
+    if (this.buffer.length < this.eagerCharThreshold) return "";
+
+    const softBreakIdx = this.findSoftBreakAfterThreshold();
+    if (softBreakIdx >= 0) {
+      const chunk = this.buffer.slice(0, softBreakIdx + 1).trim();
+      this.buffer = this.buffer.slice(softBreakIdx + 1);
+      return chunk;
+    }
+
+    if (this.buffer.length < this.eagerCharThreshold + this.eagerLookaheadChars) {
+      return "";
+    }
+
+    const forceIdx = this.findSafeForcedCut();
+    const chunk = this.buffer.slice(0, forceIdx).trim();
+    this.buffer = this.buffer.slice(forceIdx);
+    return chunk;
+  }
+
+  private findSoftBreakAfterThreshold(): number {
+    const searchLimit = Math.min(
+      this.buffer.length,
+      this.eagerCharThreshold + this.eagerLookaheadChars,
+    );
+    for (let i = this.eagerCharThreshold - 1; i < searchLimit; i++) {
+      if (SOFT_BREAK_RE.test(this.buffer[i] || "")) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  private findSafeForcedCut(): number {
+    let idx = Math.min(
+      this.buffer.length,
+      this.eagerCharThreshold + this.eagerLookaheadChars,
+    );
+    while (
+      idx < this.buffer.length &&
+      idx < this.eagerCharThreshold + this.eagerLookaheadChars + 4 &&
+      isHanChar(this.buffer[idx - 1] || "") &&
+      isHanChar(this.buffer[idx] || "")
+    ) {
+      idx += 1;
+    }
+    return Math.min(idx, this.buffer.length);
   }
 
   /** Merge held text with outgoing chunks; hold fragments shorter than minTtsChars. */
@@ -180,4 +241,8 @@ export async function* chunkSentences(
 
   const rest = chunker.flush();
   if (rest) yield rest;
+}
+
+function isHanChar(char: string): boolean {
+  return /\p{Script=Han}/u.test(char);
 }

@@ -40,11 +40,14 @@ npm install
 # 安装前端依赖
 npm install --prefix web
 
+# 若需本地数据库/Redis（推荐仅把这两个放 Docker）
+./scripts/start-dev-stack.sh
+
 # 配置环境变量
 cp .env.example .env   # 然后编辑 .env 填入 API Key 等
 
-# 启动后端（端口 3000）
-npm run dev
+# 启动后端（端口 3000，推荐原生模式）
+npm run dev:native
 
 # 启动前端（另一个终端）
 npm run web:dev
@@ -52,6 +55,9 @@ npm run web:dev
 # 仅类型检查（不写 dist）
 npm run typecheck
 ```
+
+浏览器远程开发与办公网实时预览见 **`REMOTE_DEV.md`**。
+如果 Next 开发态缓存异常，可先执行 **`npm run dev:web:clean`** 再重启服务。
 
 ### 环境变量
 

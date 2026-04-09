@@ -78,4 +78,24 @@ describe("deriveAvatarIntent", () => {
     expect(intent.gestureIntensity).to.equal(2);
     expect(intent.holdMs).to.equal(1200);
   });
+
+  it("leans in while actively listening, even for neutral emotion", () => {
+    const intent = deriveAvatarIntent({
+      emotion: "neutral",
+      turnState: "listening_active",
+    });
+
+    expect(intent.gesture).to.equal("lean_in");
+    expect(intent.energy).to.equal(1);
+  });
+
+  it("softens into a head tilt during listening hold", () => {
+    const intent = deriveAvatarIntent({
+      emotion: "curious",
+      turnState: "listening_hold",
+    });
+
+    expect(intent.gesture).to.equal("tilt_head");
+    expect(intent.gestureIntensity).to.equal(1);
+  });
 });

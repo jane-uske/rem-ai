@@ -1,7 +1,14 @@
 "use client";
 
 import { useSyncExternalStore } from "react";
-import type { AvatarActionCommand, AvatarIntent, RemState } from "@/types/avatar";
+import type {
+  AvatarActionCommand,
+  AvatarIntent,
+  InterruptionType,
+  RemState,
+  RemTurnState,
+  RemTurnStateReason,
+} from "@/types/avatar";
 
 export interface AvatarDevtoolsLogEntry {
   id: number;
@@ -15,6 +22,11 @@ export interface AvatarRuntimeSnapshot {
   ts: number;
   emotion: string;
   remState: RemState;
+  turnState?: RemTurnState | null;
+  turnReason?: RemTurnStateReason | null;
+  turnStateAtMs?: number | null;
+  sttPredictionPreview?: string | null;
+  interruptionType?: InterruptionType | null;
   voiceActive: boolean;
   lipEnvelope: number;
   expressionWeights: Partial<Record<string, number>>;
@@ -65,6 +77,26 @@ export function pushAvatarDevtoolsLog(
 
 export function publishAvatarRuntimeSnapshot(snapshot: AvatarRuntimeSnapshot): void {
   state = { ...state, snapshot };
+  emit();
+}
+
+export function mergeAvatarRuntimeSnapshot(
+  patch: Partial<AvatarRuntimeSnapshot>,
+): void {
+  state = {
+    ...state,
+    snapshot: {
+      ...(state.snapshot ?? {
+        ts: Date.now(),
+        emotion: "neutral",
+        remState: "idle",
+        voiceActive: false,
+        lipEnvelope: 0,
+        expressionWeights: {},
+      }),
+      ...patch,
+    },
+  };
   emit();
 }
 

@@ -5,19 +5,12 @@ import type {
   AvatarIntentFacialAccent,
   AvatarIntentGesture,
   AvatarIntentSource,
+  RemTurnState,
 } from "@/types/avatar";
-
-function clampBand(value: number): 0 | 1 | 2 | 3 {
-  if (!Number.isFinite(value)) return 0;
-  if (value <= 0.75) return 0;
-  if (value <= 1.5) return 1;
-  if (value <= 2.35) return 2;
-  return 3;
-}
+import { asEmotion, clampBand, clampMs } from "../../../../avatar/utils";
 
 function clampHoldMs(value: number): number {
-  if (!Number.isFinite(value)) return 700;
-  return Math.max(180, Math.min(2400, Math.round(value)));
+  return clampMs(value, 700, 180, 2400);
 }
 
 function emotionToAccent(
@@ -63,22 +56,24 @@ export function deriveAvatarIntent(input: {
   emotion: string;
   action?: AvatarActionCommand | null;
   face?: AvatarFaceOverlay | null;
+  turnState?: RemTurnState | null;
   source?: AvatarIntentSource;
   reason?: string;
 }): AvatarIntent {
-  const emotion =
-    input.emotion === "happy" ||
-    input.emotion === "curious" ||
-    input.emotion === "shy" ||
-    input.emotion === "sad"
-      ? input.emotion
-      : "neutral";
+  const emotion = asEmotion(input.emotion);
 
   const actionGesture = mapActionToGesture(input.action);
   let gesture: AvatarIntentGesture = actionGesture;
+  const turnState = input.turnState ?? null;
 
   if (gesture === "none") {
-    if (emotion === "happy") {
+    if (turnState === "listening_active") {
+      gesture = emotion === "sad" || emotion === "shy" ? "shrink_in" : "lean_in";
+    } else if (turnState === "listening_hold") {
+      gesture = emotion === "sad" ? "shrink_in" : "tilt_head";
+    } else if (turnState === "likely_end" || turnState === "assistant_entering") {
+      gesture = emotion === "sad" ? "shrink_in" : "lean_in";
+    } else if (emotion === "happy") {
       gesture = "happy_hop";
     } else if (emotion === "sad" || emotion === "shy") {
       gesture = "shrink_in";
@@ -98,11 +93,20 @@ export function deriveAvatarIntent(input: {
   else if (emotion === "neutral") energy = 1;
   else energy = 0;
 
+  if (turnState === "listening_active") {
+    energy = Math.max(1, energy) as 0 | 1 | 2 | 3;
+  } else if (turnState === "likely_end" || turnState === "assistant_entering") {
+    energy = Math.min(3, energy + 1) as 0 | 1 | 2 | 3;
+  } else if (turnState === "listening_hold" && energy > 0) {
+    energy = (energy - 1) as 0 | 1 | 2 | 3;
+  }
+
   const gestureIntensity = clampBand(
     input.action?.intensity ??
       (gesture === "happy_hop" ? 2.8
       : gesture === "shrink_in" ? 1.8
-      : gesture === "lean_in" ? 1.4
+      : gesture === "lean_in" ? 1.55
+      : gesture === "tilt_head" ? 1.1
       : 0),
   );
 

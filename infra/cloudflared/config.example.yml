@@ -1,0 +1,9 @@
+tunnel: YOUR_TUNNEL_ID
+credentials-file: /Users/rare/.cloudflared/YOUR_TUNNEL_ID.json
+
+ingress:
+  - hostname: app-rem.example.com
+    service: http://127.0.0.1:3000
+  - hostname: ide-rem.example.com
+    service: http://127.0.0.1:8443
+  - service: http_status:404

@@ -17,6 +17,12 @@ export interface AudioQueueOptions {
   onPlaybackStart?: (generationId: number | null) => void;
 }
 
+const PCM_BATCH_TARGET_MS = 72;
+
+function isBrokenAudioContextState(state: string): boolean {
+  return state === "closed" || state === "interrupted";
+}
+
 export function useAudioBase64Queue(options?: AudioQueueOptions) {
   const [playing, setPlaying] = useState(false);
   const decodeChainRef = useRef<Promise<void>>(Promise.resolve());
@@ -34,6 +40,13 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
   const fallbackAudioRef = useRef<HTMLAudioElement | null>(null);
   const fallbackSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
   const stopFallbackRef = useRef<(() => void) | null>(null);
+  const audioGraphRetryAfterRef = useRef(0);
+  const pcmFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingPcmChunksRef = useRef<Float32Array[]>([]);
+  const pendingPcmSamplesRef = useRef(0);
+  const pendingPcmSampleRateRef = useRef(24000);
+  const pendingPcmGenerationRef = useRef<number | null>(null);
+  const pendingPcmServerGenerationRef = useRef<number | null>(null);
   /** Updated ~60fps while TTS plays; read by RemVrmViewer for mouth `aa` blend shape */
   const lipEnvelopeRef = useRef(0);
   const lipSignalRef = useRef<LipSignal>({
@@ -46,6 +59,23 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
   useEffect(() => {
     onPlaybackStartRef.current = options?.onPlaybackStart;
   }, [options?.onPlaybackStart]);
+
+  const resetAudioGraph = useCallback(() => {
+    const ctx = audioContextRef.current;
+    audioContextRef.current = null;
+    analyserRef.current = null;
+    analyserReadyRef.current = false;
+    nextStartTimeRef.current = 0;
+    activeSourcesRef.current.clear();
+    playingRef.current = false;
+    playbackNotifiedRef.current = false;
+    if (ctx) {
+      ctx.onstatechange = null;
+      if (ctx.state !== "closed") {
+        void ctx.close().catch(() => {});
+      }
+    }
+  }, []);
 
   const sync = useCallback(() => {
     setPlaying(playingRef.current);
@@ -101,19 +131,51 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
 
   const ensureAudioGraph = useCallback(async (): Promise<AudioContext | null> => {
     if (typeof window === "undefined") return null;
+    if (Date.now() < audioGraphRetryAfterRef.current) return null;
     const Ctx =
       window.AudioContext ||
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     if (!Ctx) return null;
 
-    const ctx = audioContextRef.current ?? new Ctx();
-    audioContextRef.current = ctx;
+    let ctx = audioContextRef.current;
+    if (ctx && isBrokenAudioContextState(String(ctx.state))) {
+      audioGraphRetryAfterRef.current = Date.now() + 1500;
+      resetAudioGraph();
+      ctx = null;
+    }
+    if (!ctx) {
+      let freshCtx: AudioContext;
+      try {
+        freshCtx = new Ctx();
+      } catch {
+        audioGraphRetryAfterRef.current = Date.now() + 1500;
+        return null;
+      }
+      freshCtx.onstatechange = () => {
+        if (audioContextRef.current !== freshCtx) return;
+        if (isBrokenAudioContextState(String(freshCtx.state))) {
+          audioGraphRetryAfterRef.current = Date.now() + 1500;
+          resetAudioGraph();
+        }
+      };
+      audioContextRef.current = freshCtx;
+      ctx = freshCtx;
+    }
     if (ctx.state !== "running") {
       try {
         await ctx.resume();
       } catch {
-        /* ignore */
+        audioGraphRetryAfterRef.current = Date.now() + 1500;
+        if (isBrokenAudioContextState(String(ctx.state))) {
+          resetAudioGraph();
+        }
+        return null;
       }
+    }
+    if (isBrokenAudioContextState(String(ctx.state))) {
+      audioGraphRetryAfterRef.current = Date.now() + 1500;
+      resetAudioGraph();
+      return null;
     }
 
     if (!analyserReadyRef.current) {
@@ -125,7 +187,7 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
       analyserReadyRef.current = true;
     }
     return ctx;
-  }, []);
+  }, [resetAudioGraph]);
 
   const unlockPlayback = useCallback(async (): Promise<void> => {
     const ctx = await ensureAudioGraph();
@@ -139,6 +201,24 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
     }
   }, [ensureAudioGraph]);
 
+  const clearPendingPcm = useCallback(() => {
+    if (pcmFlushTimerRef.current) {
+      clearTimeout(pcmFlushTimerRef.current);
+      pcmFlushTimerRef.current = null;
+    }
+    pendingPcmChunksRef.current = [];
+    pendingPcmSamplesRef.current = 0;
+    pendingPcmSampleRateRef.current = 24000;
+    pendingPcmGenerationRef.current = null;
+    pendingPcmServerGenerationRef.current = null;
+  }, []);
+
+  const queuedAheadMs = useCallback(() => {
+    const ctx = audioContextRef.current;
+    if (!ctx) return 0;
+    return Math.max(0, (nextStartTimeRef.current - ctx.currentTime) * 1000);
+  }, []);
+
   const scheduleIdleCheck = useCallback(() => {
     if (idleTimerRef.current) {
       clearTimeout(idleTimerRef.current);
@@ -149,6 +229,7 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
     const remainMs = Math.max(20, (nextStartTimeRef.current - ctx.currentTime) * 1000 + 20);
     idleTimerRef.current = setTimeout(() => {
       if (activeSourcesRef.current.size > 0) return;
+      if (pendingPcmSamplesRef.current > 0 || pcmFlushTimerRef.current) return;
       const now = audioContextRef.current?.currentTime ?? 0;
       if (now + 0.01 < nextStartTimeRef.current) return;
       playingRef.current = false;
@@ -214,20 +295,99 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
       if (!floats) return;
       const ctxRate = Number.isFinite(sampleRate) && sampleRate > 0 ? sampleRate : 24000;
 
-      const frame = audioContextRef.current?.createBuffer(1, floats.length, ctxRate);
-      if (frame) {
-        frame.getChannelData(0).set(floats);
-        void scheduleAudioBuffer(frame, generationAtCall, serverGenerationId);
-      } else {
-        // Fallback path if ctx not initialized yet.
+      const flushPending = () => {
+        if (pendingPcmSamplesRef.current <= 0 || generationRef.current !== generationAtCall) {
+          clearPendingPcm();
+          return;
+        }
+        const chunks = pendingPcmChunksRef.current;
+        const totalSamples = pendingPcmSamplesRef.current;
+        const rate = pendingPcmSampleRateRef.current;
+        const serverGeneration = pendingPcmServerGenerationRef.current;
+        clearPendingPcm();
         void (async () => {
           const ctx = await ensureAudioGraph();
           if (!ctx || generationRef.current !== generationAtCall) return;
-          const buf = ctx.createBuffer(1, floats.length, ctxRate);
-          buf.getChannelData(0).set(floats);
-          await scheduleAudioBuffer(buf, generationAtCall, serverGenerationId);
+          const buf = ctx.createBuffer(1, totalSamples, rate);
+          const channel = buf.getChannelData(0);
+          let offset = 0;
+          for (const chunk of chunks) {
+            channel.set(chunk, offset);
+            offset += chunk.length;
+          }
+          await scheduleAudioBuffer(buf, generationAtCall, serverGeneration);
         })();
+      };
+
+      const shouldScheduleImmediately =
+        pendingPcmSamplesRef.current === 0 &&
+        queuedAheadMs() < 24 &&
+        activeSourcesRef.current.size === 0 &&
+        !playingRef.current;
+
+      if (shouldScheduleImmediately) {
+        const frame = audioContextRef.current?.createBuffer(1, floats.length, ctxRate);
+        if (frame) {
+          frame.getChannelData(0).set(floats);
+          void scheduleAudioBuffer(frame, generationAtCall, serverGenerationId);
+          return;
+        }
       }
+
+      if (
+        pendingPcmSamplesRef.current > 0 &&
+        (pendingPcmGenerationRef.current !== generationAtCall ||
+          pendingPcmSampleRateRef.current !== ctxRate)
+      ) {
+        flushPending();
+      }
+
+      pendingPcmChunksRef.current.push(floats);
+      pendingPcmSamplesRef.current += floats.length;
+      pendingPcmSampleRateRef.current = ctxRate;
+      pendingPcmGenerationRef.current = generationAtCall;
+      pendingPcmServerGenerationRef.current = serverGenerationId;
+
+      const bufferedMs = (pendingPcmSamplesRef.current / ctxRate) * 1000;
+      if (bufferedMs >= PCM_BATCH_TARGET_MS || queuedAheadMs() < 12) {
+        flushPending();
+        return;
+      }
+
+      if (!pcmFlushTimerRef.current) {
+        pcmFlushTimerRef.current = setTimeout(() => {
+          pcmFlushTimerRef.current = null;
+          flushPending();
+        }, Math.max(12, PCM_BATCH_TARGET_MS - bufferedMs));
+      }
+    },
+    [clearPendingPcm, ensureAudioGraph, queuedAheadMs, scheduleAudioBuffer],
+  );
+
+  const decodeBase64ToAudioBuffer = useCallback(
+    async (
+      base64: string,
+      generationAtCall: number,
+      serverGenerationId: number | null,
+    ): Promise<boolean> => {
+      const ctx = await ensureAudioGraph();
+      if (!ctx) return false;
+      if (generationRef.current !== generationAtCall) return true;
+      const bytes = base64ToUint8Array(base64);
+      if (!bytes) return false;
+
+      const sourceBuffer = new Uint8Array(bytes).buffer;
+
+      let decoded: AudioBuffer;
+      try {
+        decoded = await decodeAudioBuffer(ctx, sourceBuffer);
+      } catch {
+        return false;
+      }
+
+      if (generationRef.current !== generationAtCall) return true;
+      await scheduleAudioBuffer(decoded, generationAtCall, serverGenerationId);
+      return true;
     },
     [ensureAudioGraph, scheduleAudioBuffer],
   );
@@ -335,15 +495,23 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
         .catch(() => {})
         .then(async () => {
           if (generationRef.current !== generationAtCall) return;
-          await playBase64Fallback(base64, generationAtCall, serverGenerationId);
+          const scheduled = await decodeBase64ToAudioBuffer(
+            base64,
+            generationAtCall,
+            serverGenerationId,
+          );
+          if (!scheduled) {
+            await playBase64Fallback(base64, generationAtCall, serverGenerationId);
+          }
         });
     },
-    [playBase64Fallback],
+    [decodeBase64ToAudioBuffer, playBase64Fallback],
   );
 
   /** Stop current playback and discard all queued audio (used on interrupt). */
   const clearQueue = useCallback(() => {
     generationRef.current += 1;
+    clearPendingPcm();
 
     if (idleTimerRef.current) {
       clearTimeout(idleTimerRef.current);
@@ -386,7 +554,15 @@ export function useAudioBase64Queue(options?: AudioQueueOptions) {
     stopEnvelopeLoop();
     playingRef.current = false;
     sync();
-  }, [stopEnvelopeLoop, sync]);
+  }, [clearPendingPcm, stopEnvelopeLoop, sync]);
+
+  useEffect(() => {
+    return () => {
+      clearPendingPcm();
+      stopEnvelopeLoop();
+      resetAudioGraph();
+    };
+  }, [clearPendingPcm, resetAudioGraph, stopEnvelopeLoop]);
 
   return {
     enqueueBase64,
@@ -421,4 +597,25 @@ function pcm16Base64ToFloat32(base64: string): Float32Array | null {
     out[i] = s < 0 ? s / 0x8000 : s / 0x7fff;
   }
   return out;
+}
+
+function decodeAudioBuffer(ctx: AudioContext, data: ArrayBuffer): Promise<AudioBuffer> {
+  return new Promise((resolve, reject) => {
+    const finishReject = (error: unknown) => {
+      reject(error instanceof Error ? error : new Error("decodeAudioData failed"));
+    };
+
+    try {
+      const maybePromise = ctx.decodeAudioData(
+        data,
+        (buffer) => resolve(buffer),
+        (error) => finishReject(error),
+      );
+      if (maybePromise && typeof maybePromise.then === "function") {
+        maybePromise.then(resolve).catch(finishReject);
+      }
+    } catch (error) {
+      finishReject(error);
+    }
+  });
 }

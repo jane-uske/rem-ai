@@ -10,6 +10,7 @@ import {
   useState,
 } from "react";
 import { clearAvatarDevtoolsLogs, useAvatarDevtoolsState } from "@/lib/rem3d/devtoolsStore";
+import type { RemTurnState, RemTurnStateReason } from "@/types/avatar";
 
 type AvatarDevtoolsPanelProps = {
   title?: string;
@@ -43,6 +44,76 @@ function safeStringify(value: unknown): string {
   }
 }
 
+function getTurnStateLabel(turnState: RemTurnState | null | undefined): string {
+  switch (turnState) {
+    case "listening_active":
+      return "专心听";
+    case "listening_hold":
+      return "等你说完";
+    case "likely_end":
+      return "准备接话";
+    case "confirmed_end":
+      return "准备回复";
+    case "assistant_entering":
+      return "要开口了";
+    case "assistant_speaking":
+      return "正在说";
+    case "interrupted_by_user":
+      return "被你打断";
+    default:
+      return "none";
+  }
+}
+
+function getTurnReasonLabel(reason: RemTurnStateReason | null | undefined): string {
+  switch (reason) {
+    case "speech_start":
+      return "speech_start";
+    case "partial_growth":
+      return "partial_growth";
+    case "semantic_hold":
+      return "semantic_hold";
+    case "likely_end":
+      return "likely_end";
+    case "confirmed_end":
+      return "confirmed_end";
+    case "tts_prepare":
+      return "tts_prepare";
+    case "playback_start":
+      return "playback_start";
+    case "user_interrupt":
+      return "user_interrupt";
+    default:
+      return "none";
+  }
+}
+
+function getTurnStateAccent(turnState: RemTurnState | null | undefined): string {
+  switch (turnState) {
+    case "listening_active":
+      return "border-sky-400/30 bg-sky-500/10 text-sky-100";
+    case "listening_hold":
+      return "border-cyan-400/30 bg-cyan-500/10 text-cyan-100";
+    case "likely_end":
+    case "confirmed_end":
+      return "border-amber-400/30 bg-amber-500/10 text-amber-100";
+    case "assistant_entering":
+      return "border-orange-400/30 bg-orange-500/10 text-orange-100";
+    case "assistant_speaking":
+      return "border-emerald-400/30 bg-emerald-500/10 text-emerald-100";
+    case "interrupted_by_user":
+      return "border-rose-400/30 bg-rose-500/10 text-rose-100";
+    default:
+      return "border-white/10 bg-black/20 text-[var(--foreground)]";
+  }
+}
+
+function formatDuration(ms: number | null | undefined): string {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0) return "--";
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  return `${(ms / 1000).toFixed(ms >= 10_000 ? 0 : 1)} s`;
+}
+
 export function AvatarDevtoolsPanel({
   title = "Avatar DevTools",
   className = "",
@@ -68,10 +139,18 @@ export function AvatarDevtoolsPanel({
   } | null>(null);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [dragging, setDragging] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const [floatingSize, setFloatingSize] = useState({
     width: DEFAULT_FLOAT_WIDTH,
     height: DEFAULT_FLOAT_HEIGHT,
   });
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     if (!draggable || typeof window === "undefined") return;
@@ -135,6 +214,11 @@ export function AvatarDevtoolsPanel({
     () => safeStringify(deferredSnapshot?.expressionWeights ?? {}),
     [deferredSnapshot],
   );
+  const turnStateLabel = getTurnStateLabel(deferredSnapshot?.turnState);
+  const turnReasonLabel = getTurnReasonLabel(deferredSnapshot?.turnReason);
+  const turnElapsed = deferredSnapshot?.turnStateAtMs
+    ? Math.max(0, nowMs - deferredSnapshot.turnStateAtMs)
+    : null;
 
   const handlePointerMove = useCallback((event: PointerEvent) => {
     const drag = dragOriginRef.current;
@@ -287,12 +371,40 @@ export function AvatarDevtoolsPanel({
                   <div className="mt-1 font-medium">{deferredSnapshot.remState}</div>
                 </div>
                 <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">
+                  <div className="text-[10px] text-[var(--rem-dim)]">Turn</div>
+                  <div
+                    className={`mt-1 inline-flex rounded-full border px-2 py-0.5 text-[11px] font-medium ${getTurnStateAccent(deferredSnapshot.turnState)}`}
+                  >
+                    {turnStateLabel}
+                  </div>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">
+                  <div className="text-[10px] text-[var(--rem-dim)]">Turn Reason</div>
+                  <div className="mt-1 font-medium">{turnReasonLabel}</div>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">
+                  <div className="text-[10px] text-[var(--rem-dim)]">Turn For</div>
+                  <div className="mt-1 font-medium">{formatDuration(turnElapsed)}</div>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">
                   <div className="text-[10px] text-[var(--rem-dim)]">Lip</div>
                   <div className="mt-1 font-medium">{deferredSnapshot.lipEnvelope.toFixed(2)}</div>
                 </div>
                 <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">
                   <div className="text-[10px] text-[var(--rem-dim)]">Voice</div>
                   <div className="mt-1 font-medium">{deferredSnapshot.voiceActive ? "active" : "idle"}</div>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">
+                  <div className="text-[10px] text-[var(--rem-dim)]">Prediction</div>
+                  <div className="mt-1 break-words font-medium">
+                    {deferredSnapshot.sttPredictionPreview ?? "none"}
+                  </div>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">
+                  <div className="text-[10px] text-[var(--rem-dim)]">Interrupt</div>
+                  <div className="mt-1 font-medium">
+                    {deferredSnapshot.interruptionType ?? "none"}
+                  </div>
                 </div>
                 <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">
                   <div className="text-[10px] text-[var(--rem-dim)]">Cue</div>

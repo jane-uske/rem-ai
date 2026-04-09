@@ -35,6 +35,23 @@ export interface VadOptions {
   maxCrest?: number;
   /** Looser crest gate while already speaking. Default: 30 */
   continueMaxCrest?: number;
+  /**
+   * Fallback energy gate for speech onset when ZCR / crest are too strict
+   * for real mic conditions. Sustained voiced energy over several frames
+   * can still trigger speech_start, avoiding "never recognizes speech".
+   */
+  fallbackEnergyThreshold?: number;
+  /** Minimum consecutive fallback-energy frames before speech_start. */
+  fallbackMinSpeechFrames?: number;
+  /**
+   * Minimum "active sample" ratio for onset.
+   * Speech occupies a wider portion of the frame; impulsive keyboard clicks are sparse.
+   */
+  minActiveRatio?: number;
+  /** Looser active-sample ratio while already speaking. */
+  continueMinActiveRatio?: number;
+  /** Fallback-energy mode still requires a speech-like active spread. */
+  fallbackMinActiveRatio?: number;
 }
 
 /**
@@ -60,10 +77,16 @@ export class VadDetector extends EventEmitter {
   private continueMaxZcr: number;
   private maxCrest: number;
   private continueMaxCrest: number;
+  private fallbackEnergyThreshold: number;
+  private fallbackMinSpeech: number;
+  private minActiveRatio: number;
+  private continueMinActiveRatio: number;
+  private fallbackMinActiveRatio: number;
 
   private _speaking = false;
   private speechCount = 0;
   private silentCount = 0;
+  private fallbackSpeechCount = 0;
 
   constructor(opts: VadOptions = {}) {
     super();
@@ -84,18 +107,46 @@ export class VadDetector extends EventEmitter {
     const envContinueMaxCrest = process.env.VAD_CONTINUE_MAX_CREST
       ? Number(process.env.VAD_CONTINUE_MAX_CREST)
       : undefined;
+    const envFallbackEnergyThreshold = process.env.VAD_FALLBACK_ENERGY_THRESHOLD
+      ? Number(process.env.VAD_FALLBACK_ENERGY_THRESHOLD)
+      : undefined;
+    const envFallbackMinSpeechFrames = process.env.VAD_FALLBACK_MIN_SPEECH_FRAMES
+      ? Number(process.env.VAD_FALLBACK_MIN_SPEECH_FRAMES)
+      : undefined;
+    const envMinActiveRatio = process.env.VAD_MIN_ACTIVE_RATIO
+      ? Number(process.env.VAD_MIN_ACTIVE_RATIO)
+      : undefined;
+    const envContinueMinActiveRatio = process.env.VAD_CONTINUE_MIN_ACTIVE_RATIO
+      ? Number(process.env.VAD_CONTINUE_MIN_ACTIVE_RATIO)
+      : undefined;
+    const envFallbackMinActiveRatio = process.env.VAD_FALLBACK_MIN_ACTIVE_RATIO
+      ? Number(process.env.VAD_FALLBACK_MIN_ACTIVE_RATIO)
+      : undefined;
     // Balance: too high → mic never crosses threshold (no reaction); too low
     // → false triggers. Tune with VAD_THRESHOLD / VAD_MIN_SPEECH_FRAMES.
-    this.threshold = opts.energyThreshold ?? envThreshold ?? 0.06;
+    this.threshold = opts.energyThreshold ?? envThreshold ?? 0.04;
     this.silenceLimit = opts.silenceFrames ?? envSilenceFrames ?? 6;
     this.speakingSilenceLimit =
       opts.speakingSilenceFrames ?? envSpeakingSilenceFrames ?? Math.max(this.silenceLimit, 10);
     this.minSpeech = opts.minSpeechFrames ?? envMinSpeech ?? 3;
     this.continueEnergyRatio = opts.continueEnergyRatio ?? envContinueEnergyRatio ?? 0.55;
-    this.maxZcr = opts.maxZcr ?? envMaxZcr ?? 0.45;
-    this.continueMaxZcr = opts.continueMaxZcr ?? envContinueMaxZcr ?? 0.58;
-    this.maxCrest = opts.maxCrest ?? envMaxCrest ?? 22;
-    this.continueMaxCrest = opts.continueMaxCrest ?? envContinueMaxCrest ?? 30;
+    this.maxZcr = opts.maxZcr ?? envMaxZcr ?? 0.62;
+    this.continueMaxZcr = opts.continueMaxZcr ?? envContinueMaxZcr ?? 0.78;
+    this.maxCrest = opts.maxCrest ?? envMaxCrest ?? 28;
+    this.continueMaxCrest = opts.continueMaxCrest ?? envContinueMaxCrest ?? 38;
+    this.fallbackEnergyThreshold =
+      opts.fallbackEnergyThreshold ??
+      envFallbackEnergyThreshold ??
+      Math.max(0.015, this.threshold * 0.45);
+    this.fallbackMinSpeech =
+      opts.fallbackMinSpeechFrames ??
+      envFallbackMinSpeechFrames ??
+      Math.max(this.minSpeech + 1, 4);
+    this.minActiveRatio = opts.minActiveRatio ?? envMinActiveRatio ?? 0.18;
+    this.continueMinActiveRatio =
+      opts.continueMinActiveRatio ?? envContinueMinActiveRatio ?? 0.12;
+    this.fallbackMinActiveRatio =
+      opts.fallbackMinActiveRatio ?? envFallbackMinActiveRatio ?? 0.16;
   }
 
   get speaking(): boolean {
@@ -112,21 +163,45 @@ export class VadDetector extends EventEmitter {
     const energy = rms(pcm);
     const zcr = zeroCrossingRate(pcm);
     const crest = crestFactor(pcm);
+    const activeRatio = activeSampleRatio(pcm);
     const isSpeechStart =
-      energy > this.threshold && zcr < this.maxZcr && crest < this.maxCrest;
+      energy > this.threshold &&
+      zcr < this.maxZcr &&
+      crest < this.maxCrest &&
+      activeRatio >= this.minActiveRatio;
     const continueThreshold = this.threshold * this.continueEnergyRatio;
     const isSpeechContinue =
       energy > continueThreshold &&
       zcr < this.continueMaxZcr &&
-      crest < this.continueMaxCrest;
+      crest < this.continueMaxCrest &&
+      activeRatio >= this.continueMinActiveRatio;
+    const isFallbackStart =
+      !this._speaking &&
+      energy > this.fallbackEnergyThreshold &&
+      zcr < this.continueMaxZcr &&
+      crest < this.continueMaxCrest &&
+      activeRatio >= this.fallbackMinActiveRatio;
 
-    if (isSpeechStart || (this._speaking && isSpeechContinue)) {
+    if (isSpeechStart || (this._speaking && isSpeechContinue) || isFallbackStart) {
       this.silentCount = 0;
-      this.speechCount++;
+      if (isSpeechStart || (this._speaking && isSpeechContinue)) {
+        this.speechCount++;
+      } else {
+        this.speechCount = Math.max(0, this.speechCount - 1);
+      }
+      this.fallbackSpeechCount = isFallbackStart ? this.fallbackSpeechCount + 1 : 0;
 
-      if (!this._speaking && this.speechCount >= this.minSpeech) {
+      const hitStrictStart = !this._speaking && this.speechCount >= this.minSpeech;
+      const hitFallbackStart = !this._speaking && this.fallbackSpeechCount >= this.fallbackMinSpeech;
+      if (hitStrictStart || hitFallbackStart) {
         this._speaking = true;
-        this.emit("speech_start");
+        this.emit("speech_start", {
+          mode: hitStrictStart ? "strict" : "fallback_energy",
+          energy,
+          zcr,
+          crest,
+          activeRatio,
+        });
       }
     } else if (this._speaking) {
       this.silentCount++;
@@ -134,12 +209,14 @@ export class VadDetector extends EventEmitter {
         this._speaking = false;
         this.speechCount = 0;
         this.silentCount = 0;
+        this.fallbackSpeechCount = 0;
         this.emit("speech_end");
       }
     } else {
       // Gradual decay instead of hard reset — tolerates occasional
       // sibilant/unvoiced frames (high ZCR) during speech onset.
       this.speechCount = Math.max(0, this.speechCount - 1);
+      this.fallbackSpeechCount = Math.max(0, this.fallbackSpeechCount - 1);
     }
   }
 
@@ -147,6 +224,7 @@ export class VadDetector extends EventEmitter {
     this._speaking = false;
     this.speechCount = 0;
     this.silentCount = 0;
+    this.fallbackSpeechCount = 0;
   }
 
   /** Update speaking silence frame threshold dynamically */
@@ -199,4 +277,28 @@ function crestFactor(pcm: Buffer): number {
   const rms = Math.sqrt(sumSq / n);
   if (rms < 1e-9) return 1;
   return peak / rms;
+}
+
+/**
+ * Ratio of samples whose absolute amplitude is meaningfully above the noise floor.
+ * Speech tends to occupy a wider spread of a frame; keyboard clicks are sparse transients.
+ */
+function activeSampleRatio(pcm: Buffer): number {
+  const n = Math.floor(pcm.length / 2);
+  if (n === 0) return 0;
+  let peak = 0;
+  const samples = new Int16Array(n);
+  for (let i = 0; i < n; i++) {
+    const s = pcm.readInt16LE(i * 2) / 32768;
+    samples[i] = Math.round(s * 32768);
+    const abs = Math.abs(s);
+    if (abs > peak) peak = abs;
+  }
+  const floor = Math.max(0.008, peak * 0.18);
+  let active = 0;
+  for (let i = 0; i < n; i++) {
+    const abs = Math.abs(samples[i] / 32768);
+    if (abs >= floor) active++;
+  }
+  return active / n;
 }

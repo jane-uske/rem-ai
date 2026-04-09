@@ -8,11 +8,17 @@ import type {
   AvatarFrameState,
   AvatarIntentBeat,
   AvatarIntent,
+  InterruptionType,
+  RemTurnState,
+  RemTurnStateReason,
 } from "@/types/avatar";
 import { useAudioBase64Queue } from "@/hooks/useAudioBase64Queue";
 import { startPcmCapture, type PcmCapture } from "@/lib/pcmCapture";
 import { deriveAvatarIntent } from "@/lib/rem3d/avatarIntent";
-import { pushAvatarDevtoolsLog } from "@/lib/rem3d/devtoolsStore";
+import {
+  mergeAvatarRuntimeSnapshot,
+  pushAvatarDevtoolsLog,
+} from "@/lib/rem3d/devtoolsStore";
 
 function uid() {
   return crypto.randomUUID();
@@ -48,6 +54,24 @@ function arrayBufferToBase64(buf: ArrayBuffer): string {
   return btoa(binary);
 }
 
+function measurePcmFrame(buf: ArrayBuffer): { rms: number; peak: number } {
+  const view = new DataView(buf);
+  const sampleCount = Math.floor(buf.byteLength / 2);
+  if (sampleCount <= 0) return { rms: 0, peak: 0 };
+  let sum = 0;
+  let peak = 0;
+  for (let i = 0; i < sampleCount; i++) {
+    const sample = view.getInt16(i * 2, true) / 32768;
+    const abs = Math.abs(sample);
+    if (abs > peak) peak = abs;
+    sum += sample * sample;
+  }
+  return {
+    rms: Math.sqrt(sum / sampleCount),
+    peak,
+  };
+}
+
 /** WebSocket 断线后自动重连的延迟（与 UI 倒计时同源） */
 export const REM_WS_RECONNECT_DELAY_MS = 3000;
 
@@ -61,6 +85,7 @@ const MESSAGE_STORAGE_MAX = 50;
 const USER_SPEAKING_END_DEBOUNCE_MS = 260;
 const STT_FALLBACK_PREFIX = "录音中";
 const STT_USER_MERGE_WINDOW_MS = 2200;
+const MIC_TX_LOG_INTERVAL_MS = 900;
 
 function isListeningFallbackText(text: string): boolean {
   return text.startsWith(STT_FALLBACK_PREFIX);
@@ -116,12 +141,16 @@ export function useRemChat() {
   /** 仅用于在重连倒计时期间驱动按秒刷新（deadline 派生秒数） */
   const [, bumpReconnectTick] = useState(0);
   const [connLabel, setConnLabel] = useState("连接中…");
-  const [messages, setMessages] = useState<ChatMessage[]>(loadPersistedMessages);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messagesHydrated, setMessagesHydrated] = useState(false);
   const [streamingText, setStreamingText] = useState("");
   const [sttPartialText, setSttPartialText] = useState("");
   const [typing, setTyping] = useState(false);
   const [waiting, setWaiting] = useState(false);
-  /** 首 token 前：展示「Rem 在想…」（S9） */
+  const [turnState, setTurnState] = useState<RemTurnState>("confirmed_end");
+  const [sttPredictionPreview, setSttPredictionPreview] = useState<string | null>(null);
+  const [interruptionType, setInterruptionType] = useState<InterruptionType | null>(null);
+  /** 首 token 前：转成更弱的状态提示，不再直接显示“Rem 在想…” */
   const thinkingHint = waiting && streamingText.length === 0;
   const [avatarAction, setAvatarAction] = useState<{
     action: AvatarActionCommand;
@@ -139,6 +168,7 @@ export function useRemChat() {
   const duplexRef = useRef(false);
   const pcmRef = useRef<PcmCapture | null>(null);
   const recordingRef = useRef(false);
+  const resumeDuplexAfterReconnectRef = useRef(false);
   const userSpeakingEndTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastUserTranscriptAtRef = useRef(0);
   const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -147,9 +177,111 @@ export function useRemChat() {
   const activeGenerationRef = useRef<number | null>(null);
   const blockedGenerationsRef = useRef<Set<number>>(new Set());
   const loggedVoiceGenerationsRef = useRef<Set<number>>(new Set());
+  const turnStateRef = useRef<RemTurnState>("confirmed_end");
+  const turnStateMetaRef = useRef<{
+    state: RemTurnState;
+    reason: RemTurnStateReason;
+    sinceAtMs: number;
+    generationId: number | null;
+    preview: string | null;
+    interruptionType: InterruptionType | null;
+  }>({
+    state: "confirmed_end",
+    reason: "confirmed_end",
+    sinceAtMs: Date.now(),
+    generationId: null,
+    preview: null,
+    interruptionType: null,
+  });
+  const sttPredictionPreviewRef = useRef<string | null>(null);
+  const interruptionTypeRef = useRef<InterruptionType | null>(null);
+  const micTxStartedAtRef = useRef(0);
+  const micTxFramesRef = useRef(0);
+  const micTxBytesRef = useRef(0);
+  const micTxLastRmsRef = useRef(0);
+  const micTxLastPeakRef = useRef(0);
+  const micTxMaxRmsRef = useRef(0);
+  const micTxLastLogAtRef = useRef(0);
+  const lastMicFaultAtRef = useRef(0);
+  const startingDuplexRef = useRef(false);
   /** 连接超时主动 close 时，onclose 不再刷「已断开」系统提示（避免与超时错误重复） */
   const suppressDisconnectSysMsgRef = useRef(false);
   const avatarBeatTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+
+  const commitTurnState = useCallback(
+    (
+      nextState: RemTurnState,
+      reason: RemTurnStateReason,
+      extras?: {
+        preview?: string | null;
+        interruptionType?: InterruptionType | null;
+        generationId?: number | null;
+        kind?: "ws" | "system";
+      },
+    ) => {
+      const prevMeta = turnStateMetaRef.current;
+      const nextPreview =
+        extras?.preview !== undefined ? extras.preview : sttPredictionPreviewRef.current;
+      const nextInterruptionType =
+        extras?.interruptionType !== undefined
+          ? extras.interruptionType
+          : interruptionTypeRef.current;
+      const nextGenerationId =
+        extras?.generationId !== undefined ? extras.generationId ?? null : prevMeta.generationId;
+      const now = Date.now();
+      const nextSinceAtMs =
+        prevMeta.state === nextState ? prevMeta.sinceAtMs : now;
+
+      if (
+        prevMeta.state === nextState &&
+        prevMeta.reason === reason &&
+        prevMeta.generationId === nextGenerationId &&
+        prevMeta.preview === nextPreview &&
+        prevMeta.interruptionType === nextInterruptionType
+      ) {
+        return;
+      }
+
+      const prev = turnStateRef.current;
+      turnStateRef.current = nextState;
+      turnStateMetaRef.current = {
+        state: nextState,
+        reason,
+        sinceAtMs: nextSinceAtMs,
+        generationId: nextGenerationId,
+        preview: nextPreview,
+        interruptionType: nextInterruptionType,
+      };
+      setTurnState(nextState);
+      if (extras?.preview !== undefined) {
+        sttPredictionPreviewRef.current = extras.preview;
+        setSttPredictionPreview(extras.preview);
+      }
+      if (extras?.interruptionType !== undefined) {
+        interruptionTypeRef.current = extras.interruptionType;
+        setInterruptionType(extras.interruptionType);
+      }
+      pushAvatarDevtoolsLog(extras?.kind ?? "ws", "turn state", {
+        from: prev,
+        to: nextState,
+        reason,
+        enteredAtMs: nextSinceAtMs,
+        dwellMs: prev === nextState ? now - prevMeta.sinceAtMs : now - prevMeta.sinceAtMs,
+        generationId: nextGenerationId,
+        preview: nextPreview,
+        interruptionType: nextInterruptionType,
+      });
+      mergeAvatarRuntimeSnapshot({
+        ts: now,
+        turnState: nextState,
+        turnReason: reason,
+        turnStateAtMs: nextSinceAtMs,
+        sttPredictionPreview: nextPreview,
+        interruptionType: nextInterruptionType,
+      });
+    },
+    [],
+  );
 
   const clearGenerationState = useCallback(() => {
     activeGenerationRef.current = null;
@@ -168,6 +300,44 @@ export function useRemChat() {
     for (const timer of avatarBeatTimersRef.current) clearTimeout(timer);
     avatarBeatTimersRef.current = [];
   }, []);
+
+  const handleMicCaptureFault = useCallback(
+    (detail: { reason: string; state?: string; message?: string }) => {
+      const now = Date.now();
+      pushAvatarDevtoolsLog("system", "mic capture fault", detail);
+      if (now - lastMicFaultAtRef.current < 1500) return;
+      lastMicFaultAtRef.current = now;
+      startingDuplexRef.current = false;
+      resumeDuplexAfterReconnectRef.current = false;
+      const ws = wsRef.current;
+      if (pcmRef.current) {
+        const capture = pcmRef.current;
+        pcmRef.current = null;
+        capture.stop();
+      }
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ type: "duplex_stop" }));
+        } catch {
+          /* ignore */
+        }
+      }
+      setSttPartialText("");
+      clearGenerationState();
+      duplexRef.current = false;
+      setDuplex(false);
+      setRecording(false);
+      recordingRef.current = false;
+      clearUserSpeakingEndTimer();
+      setUserSpeaking(false);
+      setInputPlaceholder("说点什么…");
+      setMessages((m) => [
+        ...m,
+        { id: uid(), role: "error", text: "音频设备异常，请重新开启麦克风" },
+      ]);
+    },
+    [clearGenerationState, clearUserSpeakingEndTimer],
+  );
 
   const triggerIntentGestureAction = useCallback((intent: AvatarIntent | null) => {
     if (!intent) return;
@@ -307,10 +477,11 @@ export function useRemChat() {
         emotion,
         action: avatarAction?.action ?? null,
         face: avatarFrame?.face ?? null,
+        turnState,
         source: "server",
-        reason: avatarAction?.action.action ?? "emotion",
+        reason: avatarAction?.action.action ?? turnState,
       }),
-    [avatarAction, avatarFrame, emotion],
+    [avatarAction, avatarFrame, emotion, turnState],
   );
   const avatarIntent = avatarIntentOverride ?? derivedAvatarIntent;
 
@@ -375,14 +546,25 @@ export function useRemChat() {
 
   const startDuplex = useCallback(async () => {
     const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (
+      !ws ||
+      ws.readyState !== WebSocket.OPEN ||
+      startingDuplexRef.current ||
+      pcmRef.current ||
+      recordingRef.current ||
+      duplexRef.current
+    ) {
+      return;
+    }
+    startingDuplexRef.current = true;
     // Local pre-barge-in: stop any queued/playing TTS immediately.
     clearQueue();
     setSttPartialText("");
     void unlockPlayback();
 
+    let stream: MediaStream | null = null;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
@@ -391,27 +573,66 @@ export function useRemChat() {
       });
 
       let pcmSampleRate = 16000;
-      const capture = await startPcmCapture(stream, (pcm16) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          const frame = encodePcmAudioFrame(pcm16, pcmSampleRate);
-          try {
-            ws.send(frame);
-          } catch {
-            // Compatibility fallback for servers that only parse JSON audio_stream.
-            ws.send(
-              JSON.stringify({
-                type: "audio_stream",
-                audio: arrayBufferToBase64(pcm16),
-                sampleRate: pcmSampleRate,
-              }),
-            );
+      micTxStartedAtRef.current = Date.now();
+      micTxFramesRef.current = 0;
+      micTxBytesRef.current = 0;
+      micTxLastRmsRef.current = 0;
+      micTxLastPeakRef.current = 0;
+      micTxMaxRmsRef.current = 0;
+      micTxLastLogAtRef.current = 0;
+      const capture = await startPcmCapture(
+        stream,
+        (pcm16) => {
+          const metrics = measurePcmFrame(pcm16);
+          micTxFramesRef.current += 1;
+          micTxBytesRef.current += pcm16.byteLength;
+          micTxLastRmsRef.current = metrics.rms;
+          micTxLastPeakRef.current = metrics.peak;
+          micTxMaxRmsRef.current = Math.max(micTxMaxRmsRef.current, metrics.rms);
+          const now = Date.now();
+          if (now - micTxLastLogAtRef.current >= MIC_TX_LOG_INTERVAL_MS) {
+            micTxLastLogAtRef.current = now;
+            pushAvatarDevtoolsLog("system", "mic tx", {
+              frames: micTxFramesRef.current,
+              bytes: micTxBytesRef.current,
+              rms: Number(metrics.rms.toFixed(4)),
+              peak: Number(metrics.peak.toFixed(4)),
+              maxRms: Number(micTxMaxRmsRef.current.toFixed(4)),
+              wsOpen: ws.readyState === WebSocket.OPEN,
+            });
           }
-        }
-      });
+          if (ws.readyState === WebSocket.OPEN) {
+            const frame = encodePcmAudioFrame(pcm16, pcmSampleRate);
+            try {
+              ws.send(frame);
+            } catch {
+              // Compatibility fallback for servers that only parse JSON audio_stream.
+              ws.send(
+                JSON.stringify({
+                  type: "audio_stream",
+                  audio: arrayBufferToBase64(pcm16),
+                  sampleRate: pcmSampleRate,
+                }),
+              );
+            }
+          }
+        },
+        {
+          onStateChange: (state) => {
+            pushAvatarDevtoolsLog("system", "mic context state", { state });
+          },
+          onError: (detail) => {
+            handleMicCaptureFault(detail);
+          },
+        },
+      );
       pcmSampleRate = capture.sampleRate;
 
       pcmRef.current = capture;
       ws.send(JSON.stringify({ type: "duplex_start", sampleRate: capture.sampleRate }));
+      pushAvatarDevtoolsLog("system", "duplex capture start", {
+        sampleRate: capture.sampleRate,
+      });
 
       duplexRef.current = true;
       setDuplex(true);
@@ -419,19 +640,43 @@ export function useRemChat() {
       recordingRef.current = true;
       setInputPlaceholder("全双工语音 — 随时说话…");
     } catch {
+      stream?.getTracks().forEach((track) => track.stop());
+      resumeDuplexAfterReconnectRef.current = false;
+      duplexRef.current = false;
+      setDuplex(false);
+      setRecording(false);
+      recordingRef.current = false;
+      setInputPlaceholder("说点什么…");
       setMessages((m) => [
         ...m,
         { id: uid(), role: "error", text: "无法访问麦克风" },
       ]);
+    } finally {
+      startingDuplexRef.current = false;
     }
-  }, [clearQueue, unlockPlayback]);
+  }, [clearQueue, handleMicCaptureFault, unlockPlayback]);
 
-  const stopVoiceSession = useCallback(() => {
+  const stopVoiceSession = useCallback((options?: { preserveAutoResume?: boolean }) => {
     const ws = wsRef.current;
+    const startedAt = micTxStartedAtRef.current;
+    if (startedAt > 0) {
+      pushAvatarDevtoolsLog("system", "duplex capture stop", {
+        durationMs: Date.now() - startedAt,
+        frames: micTxFramesRef.current,
+        bytes: micTxBytesRef.current,
+        lastRms: Number(micTxLastRmsRef.current.toFixed(4)),
+        lastPeak: Number(micTxLastPeakRef.current.toFixed(4)),
+        maxRms: Number(micTxMaxRmsRef.current.toFixed(4)),
+        preserveAutoResume: options?.preserveAutoResume ?? false,
+      });
+    }
+    micTxStartedAtRef.current = 0;
+    startingDuplexRef.current = false;
     if (pcmRef.current) {
       pcmRef.current.stop();
       pcmRef.current = null;
     }
+    resumeDuplexAfterReconnectRef.current = options?.preserveAutoResume ?? false;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "duplex_stop" }));
     }
@@ -521,6 +766,14 @@ export function useRemChat() {
           { id: uid(), role: "sys", text: "已连接，和 Rem 聊聊吧" },
         ]);
       }
+      if (
+        resumeDuplexAfterReconnectRef.current &&
+        !recordingRef.current &&
+        !pcmRef.current &&
+        !startingDuplexRef.current
+      ) {
+        void startDuplex();
+      }
     };
 
     ws.onmessage = (ev) => {
@@ -534,6 +787,32 @@ export function useRemChat() {
       const t = data.type as string;
 
       switch (t) {
+        case "turn_state": {
+          const nextState = data.state as RemTurnState | undefined;
+          const reason = data.reason as RemTurnStateReason | undefined;
+          const preview =
+            typeof data.preview === "string" && data.preview.trim()
+              ? data.preview.trim()
+              : null;
+          const nextInterruptionType =
+            data.interruptionType === "continuation" ||
+            data.interruptionType === "correction" ||
+            data.interruptionType === "topic_switch" ||
+            data.interruptionType === "emotional_interrupt" ||
+            data.interruptionType === "unknown"
+              ? (data.interruptionType as InterruptionType)
+              : null;
+          if (nextState && reason) {
+            commitTurnState(nextState, reason, {
+              preview,
+              interruptionType: nextInterruptionType,
+              generationId: parseGenerationId(data.generationId),
+              kind: "ws",
+            });
+          }
+          break;
+        }
+
         case "emotion":
           if (data.emotion != null) {
             const nextEmotion = String(data.emotion);
@@ -544,6 +823,12 @@ export function useRemChat() {
 
         case "chat_chunk":
           if (!allowServerGeneration("chat_chunk", data.generationId)) break;
+          if (!streamingBufRef.current) {
+            commitTurnState("assistant_entering", "tts_prepare", {
+              generationId: parseGenerationId(data.generationId),
+              kind: "ws",
+            });
+          }
           setSttPartialText("");
           setTyping(false);
           appendStreaming(String(data.content ?? ""));
@@ -567,6 +852,10 @@ export function useRemChat() {
             activeGenerationRef.current = null;
           }
           if (data.emotion != null) setEmotion(String(data.emotion));
+          commitTurnState("confirmed_end", "confirmed_end", {
+            generationId: endGenerationId,
+            kind: "ws",
+          });
           break;
         }
 
@@ -574,6 +863,10 @@ export function useRemChat() {
           if (!allowServerGeneration("voice", data.generationId)) break;
           if (typeof data.audio === "string") {
             const generationId = parseGenerationId(data.generationId);
+            commitTurnState("assistant_speaking", "playback_start", {
+              generationId,
+              kind: "ws",
+            });
             enqueueBase64(data.audio, generationId);
             if (rememberLoggedVoiceGeneration(generationId)) {
               pushAvatarDevtoolsLog("ws", "voice start", {
@@ -590,6 +883,10 @@ export function useRemChat() {
           if (typeof data.audio === "string") {
             const rate = Number(data.sampleRate);
             const generationId = parseGenerationId(data.generationId);
+            commitTurnState("assistant_speaking", "playback_start", {
+              generationId,
+              kind: "ws",
+            });
             enqueuePcmChunk(
               data.audio,
               Number.isFinite(rate) && rate > 0 ? rate : 24000,
@@ -678,6 +975,24 @@ export function useRemChat() {
           break;
         }
 
+        case "stt_prediction": {
+          const preview =
+            typeof data.preview === "string" && data.preview.trim()
+              ? data.preview.trim()
+              : null;
+          sttPredictionPreviewRef.current = preview;
+          setSttPredictionPreview(preview);
+          mergeAvatarRuntimeSnapshot({
+            ts: Date.now(),
+            sttPredictionPreview: preview,
+          });
+          pushAvatarDevtoolsLog("ws", "stt prediction", {
+            status: data.status,
+            preview,
+          });
+          break;
+        }
+
         /* ── Full-duplex events ── */
 
         case "interrupt": {
@@ -691,8 +1006,17 @@ export function useRemChat() {
           clearQueue();
           clearAvatarIntentSchedule();
           setAvatarIntentOverride(null);
+          sttPredictionPreviewRef.current = null;
+          setSttPredictionPreview(null);
           resetStreaming();
           setTyping(false);
+          interruptionTypeRef.current = "unknown";
+          setInterruptionType("unknown");
+          commitTurnState("interrupted_by_user", "user_interrupt", {
+            interruptionType: "unknown",
+            generationId: interruptedGeneration,
+            kind: "ws",
+          });
           pushAvatarDevtoolsLog("ws", "interrupt", {
             generationId: interruptedGeneration,
           });
@@ -704,6 +1028,9 @@ export function useRemChat() {
           setSttPartialText((prev) => (isListeningFallbackText(prev) ? "" : prev));
           setUserSpeaking(true);
           setInputPlaceholder("正在听…");
+          commitTurnState("listening_active", "speech_start", {
+            kind: "ws",
+          });
           break;
 
         case "vad_end":
@@ -715,6 +1042,9 @@ export function useRemChat() {
               setInputPlaceholder("全双工语音 — 随时说话…");
             }
           }, USER_SPEAKING_END_DEBOUNCE_MS);
+          commitTurnState("listening_hold", "semantic_hold", {
+            kind: "ws",
+          });
           break;
 
         case "stt_partial": {
@@ -724,8 +1054,8 @@ export function useRemChat() {
             if (isListeningFallbackText(partial)) {
               return isListeningFallbackText(prev) ? "" : prev;
             }
-            return partial;
-          });
+              return partial;
+            });
           break;
         }
 
@@ -742,6 +1072,9 @@ export function useRemChat() {
             setWaiting(true);
           }
           setTyping(true);
+          commitTurnState("confirmed_end", "confirmed_end", {
+            kind: "ws",
+          });
           break;
         }
 
@@ -769,8 +1102,8 @@ export function useRemChat() {
     ws.onclose = () => {
       window.clearTimeout(connectTimer);
       if (!mountedRef.current) return;
-
-      stopVoiceSession();
+      const shouldResumeDuplex = recordingRef.current || duplexRef.current;
+      stopVoiceSession({ preserveAutoResume: shouldResumeDuplex });
 
       setConnected(false);
       setConnectionPhase("closed");
@@ -782,6 +1115,10 @@ export function useRemChat() {
       clearAvatarIntentSchedule();
       setAvatarIntentOverride(null);
       setSttPartialText("");
+      sttPredictionPreviewRef.current = null;
+      setSttPredictionPreview(null);
+      interruptionTypeRef.current = null;
+      setInterruptionType(null);
       resetStreaming();
       setTyping(false);
       const quiet = suppressDisconnectSysMsgRef.current;
@@ -820,10 +1157,17 @@ export function useRemChat() {
       if (reconnectRef.current) clearTimeout(reconnectRef.current);
       wsRef.current?.close();
     };
-  }, [allowServerGeneration, appendStreaming, appendUserTranscript, blockGeneration, clearAvatarIntentSchedule, clearGenerationState, clearQueue, clearUserSpeakingEndTimer, enqueueBase64, enqueuePcmChunk, mergeIntentBeat, parseGenerationId, resetStreaming, stopVoiceSession, triggerIntentGestureAction]);
+  }, [allowServerGeneration, appendStreaming, appendUserTranscript, blockGeneration, clearAvatarIntentSchedule, clearGenerationState, clearQueue, clearUserSpeakingEndTimer, enqueueBase64, enqueuePcmChunk, mergeIntentBeat, parseGenerationId, resetStreaming, startDuplex, stopVoiceSession, triggerIntentGestureAction]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
+    const persisted = loadPersistedMessages();
+    setMessages((current) => (current.length === 0 ? persisted : [...persisted, ...current]));
+    setMessagesHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    if (!messagesHydrated || typeof window === "undefined") return;
     const persist = messages
       .filter((m) => m.role === "user" || m.role === "rem")
       .slice(-MESSAGE_STORAGE_MAX);
@@ -832,7 +1176,7 @@ export function useRemChat() {
     } catch {
       /* quota or private mode */
     }
-  }, [messages]);
+  }, [messages, messagesHydrated]);
 
   /* ── Text chat ── */
 
@@ -853,6 +1197,16 @@ export function useRemChat() {
       clearAvatarIntentSchedule();
       setAvatarIntentOverride(null);
       setSttPartialText("");
+      sttPredictionPreviewRef.current = null;
+      setSttPredictionPreview(null);
+      interruptionTypeRef.current = null;
+      setInterruptionType(null);
+      commitTurnState("confirmed_end", "confirmed_end", {
+        preview: null,
+        interruptionType: null,
+        generationId: interruptedGeneration,
+        kind: "system",
+      });
       setMessages((m) => [...m, { id: uid(), role: "user", text: trimmed }]);
       pushAvatarDevtoolsLog("system", "chat send", {
         interruptedGeneration,
@@ -864,11 +1218,14 @@ export function useRemChat() {
       setTyping(true);
       resetStreaming();
     },
-    [blockGeneration, clearAvatarIntentSchedule, clearQueue, resetStreaming, unlockPlayback],
+    [blockGeneration, clearAvatarIntentSchedule, clearQueue, commitTurnState, resetStreaming, unlockPlayback],
   );
 
   return {
     emotion,
+    turnState,
+    sttPredictionPreview,
+    interruptionType,
     avatarFrame,
     avatarIntent,
     connected,

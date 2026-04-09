@@ -7,6 +7,7 @@ import type {
   AvatarIntentGesture,
   Emotion,
 } from "../avatar/types";
+import { asEmotion, asGesture, asFacialAccent, clampBand, clampMs } from "../avatar/utils";
 
 const logger = createLogger("avatar-intent-agent");
 
@@ -67,63 +68,6 @@ function parseJsonObject(raw: string): Record<string, unknown> | null {
   }
 }
 
-function asEmotion(value: unknown, fallback: Emotion): Emotion {
-  return value === "happy" ||
-    value === "curious" ||
-    value === "shy" ||
-    value === "sad" ||
-    value === "neutral"
-    ? value
-    : fallback;
-}
-
-function asGesture(value: unknown, fallback: AvatarIntentGesture): AvatarIntentGesture {
-  switch (value) {
-    case "happy_hop":
-    case "nod":
-    case "shake_head":
-    case "wave":
-    case "tilt_head":
-    case "shrug":
-    case "lean_in":
-    case "recoil":
-    case "shrink_in":
-    case "none":
-      return value;
-    default:
-      return fallback;
-  }
-}
-
-function asFacialAccent(
-  value: unknown,
-  fallback: AvatarIntentFacialAccent,
-): AvatarIntentFacialAccent {
-  switch (value) {
-    case "brow_furrow":
-    case "brow_raise":
-    case "soft_smile":
-    case "sad_mouth":
-    case "none":
-      return value;
-    default:
-      return fallback;
-  }
-}
-
-function clampBand(value: unknown, fallback: 0 | 1 | 2 | 3): 0 | 1 | 2 | 3 {
-  if (value === 0 || value === 1 || value === 2 || value === 3) return value;
-  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
-  if (value <= 0) return 0;
-  if (value <= 1) return 1;
-  if (value <= 2) return 2;
-  return 3;
-}
-
-function clampMs(value: unknown, fallback: number, min: number, max: number): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
-  return Math.max(min, Math.min(max, Math.round(value)));
-}
 
 function fallbackIntent(text: string, emotion: Emotion): AvatarIntentEnvelope {
   const hasSurprisedCue = /眼睛|亮起来|忽然|惊讶|诶|欸|哎呀/.test(text);

@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "@/types/chat";
+import type { RemTurnState } from "@/types/avatar";
 import { MessageBubble } from "@/components/MessageBubble";
 
 export type ChatWindowProps = {
@@ -11,7 +12,28 @@ export type ChatWindowProps = {
   listeningHint: boolean;
   /** STT 结束或发送消息后、首 token 到达前 */
   thinkingHint: boolean;
+  turnState: RemTurnState;
 };
+
+function getTurnStateLabel(turnState: RemTurnState): string | null {
+  switch (turnState) {
+    case "listening_active":
+      return "听着";
+    case "listening_hold":
+      return "还在听";
+    case "likely_end":
+      return "准备回应";
+    case "confirmed_end":
+      return "准备回复";
+    case "assistant_entering":
+      return "开口中";
+    case "interrupted_by_user":
+      return "被打断";
+    case "assistant_speaking":
+    default:
+      return null;
+  }
+}
 
 export function ChatWindow({
   messages,
@@ -19,6 +41,7 @@ export function ChatWindow({
   streamingText,
   listeningHint,
   thinkingHint,
+  turnState,
 }: ChatWindowProps) {
   const scrollerRef = useRef<HTMLDivElement>(null);
   const prevStreamingRef = useRef("");
@@ -55,7 +78,16 @@ export function ChatWindow({
     }
   }, [streamingText]);
 
-  const responseBusy = thinkingHint || Boolean(streamingText);
+  const statusLabel = getTurnStateLabel(turnState);
+  const responseBusy =
+    Boolean(streamingText) ||
+    (thinkingHint &&
+      turnState !== "listening_active" &&
+      turnState !== "listening_hold") ||
+    turnState === "likely_end" ||
+    turnState === "confirmed_end" ||
+    turnState === "assistant_entering" ||
+    turnState === "interrupted_by_user";
 
   return (
     <section className="flex min-h-0 flex-1 flex-col bg-transparent">
@@ -69,8 +101,18 @@ export function ChatWindow({
         aria-live="off"
         aria-busy={responseBusy}
         tabIndex={0}
-        className="flex flex-1 flex-col gap-3 overflow-y-auto px-3 py-3 outline-none min-[480px]:px-4 min-[480px]:py-4 sm:px-5 sm:py-5 focus-visible:ring-2 focus-visible:ring-[var(--rem-accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-transparent"
+        className="flex flex-1 flex-col gap-2 overflow-y-auto px-3 py-3 outline-none min-[480px]:px-4 min-[480px]:py-4 sm:px-5 sm:py-5 focus-visible:ring-2 focus-visible:ring-[var(--rem-accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-transparent"
       >
+        {statusLabel ? (
+          <div className="flex justify-start px-1 pb-1">
+            <div
+              role="status"
+              className="rounded-full border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[11px] text-[var(--rem-dim)] backdrop-blur-md"
+            >
+              {statusLabel}
+            </div>
+          </div>
+        ) : null}
         {messages.map((m) => (
           <MessageBubble key={m.id} role={m.role}>
             {m.text}
@@ -79,29 +121,8 @@ export function ChatWindow({
         {sttPartialText ? (
           <MessageBubble role="partial">{sttPartialText}</MessageBubble>
         ) : null}
-        {listeningHint ? (
-          <div
-            role="status"
-            className="flex max-w-[85%] flex-wrap items-center gap-2 self-start rounded-2xl rounded-bl-md border border-white/10 bg-white/[0.05] px-4 py-3 text-sm text-[var(--rem-dim)] backdrop-blur-md"
-          >
-            <span>正在听你说…</span>
-          </div>
-        ) : null}
         {streamingText ? (
           <MessageBubble role="rem">{streamingText}</MessageBubble>
-        ) : null}
-        {thinkingHint ? (
-          <div
-            role="status"
-            className="rem-thinking-bubble flex max-w-[85%] flex-wrap items-center gap-2 self-start rounded-2xl rounded-bl-md border border-white/12 bg-[var(--rem-bubble-rem)] px-4 py-3 text-sm text-[var(--foreground)] backdrop-blur-md dark:border-white/10"
-          >
-            <span className="text-[var(--rem-dim)]">Rem 在想…</span>
-            <span className="flex gap-1.5" aria-hidden>
-              <span className="rem-typing-dot h-1.5 w-1.5 rounded-full bg-[var(--rem-accent)]" />
-              <span className="rem-typing-dot h-1.5 w-1.5 rounded-full bg-[var(--rem-accent)]" />
-              <span className="rem-typing-dot h-1.5 w-1.5 rounded-full bg-[var(--rem-accent)]" />
-            </span>
-          </div>
         ) : null}
       </div>
     </section>

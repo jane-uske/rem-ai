@@ -16,12 +16,14 @@ import type {
   AvatarModelPreset,
   LipSignal,
   RemState,
+  RemTurnState,
 } from "@/types/avatar";
 import type { VrmViewerState } from "@/lib/rem3d/vrmViewer";
 
 export type Rem3DAvatarProps = {
   emotion: string;
   remState?: RemState;
+  turnState?: RemTurnState;
   avatarIntent?: AvatarIntent | null;
   avatarFrame?: AvatarFrameState | null;
   actionSignal?: { action: AvatarActionCommand; nonce: number } | null;
@@ -37,6 +39,7 @@ export type Rem3DAvatarProps = {
 export function Rem3DAvatar({
   emotion,
   remState = "idle",
+  turnState = "confirmed_end",
   avatarIntent = null,
   avatarFrame = null,
   actionSignal = null,
@@ -95,6 +98,10 @@ export function Rem3DAvatar({
   useEffect(() => {
     runtimeRef.current?.setState(remState);
   }, [remState]);
+
+  useEffect(() => {
+    runtimeRef.current?.setTurnState(turnState);
+  }, [turnState]);
 
   useEffect(() => {
     runtimeRef.current?.setIntent(avatarIntent);

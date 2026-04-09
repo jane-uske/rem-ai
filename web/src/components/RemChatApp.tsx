@@ -11,7 +11,7 @@ import {
   type RemConnectionPhase,
 } from "@/hooks/useRemChat";
 import { getEmotionLabel } from "@/lib/emotionLabels";
-import type { RemState } from "@/types/avatar";
+import type { RemState, RemTurnState } from "@/types/avatar";
 
 const Rem3DAvatar = dynamic(
   () =>
@@ -67,6 +67,27 @@ function remConnectionDotClass(
   }
 }
 
+function remStateFromTurnState(
+  turnState: RemTurnState,
+  voiceActive: boolean,
+  busy: boolean,
+): RemState {
+  switch (turnState) {
+    case "listening_active":
+    case "listening_hold":
+      return "listening";
+    case "assistant_speaking":
+      return "speaking";
+    case "likely_end":
+    case "confirmed_end":
+    case "assistant_entering":
+    case "interrupted_by_user":
+      return busy ? "thinking" : "idle";
+    default:
+      return voiceActive ? "speaking" : "idle";
+  }
+}
+
 export function RemChatApp() {
   const {
     emotion,
@@ -76,6 +97,7 @@ export function RemChatApp() {
     connectionPhase,
     reconnectInSec,
     messages,
+    turnState,
     sttPartialText,
     streamingText,
     typing,
@@ -95,11 +117,7 @@ export function RemChatApp() {
   const [showDevtools, setShowDevtools] = useState(false);
   const remState: RemState = userSpeaking || recording
     ? "listening"
-    : voiceActive
-      ? "speaking"
-      : typing || waiting
-        ? "thinking"
-        : "idle";
+    : remStateFromTurnState(turnState, voiceActive, typing || waiting);
 
   const inputDisabled = !connected || recording;
   const micDisabled = !connected || !hasMic;
@@ -127,6 +145,7 @@ export function RemChatApp() {
             <Rem3DAvatar
               emotion={emotion}
               remState={remState}
+              turnState={turnState}
               avatarIntent={avatarIntent}
               avatarFrame={avatarFrame}
               actionSignal={avatarAction}
@@ -143,13 +162,14 @@ export function RemChatApp() {
         </section>
 
         <aside className="rem-chat-panel rem-glass-edge flex min-h-0 w-full min-w-0 flex-1 flex-col border-t lg:w-[min(100%,clamp(320px,42vw,440px))] lg:max-w-[min(100%,440px)] lg:flex-none lg:border-l lg:border-t-0 lg:pt-14">
-          <ChatWindow
-            messages={messages}
-            sttPartialText={sttPartialText}
-            streamingText={streamingText}
-            listeningHint={listeningHint}
-            thinkingHint={thinkingHint}
-          />
+            <ChatWindow
+              messages={messages}
+              sttPartialText={sttPartialText}
+              streamingText={streamingText}
+              listeningHint={listeningHint}
+              thinkingHint={thinkingHint}
+              turnState={turnState}
+            />
           <div className="shrink-0 border-t border-white/10 bg-transparent p-2 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:p-4 dark:border-white/5">
             <InputBar
               onSend={sendText}

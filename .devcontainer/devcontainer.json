@@ -1,0 +1,26 @@
+{
+  "name": "rem-ai",
+  "dockerComposeFile": [
+    "../docker-compose.dev.yml"
+  ],
+  "service": "app-dev",
+  "workspaceFolder": "/workspace/rem-ai",
+  "shutdownAction": "stopCompose",
+  "runServices": [
+    "postgres",
+    "redis"
+  ],
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "sh"
+      },
+      "extensions": [
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "ms-vscode.vscode-typescript-next"
+      ]
+    }
+  },
+  "postCreateCommand": "npm install && npm install --prefix web"
+}

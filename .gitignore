@@ -4,6 +4,7 @@
 /web/.next
 /web/.next-dev
 .env
+.cloudflared
 .DS_Store
 *.log
 *.tmp

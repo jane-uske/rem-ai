@@ -137,9 +137,19 @@ function stripEmojiForTts(text: string): string {
   );
 }
 
-function normalizeTtsText(raw: string): string {
+function stripDecorativeTailForTts(text: string): string {
+  return text
+    .replace(/\p{Mark}+/gu, "")
+    .replace(/([。！？.!?~～]+)\s*[\p{Script=Arabic}\p{Script=Hebrew}\p{Script=Thaana}\p{S}\p{Mark}]+$/gu, "$1")
+    .replace(/[\p{Script=Arabic}\p{Script=Hebrew}\p{Script=Thaana}\p{S}\p{Mark}]+$/gu, "")
+    .trim();
+}
+
+export function normalizeTtsText(raw: string): string {
   const maxChars = Number(process.env.tts_max_chars || 120);
-  const clean = stripEmojiForTts(stripParentheticalStageDirections(raw))
+  const clean = stripDecorativeTailForTts(
+    stripEmojiForTts(stripParentheticalStageDirections(raw)),
+  )
     .replace(/\s+/g, " ")
     .trim();
 

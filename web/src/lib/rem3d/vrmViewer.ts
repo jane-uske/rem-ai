@@ -14,6 +14,7 @@ import type {
   AvatarIntent,
   LipSignal,
   RemState,
+  RemTurnState,
 } from "@/types/avatar";
 
 /** 关闭每帧「归一化骨骼 → 蒙皮」的自动同步，改由我们直接写 raw 骨骼，否则摆好的手臂会被覆盖回 T-pose */
@@ -24,7 +25,10 @@ import {
   mergeExpressionWeights,
   type VrmExpressionWeights,
 } from "./emotionToVrm";
-import { publishAvatarRuntimeSnapshot, pushAvatarDevtoolsLog } from "./devtoolsStore";
+import {
+  mergeAvatarRuntimeSnapshot,
+  pushAvatarDevtoolsLog,
+} from "./devtoolsStore";
 import {
   faceToExpressionWeights,
   lipSyncToExpressionWeights,
@@ -139,6 +143,7 @@ export class RemVrmViewer {
   private gestureT = 0;
   private loopStarted = false;
   private remState: RemState = "idle";
+  private turnState: RemTurnState = "confirmed_end";
   private activeAction: (AvatarActionCommand & { endAtMs: number }) | null = null;
   private currentIntent: AvatarIntent | null = null;
   private currentFrame: AvatarFrameState | null = null;
@@ -466,6 +471,12 @@ export class RemVrmViewer {
 
     const breath = Math.sin(t * 1.35) * 0.024;
     const sway = Math.sin(t * 0.38) * 0.018;
+    const listeningActive = this.turnState === "listening_active";
+    const listeningHold = this.turnState === "listening_hold";
+    const likelyEnd =
+      this.turnState === "likely_end" || this.turnState === "confirmed_end";
+    const entering = this.turnState === "assistant_entering";
+    const preparingToSpeak = likelyEnd || entering;
     const energyFactor =
       this.currentIntent?.energy === 3 ? 1.3
       : this.currentIntent?.energy === 2 ? 1.12
@@ -475,21 +486,48 @@ export class RemVrmViewer {
       this.currentIntent?.gesture === "shrink_in" || this.currentEmotion === "sad"
         ? 1
         : 0;
+    const leanInFactor =
+      this.currentIntent?.gesture === "lean_in" || listeningActive ? 1 : 0;
+    const openUpFactor = preparingToSpeak ? 1 : 0;
+    const tiltFactor =
+      this.currentIntent?.gesture === "tilt_head" || listeningHold ? 1 : 0;
+    const swayFactor =
+      listeningActive ? 0.5
+      : listeningHold ? 0.38
+      : preparingToSpeak ? 0.7
+      : 1;
     if (hips) {
-      hips.rotation.y = sway * energyFactor * (1 - inwardFactor * 0.25);
-      hips.rotation.z = Math.sin(t * 0.31) * 0.012 * energyFactor;
+      hips.rotation.y = sway * energyFactor * swayFactor * (1 - inwardFactor * 0.25);
+      hips.rotation.z =
+        Math.sin(t * 0.31) * 0.012 * energyFactor * (0.75 + swayFactor * 0.25);
+      hips.rotation.x += openUpFactor * 0.012 - inwardFactor * 0.01;
     }
     if (spine) {
-      spine.rotation.x = breath * energyFactor - inwardFactor * 0.045;
-      spine.rotation.y = Math.sin(t * 0.42) * 0.025 * energyFactor;
+      spine.rotation.x =
+        breath * energyFactor -
+        inwardFactor * 0.045 -
+        leanInFactor * 0.036 +
+        openUpFactor * 0.026;
+      spine.rotation.y = Math.sin(t * 0.42) * 0.025 * energyFactor * swayFactor;
+      spine.rotation.z += tiltFactor * -0.024;
     }
     if (chest) {
-      chest.rotation.x = breath * 0.62 * energyFactor - inwardFactor * 0.075;
-      chest.rotation.z = inwardFactor * -0.035;
+      chest.rotation.x =
+        breath * 0.62 * energyFactor -
+        inwardFactor * 0.075 -
+        leanInFactor * 0.048 +
+        openUpFactor * 0.04;
+      chest.rotation.y += preparingToSpeak ? Math.sin(t * 1.8) * 0.014 : 0;
+      chest.rotation.z = inwardFactor * -0.035 + tiltFactor * -0.04;
     }
-    if (neck && inwardFactor > 0) {
-      neck.rotation.x -= 0.038;
-      neck.rotation.z -= 0.018;
+    if (neck) {
+      if (inwardFactor > 0) {
+        neck.rotation.x -= 0.038;
+        neck.rotation.z -= 0.018;
+      }
+      neck.rotation.x += leanInFactor * 0.028 - openUpFactor * 0.012;
+      neck.rotation.z += tiltFactor * -0.05;
+      neck.rotation.y += listeningActive ? Math.sin(t * 1.2) * 0.012 : 0;
     }
 
     if (this.gestureT > 0) {
@@ -534,6 +572,14 @@ export class RemVrmViewer {
       } else if (e === "sad") {
         lr = -0.18;
         rr = -0.18;
+      }
+      if (leanInFactor > 0) {
+        lr += 0.08 * leanInFactor;
+        rr += 0.08 * leanInFactor;
+      }
+      if (openUpFactor > 0) {
+        lr -= 0.08 * openUpFactor;
+        rr += 0.08 * openUpFactor;
       }
       const armWiggle = Math.sin(t * 1.05) * 0.028;
       ruArm.rotation.z = rr + armWiggle;
@@ -624,6 +670,7 @@ export class RemVrmViewer {
     const expressionWeights = mergeExpressionWeights(
       getEmotionExpressionWeights(this.currentEmotion),
       this.getFrameExpressionWeights(),
+      this.getTurnStateExpressionWeights(),
       this.getIntentAccentWeights(),
       this.getActionExpressionWeights(),
       speech.expressions,
@@ -645,6 +692,40 @@ export class RemVrmViewer {
       };
     }
     return null;
+  }
+
+  private getTurnStateExpressionWeights(): VrmExpressionWeights | null {
+    switch (this.turnState) {
+      case "listening_active":
+        return {
+          [VRMExpressionPresetName.Relaxed]: 0.09,
+          [VRMExpressionPresetName.LookUp]: 0.04,
+        };
+      case "listening_hold":
+        return {
+          [VRMExpressionPresetName.Relaxed]: 0.05,
+          [VRMExpressionPresetName.LookDown]: 0.03,
+        };
+      case "likely_end":
+      case "confirmed_end":
+        return {
+          [VRMExpressionPresetName.Relaxed]: 0.06,
+          [VRMExpressionPresetName.Surprised]: 0.04,
+        };
+      case "assistant_entering":
+        return {
+          [VRMExpressionPresetName.Relaxed]: 0.08,
+          [VRMExpressionPresetName.Surprised]: 0.06,
+          [VRMExpressionPresetName.LookUp]: 0.03,
+        };
+      case "interrupted_by_user":
+        return {
+          [VRMExpressionPresetName.Sad]: 0.08,
+          [VRMExpressionPresetName.Angry]: 0.04,
+        };
+      default:
+        return null;
+    }
   }
 
   private getIntentAccentWeights(): VrmExpressionWeights | null {
@@ -692,7 +773,7 @@ export class RemVrmViewer {
     const now = Date.now();
     if (now - this.lastDebugPublishAt < DEBUG_PUBLISH_INTERVAL_MS) return;
     this.lastDebugPublishAt = now;
-    publishAvatarRuntimeSnapshot({
+    mergeAvatarRuntimeSnapshot({
       ts: now,
       emotion: this.currentEmotion,
       remState: this.remState,
@@ -816,6 +897,10 @@ export class RemVrmViewer {
 
   setState(state: RemState): void {
     this.remState = state;
+  }
+
+  setTurnState(state: RemTurnState): void {
+    this.turnState = state;
   }
 
   setIntent(intent: AvatarIntent | null): void {

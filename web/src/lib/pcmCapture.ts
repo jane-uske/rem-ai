@@ -14,38 +14,160 @@ export interface PcmCapture {
   sampleRate: number;
 }
 
+export interface PcmCaptureOptions {
+  onStateChange?: (state: string) => void;
+  onError?: (detail: {
+    reason:
+      | "context-closed"
+      | "context-create-failed"
+      | "context-not-running"
+      | "context-resume-failed"
+      | "processor-error"
+      | "track-ended";
+    state?: string;
+    message?: string;
+  }) => void;
+}
+
 export async function startPcmCapture(
   stream: MediaStream,
   onChunk: (pcm16: ArrayBuffer) => void,
+  options: PcmCaptureOptions = {},
 ): Promise<PcmCapture> {
-  const ctx = new AudioContext();
-  const source = ctx.createMediaStreamSource(stream);
-  await ctx.audioWorklet.addModule(WORKLET_URL);
-  const processor = new AudioWorkletNode(ctx, "rem-pcm-capture-processor", {
-    numberOfInputs: 1,
-    numberOfOutputs: 0,
-    channelCount: 1,
-    channelCountMode: "explicit",
-  });
+  let ctx: AudioContext;
+  try {
+    ctx = new AudioContext();
+  } catch (error) {
+    stream.getTracks().forEach((t) => t.stop());
+    options.onError?.({
+      reason: "context-create-failed",
+      message: error instanceof Error ? error.message : String(error),
+    });
+    throw error instanceof Error ? error : new Error("AudioContext creation failed");
+  }
+  let stopped = false;
+  const tracks = stream.getAudioTracks();
+  const cleanupInitFailure = async () => {
+    for (const track of tracks) {
+      track.removeEventListener("ended", handleTrackEnded);
+    }
+    stream.getTracks().forEach((t) => t.stop());
+    ctx.onstatechange = null;
+    if (ctx.state !== "closed") {
+      try {
+        await ctx.close();
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+  const reportError = (
+    reason:
+      | "context-closed"
+      | "context-not-running"
+      | "context-resume-failed"
+      | "processor-error"
+      | "track-ended",
+    message?: string,
+  ) => {
+    if (stopped) return;
+    options.onError?.({
+      reason,
+      state: String(ctx.state),
+      message,
+    });
+  };
+  const handleTrackEnded = () => reportError("track-ended");
+  for (const track of tracks) {
+    track.addEventListener("ended", handleTrackEnded);
+  }
+
+  if (ctx.state !== "running") {
+    try {
+      await ctx.resume();
+    } catch (error) {
+      reportError(
+        "context-resume-failed",
+        error instanceof Error ? error.message : String(error),
+      );
+      await cleanupInitFailure();
+      throw error instanceof Error ? error : new Error("AudioContext resume failed");
+    }
+  }
+  if (ctx.state !== "running") {
+    reportError("context-resume-failed", `unexpected-state:${ctx.state}`);
+    await cleanupInitFailure();
+    throw new Error(`AudioContext did not enter running state: ${ctx.state}`);
+  }
+
+  ctx.onstatechange = () => {
+    if (stopped) return;
+    const nextState = String(ctx.state);
+    options.onStateChange?.(nextState);
+    if (nextState === "closed") {
+      reportError("context-closed");
+      return;
+    }
+    if (nextState !== "running") {
+      reportError("context-not-running", `unexpected-state:${nextState}`);
+    }
+  };
+
+  let source: MediaStreamAudioSourceNode;
+  let processor: AudioWorkletNode;
+  try {
+    source = ctx.createMediaStreamSource(stream);
+    await ctx.audioWorklet.addModule(WORKLET_URL);
+    processor = new AudioWorkletNode(ctx, "rem-pcm-capture-processor", {
+      numberOfInputs: 1,
+      numberOfOutputs: 0,
+      channelCount: 1,
+      channelCountMode: "explicit",
+    });
+  } catch (error) {
+    reportError("processor-error", error instanceof Error ? error.message : String(error));
+    await cleanupInitFailure();
+    throw error instanceof Error ? error : new Error("Failed to initialize PCM capture");
+  }
   const nativeRate = ctx.sampleRate;
   const state = createResampleState(nativeRate, TARGET_RATE);
 
+  processor.onprocessorerror = () => {
+    reportError("processor-error");
+  };
+
   processor.port.onmessage = (ev: MessageEvent<Float32Array>) => {
     const input = ev.data;
-    if (!input || input.length === 0) return;
+    if (!input || input.length === 0 || stopped) return;
     const filtered = lowPass(input, state);
     const frames = resampleToPcm16(filtered, state);
     for (const frame of frames) onChunk(frame);
   };
 
   source.connect(processor);
+  options.onStateChange?.(String(ctx.state));
 
   return {
     sampleRate: TARGET_RATE,
     stop() {
+      if (stopped) return;
+      stopped = true;
       processor.port.onmessage = null;
-      processor.disconnect();
-      source.disconnect();
+      processor.onprocessorerror = null;
+      ctx.onstatechange = null;
+      try {
+        processor.disconnect();
+      } catch {
+        /* ignore */
+      }
+      try {
+        source.disconnect();
+      } catch {
+        /* ignore */
+      }
+      for (const track of tracks) {
+        track.removeEventListener("ended", handleTrackEnded);
+      }
       stream.getTracks().forEach((t) => t.stop());
       void ctx.close();
     },

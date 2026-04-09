@@ -15,6 +15,11 @@ function normalizeEnvWsUrl(raw: string): string {
   return t;
 }
 
+function browserWsProtocol(): "ws" | "wss" {
+  if (typeof window === "undefined") return "ws";
+  return window.location.protocol === "https:" ? "wss" : "ws";
+}
+
 export function getRemWsUrl(): string {
   const fromEnv = process.env.NEXT_PUBLIC_WS_URL;
   if (typeof fromEnv === "string" && fromEnv.trim() !== "") {
@@ -24,11 +29,12 @@ export function getRemWsUrl(): string {
 
   const hostname = window.location.hostname;
   const port = window.location.port;
+  const protocol = browserWsProtocol();
 
   // Next 单独 dev 常见 3001/3002；后端默认 PORT=3000
   if (port === "3001" || port === "3002") {
-    return `ws://${hostname}:3000/ws`;
+    return `${protocol}://${hostname}:3000/ws`;
   }
 
-  return `ws://${window.location.host}/ws`;
+  return `${protocol}://${window.location.host}/ws`;
 }

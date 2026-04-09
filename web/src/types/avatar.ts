@@ -6,7 +6,10 @@ import type {
   AvatarIntentBeat,
   Emotion,
   FaceParams,
+  InterruptionType,
   LipSyncFrame,
+  RemTurnState,
+  RemTurnStateReason,
   Viseme,
 } from "../../../avatar/types";
 
@@ -30,6 +33,9 @@ export type {
   AvatarIntentFacialAccent,
   AvatarIntentGesture,
   AvatarIntentSource,
+  InterruptionType,
+  RemTurnState,
+  RemTurnStateReason,
 };
 
 export type AvatarFrameState = {
