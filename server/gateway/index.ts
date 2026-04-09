@@ -1,6 +1,7 @@
 import http from "http";
 import path from "path";
 import { parse } from "node:url";
+import crypto from "node:crypto";
 import type { NextUrlWithParsedQuery } from "next/dist/server/request-meta";
 import next from "next";
 import { WebSocketServer, WebSocket } from "ws";
@@ -14,6 +15,8 @@ import { createWsRateLimiter, createRateLimiter } from "../../infra/rate_limiter
 import type { ServerMessage } from "./types";
 
 const logger = createLogger("gateway");
+const ACCESS_COOKIE_NAME = "rem_access";
+const ACCESS_LOGIN_PATH = "/__access/login";
 
 /** 与 `listen`、传给 Next 的 `port` 一致；可通过环境变量覆盖（见 README `PORT`） */
 export const PORT = (() => {
@@ -60,6 +63,175 @@ function parseRequestUrl(req: IncomingMessage): NextUrlWithParsedQuery {
 
 function requestPathname(req: IncomingMessage): string {
   return parseRequestUrl(req).pathname ?? "/";
+}
+
+function getAccessPassword(): string | null {
+  const raw = process.env.REM_ACCESS_PASSWORD?.trim();
+  return raw ? raw : null;
+}
+
+function hasSharedPasswordGate(): boolean {
+  return !!getAccessPassword();
+}
+
+function parseCookies(req: IncomingMessage): Record<string, string> {
+  const raw = req.headers.cookie;
+  if (!raw) return {};
+  return raw.split(";").reduce<Record<string, string>>((acc, pair) => {
+    const idx = pair.indexOf("=");
+    if (idx <= 0) return acc;
+    const key = pair.slice(0, idx).trim();
+    const value = pair.slice(idx + 1).trim();
+    acc[key] = decodeURIComponent(value);
+    return acc;
+  }, {});
+}
+
+function accessCookieValue(password: string): string {
+  return crypto.createHash("sha256").update(`rem-access:${password}`).digest("hex");
+}
+
+function hasValidAccessCookie(req: IncomingMessage): boolean {
+  const password = getAccessPassword();
+  if (!password) return true;
+  const cookies = parseCookies(req);
+  const actual = cookies[ACCESS_COOKIE_NAME];
+  if (!actual) return false;
+  const expected = accessCookieValue(password);
+  const actualBuf = Buffer.from(actual);
+  const expectedBuf = Buffer.from(expected);
+  if (actualBuf.length !== expectedBuf.length) return false;
+  return crypto.timingSafeEqual(actualBuf, expectedBuf);
+}
+
+function shouldUseSecureCookie(req: IncomingMessage): boolean {
+  const forwardedProto = req.headers["x-forwarded-proto"];
+  if (typeof forwardedProto === "string") {
+    return forwardedProto.split(",")[0].trim() === "https";
+  }
+  return false;
+}
+
+function loginHtml(message?: string): string {
+  const error = message
+    ? `<p style="margin:0;color:#fecaca;font-size:14px;">${message}</p>`
+    : "";
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Rem Access</title>
+    <style>
+      body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0a;color:#f5f5f5;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:24px}
+      .card{width:min(100%,380px);background:#111827;border:1px solid rgba(255,255,255,.08);border-radius:18px;padding:24px;box-shadow:0 16px 50px rgba(0,0,0,.35)}
+      h1{margin:0 0 10px;font-size:24px}
+      p{margin:0 0 16px;color:#cbd5e1;font-size:14px;line-height:1.5}
+      input{width:100%;box-sizing:border-box;border-radius:12px;border:1px solid rgba(255,255,255,.14);background:#030712;color:#fff;padding:12px 14px;font-size:16px}
+      button{margin-top:14px;width:100%;border:0;border-radius:12px;background:#f8fafc;color:#020617;padding:12px 14px;font-size:15px;font-weight:600;cursor:pointer}
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <h1>Rem 访问验证</h1>
+      <p>这个开发预览入口已加本地门禁。输入共享密码后才能继续访问。</p>
+      ${error}
+      <form method="post" action="${ACCESS_LOGIN_PATH}">
+        <input type="password" name="password" placeholder="输入访问密码" autocomplete="current-password" required />
+        <button type="submit">进入</button>
+      </form>
+    </main>
+  </body>
+</html>`;
+}
+
+async function readRequestBody(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function parseFormEncoded(body: string): URLSearchParams {
+  return new URLSearchParams(body);
+}
+
+function loginRedirectTarget(req: IncomingMessage): string {
+  const parsed = parseRequestUrl(req);
+  const returnTo = parsed.query.returnTo;
+  if (typeof returnTo === "string" && returnTo.startsWith("/")) return returnTo;
+  return "/";
+}
+
+function writeAccessCookie(req: IncomingMessage, res: http.ServerResponse, password: string): void {
+  const secure = shouldUseSecureCookie(req) ? "; Secure" : "";
+  res.setHeader(
+    "Set-Cookie",
+    `${ACCESS_COOKIE_NAME}=${accessCookieValue(password)}; Path=/; HttpOnly; SameSite=Lax${secure}`,
+  );
+}
+
+function clearAccessCookie(req: IncomingMessage, res: http.ServerResponse): void {
+  const secure = shouldUseSecureCookie(req) ? "; Secure" : "";
+  res.setHeader(
+    "Set-Cookie",
+    `${ACCESS_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`,
+  );
+}
+
+async function handleAccessLogin(req: IncomingMessage, res: http.ServerResponse): Promise<boolean> {
+  if (!hasSharedPasswordGate()) return false;
+  const pathname = requestPathname(req);
+  if (pathname !== ACCESS_LOGIN_PATH) return false;
+
+  if (req.method === "GET") {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.end(loginHtml());
+    return true;
+  }
+
+  if (req.method === "POST") {
+    const password = getAccessPassword();
+    const body = await readRequestBody(req);
+    const form = parseFormEncoded(body);
+    if (password && form.get("password") === password) {
+      writeAccessCookie(req, res, password);
+      res.statusCode = 303;
+      res.setHeader("Location", loginRedirectTarget(req));
+      res.end();
+      return true;
+    }
+    clearAccessCookie(req, res);
+    res.statusCode = 401;
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.end(loginHtml("密码不正确，请重试。"));
+    return true;
+  }
+
+  res.statusCode = 405;
+  res.end("Method Not Allowed");
+  return true;
+}
+
+function denyWithoutAccessCookie(req: IncomingMessage, res: http.ServerResponse): boolean {
+  if (!hasSharedPasswordGate()) return false;
+  const pathname = requestPathname(req);
+  if (pathname === "/health" || pathname === ACCESS_LOGIN_PATH) return false;
+  if (hasValidAccessCookie(req)) return false;
+
+  if (req.method === "GET" || req.method === "HEAD") {
+    res.statusCode = 303;
+    res.setHeader("Location", `${ACCESS_LOGIN_PATH}?returnTo=${encodeURIComponent(normalizeIncomingUrl(req.url) || "/")}`);
+    res.end();
+    return true;
+  }
+
+  res.statusCode = 401;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify({ error: "Access gate login required" }));
+  return true;
 }
 
 // ── HTTP rate limiter using unified implementation ──
@@ -133,6 +305,10 @@ export async function createGateway(config: GatewayConfig): Promise<HttpServer> 
 
   const server = http.createServer(async (req, res) => {
     try {
+      if (await handleAccessLogin(req, res)) {
+        return;
+      }
+
       // Use Express rate limiter
       // @ts-ignore - Using Express middleware with Node.js http server
       httpRateLimiter(req, res, () => {});
@@ -143,6 +319,24 @@ export async function createGateway(config: GatewayConfig): Promise<HttpServer> 
       }
 
       const { pathname } = parseRequestUrl(req);
+
+      if (pathname === "/health") {
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+        res.setHeader("Cache-Control", "no-store");
+        res.end(
+          JSON.stringify({
+            ok: true,
+            service: "rem-ai",
+            uptimeSec: Math.floor(process.uptime()),
+          }),
+        );
+        return;
+      }
+
+      if (denyWithoutAccessCookie(req, res)) {
+        return;
+      }
 
       if (useAuth && !shouldSkipAuth(pathname ?? "/")) {
         const token = extractAuthToken(req);
@@ -179,6 +373,12 @@ export async function createGateway(config: GatewayConfig): Promise<HttpServer> 
   server.on("upgrade", (req, socket, head) => {
     const pathname = requestPathname(req);
     if (pathname !== "/ws") {
+      socket.destroy();
+      return;
+    }
+
+    if (hasSharedPasswordGate() && !hasValidAccessCookie(req)) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
       socket.destroy();
       return;
     }

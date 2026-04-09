@@ -9,11 +9,13 @@
 - 家里电脑作为唯一开发主机，保存仓库、`.env`、Postgres、Redis。
 - `rem-ai` 主程序默认原生运行在家里电脑上，不放进 Docker。
 - Docker 默认只跑 `postgres` 和 `redis`。
+- 轻量远程开发优先使用 `ttyd + tmux` 浏览器终端，而不是常驻 `code-server`。
 - 浏览器 IDE 跑在家里电脑的 `127.0.0.1:8443`，仅在需要时启动。
 - 对外只暴露 HTTPS 域名，不直接暴露 `3000/5432/6379`。
 - 推荐用 `Cloudflare Tunnel + Cloudflare Access`：
   - `ide-rem.example.com` -> `http://127.0.0.1:8443`
   - `app-rem.example.com` -> `http://127.0.0.1:3000`
+  - `term-rem.example.com` -> `http://127.0.0.1:7681`
 
 ## 本机初始化
 
@@ -70,6 +72,12 @@ npm run web:dev
 npm run dev:web:clean
 ```
 
+如果需要轻量浏览器终端（推荐用于 Codex / Claude Code / tmux）：
+
+```bash
+npm run dev:term
+```
+
 同时启动浏览器 IDE：
 
 ```bash
@@ -103,6 +111,7 @@ npm run dev:web:clean
 ```text
 ide-rem.example.com  -> http://127.0.0.1:8443
 app-rem.example.com  -> http://127.0.0.1:3000
+term-rem.example.com -> http://127.0.0.1:7681
 ```
 
 4. 给 `ide-rem.example.com` 打开 Cloudflare Access，只允许你的邮箱登录。
@@ -136,6 +145,8 @@ npm run tunnel:start
 - 在公司电脑浏览器打开 `https://ide-rem.example.com`。
 - 进入同一个工作区，直接继续使用家里电脑上的代码、终端、Codex、Claude Code。
 - 预览页面在 `https://app-rem.example.com`。
+- 轻量终端入口建议使用 `https://term-rem.example.com`，登录后直接进入 `tmux` 会话 `rem-dev`。
+- 网页终端已使用仓库内 `tmux-web.conf` 优化：前缀改为 `Ctrl+a`，并可用 `F7` 或输入 `tmux copy-mode` 进入滚动模式。
 - `npm run dev` 跑在家里电脑本机；聊天与流式响应走同一域名下的 `/ws`。
 - 如机器发热或卡顿，优先关闭 `code-server`，不要先关 Postgres/Redis。
 
@@ -151,6 +162,13 @@ npm run dev:check
 
 ```bash
 npm run tunnel:start
+```
+
+需要轻量远程终端时：
+
+```bash
+npm run dev:term
+npm run dev:term:check
 ```
 
 ## 验证清单

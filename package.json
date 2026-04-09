@@ -13,6 +13,8 @@
     "dev:native": "./scripts/start-native-dev.sh",
     "dev:web:clean": "./scripts/clean-web-cache.sh",
     "dev:check": "./scripts/check-local-dev.sh",
+    "dev:term": "./scripts/start-web-terminal.sh",
+    "dev:term:check": "./scripts/check-web-terminal.sh",
     "tunnel:start": "./scripts/start-cloudflare-tunnel.sh",
     "restart": "lsof -i :3000 -t | xargs kill 2>/dev/null; sleep 1; nodemon --legacy-watch --watch server --exec ts-node server/server.ts",
     "dev:infra:start": "./scripts/start-dev-stack.sh",
