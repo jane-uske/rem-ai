@@ -9,6 +9,7 @@ import { AvatarController } from "../../avatar/avatar_controller";
 import { createLogger } from "../../infra/logger";
 import { isDbReady } from "../../infra/app_state";
 import { getLatencyTracer, removeLatencyTracer } from "../../infra/latency_tracer";
+import { ensureDevUser } from "../../storage/repositories/dev_identity";
 import { createSession as createDbSession, endSession } from "../../storage/repositories/session_repository";
 import { RemSessionContext } from "../../brains/rem_session_context";
 import { runPipeline } from "../pipeline";
@@ -17,6 +18,21 @@ import { synthesize, isTtsEnabled } from "../../voice/tts_stream";
 import { fastBrainPredictOnly } from "../../brains/fast_brain";
 import { retrieveMemory } from "../../memory/memory_agent";
 import { trimHistoryToTokenBudget } from "../../brains/history_budget";
+import type { InterruptionType, RemTurnState, RemTurnStateReason } from "../../avatar/types";
+import {
+  decideTurnTaking,
+  endsWithSentencePunctuation,
+  evaluateBackchannelDecision,
+  getMeaningfulTurnPreview,
+  isTentativeSpeechText,
+  normalizeSpeechText,
+  shouldSuppressFallbackNoiseUtterance,
+  shouldSuppressStrictNoPreviewUtterance,
+  strongFrameRatio,
+  type TurnTakingState,
+} from "./turn_taking";
+import { buildTurnTimingSnapshot } from "./turn_timing";
+import { buildCarryForwardHint, classifyInterruption } from "./interruption";
 
 const logger = createLogger("session");
 const AUDIO_BIN_MAGIC_V1 = Buffer.from([0x52, 0x41]); // "RA" (legacy)
@@ -111,50 +127,137 @@ function silenceNudgeMs(): number {
   return n;
 }
 
-function endsWithSentencePunctuation(text: string): boolean {
-  return /[。！？.!?]\s*$/.test(text);
-}
-
-function normalizeSpeechText(text: string): string {
-  return text
-    .trim()
-    .replace(/\s+/g, "")
-    .replace(/[，。！？,.!?、；;：“”"'`~·…\-]/g, "");
-}
-
-function isTentativeSpeechText(text: string): boolean {
-  const normalized = normalizeSpeechText(text);
-  if (!normalized) return false;
-
-  if (/^(嗯+|啊+|呃+|额+|唔+|哦+|欸+|诶+|哎+|em+)$/.test(normalized)) {
-    return true;
-  }
-
-  return [
-    "这个",
-    "那个",
-    "等下",
-    "等一下",
-    "等等",
-    "稍等",
-    "我想想",
-    "我想一下",
-    "让我想想",
-    "先想想",
-    "我先想想",
-    "容我想想",
-    "想一下",
-  ].includes(normalized);
-}
-
 function hesitationHoldMs(): number {
   return parseNonNegativeMs(process.env.VAD_UTTERANCE_GAP_HESITATION_MS, 980);
+}
+
+function turnTakingEnabled(): boolean {
+  const raw = (process.env.TURN_TAKING_STAGE2_ENABLED ?? "1").trim().toLowerCase();
+  return raw !== "0" && raw !== "false";
+}
+
+function turnTakingGrowthHoldMs(): number {
+  return parseNonNegativeMs(process.env.TURN_TAKING_GROWTH_HOLD_MS, 720);
+}
+
+function turnTakingLikelyStableMs(): number {
+  return parseNonNegativeMs(process.env.TURN_TAKING_LIKELY_STABLE_MS, 680);
+}
+
+function turnTakingConfirmedStableMs(): number {
+  return parseNonNegativeMs(process.env.TURN_TAKING_CONFIRMED_STABLE_MS, 1100);
+}
+
+function voiceBackchannelEnabled(): boolean {
+  const raw = (process.env.VOICE_BACKCHANNEL_ENABLED ?? "1").trim().toLowerCase();
+  return raw !== "0" && raw !== "false";
+}
+
+function voiceBackchannelCooldownMs(): number {
+  return parseNonNegativeMs(process.env.VOICE_BACKCHANNEL_COOLDOWN_MS, 6000);
+}
+
+function voiceBackchannelStableMs(): number {
+  return parseNonNegativeMs(process.env.VOICE_BACKCHANNEL_STABLE_MS, 1100);
+}
+
+function duplexInterruptMinSpeechMs(): number {
+  return parseNonNegativeMs(process.env.DUPLEX_INTERRUPT_MIN_SPEECH_MS, 260);
+}
+
+function fallbackNoiseSuppressMaxMs(): number {
+  return parseNonNegativeMs(process.env.VAD_FALLBACK_NO_PREVIEW_SUPPRESS_MS, 900);
+}
+
+function fallbackNoiseSuppressMinRms(): number {
+  return parseNonNegativeMs(process.env.VAD_FALLBACK_NO_PREVIEW_MIN_RMS, 0.035);
+}
+
+function fallbackNoiseTinyTextMaxChars(): number {
+  return Math.max(
+    1,
+    Math.floor(parseNonNegativeMs(process.env.VAD_FALLBACK_NO_PREVIEW_TINY_TEXT_MAX_CHARS, 1)),
+  );
+}
+
+function fallbackStrongFrameRms(): number {
+  return parseNonNegativeMs(process.env.VAD_FALLBACK_STRONG_FRAME_RMS, 35) / 1000;
+}
+
+function fallbackStrongFramePeak(): number {
+  return parseNonNegativeMs(process.env.VAD_FALLBACK_STRONG_FRAME_PEAK, 120) / 1000;
+}
+
+function fallbackMinStrongFrames(): number {
+  return Math.max(1, Math.floor(parseNonNegativeMs(process.env.VAD_FALLBACK_MIN_STRONG_FRAMES, 2)));
+}
+
+function fallbackMinStrongRatio(): number {
+  const raw = process.env.VAD_FALLBACK_MIN_STRONG_RATIO;
+  if (raw === undefined || raw === "") return 0.08;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 0.08;
+  return Math.max(0, Math.min(1, n));
+}
+
+function fallbackWeakSpeechSuppressMaxMs(): number {
+  return parseNonNegativeMs(process.env.VAD_FALLBACK_WEAK_SPEECH_SUPPRESS_MS, 1600);
+}
+
+function strictCandidateMinSpeechMs(): number {
+  return parseNonNegativeMs(process.env.VAD_STRICT_CANDIDATE_MIN_SPEECH_MS, 520);
+}
+
+function strictCandidateMinStrongFrames(): number {
+  return Math.max(1, Math.floor(parseNonNegativeMs(process.env.VAD_STRICT_CANDIDATE_MIN_STRONG_FRAMES, 8)));
+}
+
+function strictCandidateMinStrongRatio(): number {
+  const raw = process.env.VAD_STRICT_CANDIDATE_MIN_STRONG_RATIO;
+  if (raw === undefined || raw === "") return 0.22;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 0.22;
+  return Math.max(0, Math.min(1, n));
+}
+
+function suppressedNoiseCooldownMs(): number {
+  return parseNonNegativeMs(process.env.VAD_SUPPRESSED_NOISE_COOLDOWN_MS, 420);
+}
+
+function suppressedNoiseBypassRms(): number {
+  return parseNonNegativeMs(process.env.VAD_SUPPRESSED_NOISE_BYPASS_RMS, 40) / 1000;
+}
+
+function suppressedNoiseBypassPeak(): number {
+  return parseNonNegativeMs(process.env.VAD_SUPPRESSED_NOISE_BYPASS_PEAK, 90) / 1000;
 }
 
 /** 随机选择打断反应音文本 */
 function randomInterruptReaction(): string {
   const reactions = ["啊？", "嗯？", "怎么啦？"];
   return reactions[Math.floor(Math.random() * reactions.length)];
+}
+
+function pcmRms(pcm: Buffer): number {
+  const samples = Math.floor(pcm.length / 2);
+  if (samples <= 0) return 0;
+  let sum = 0;
+  for (let i = 0; i < samples; i++) {
+    const sample = pcm.readInt16LE(i * 2) / 32768;
+    sum += sample * sample;
+  }
+  return Math.sqrt(sum / samples);
+}
+
+function pcmPeak(pcm: Buffer): number {
+  const samples = Math.floor(pcm.length / 2);
+  if (samples <= 0) return 0;
+  let peak = 0;
+  for (let i = 0; i < samples; i++) {
+    const abs = Math.abs(pcm.readInt16LE(i * 2) / 32768);
+    if (abs > peak) peak = abs;
+  }
+  return peak;
 }
 
 export class ConnectionSession {
@@ -212,6 +315,40 @@ export class ConnectionSession {
   private predictionAbort: AbortController | null = null;
   private currentPartialText: string = "";
   private predictedReply: string = "";
+  private turnTakingState: TurnTakingState = "CONFIRMED_END";
+  private lastMeaningfulPartialText = "";
+  private lastMeaningfulPartialAt = 0;
+  private lastMeaningfulGrowthAt = 0;
+  private turnState: RemTurnState = "confirmed_end";
+  private lastPublishedTurnState: RemTurnState | null = null;
+  private lastPublishedTurnReason: RemTurnStateReason | null = null;
+  private turnStateEnteredAt = 0;
+  private lastSpeechStartAt = 0;
+  private lastSpeechEndAt = 0;
+  private lastSttFinalAt = 0;
+  private lastAssistantEnterAt = 0;
+  private lastPlaybackStartAt = 0;
+  private lastInterruptionType: InterruptionType | null = null;
+  private lastBackchannelAt = 0;
+  private backchannelSentThisTurn = false;
+  private pendingDuplexInterrupt = false;
+  private currentSpeechMaxRms = 0;
+  private duplexRxStartedAt = 0;
+  private duplexRxFrames = 0;
+  private duplexRxBytes = 0;
+  private duplexRxLastRms = 0;
+  private duplexRxLastPeak = 0;
+  private duplexRxMaxRms = 0;
+  private duplexRxVadStarts = 0;
+  private duplexRxLastLogAt = 0;
+  private lastVadStartMode: string | null = null;
+  private pendingListeningPromotion = false;
+  private utteranceFrameCount = 0;
+  private utteranceStrongFrames = 0;
+  private utteranceMaxRms = 0;
+  private utteranceMaxPeak = 0;
+  private suppressedNoiseCooldownUntil = 0;
+  private lastSuppressedNoiseLogAt = 0;
 
   constructor(ws: WebSocket) {
     this.connId = randomUUID();
@@ -232,7 +369,8 @@ export class ConnectionSession {
 
     if (isDbReady()) {
       try {
-        const sess = await createDbSession("dev");
+        const devUserId = await ensureDevUser();
+        const sess = await createDbSession(devUserId);
         this.sessionId = sess.id;
         logger.info("[Storage] Session created", { sessionId: this.sessionId });
       } catch (err) {
@@ -295,8 +433,292 @@ export class ConnectionSession {
     this.lastPreviewText = "";
     this.lastPartialEmitAt = 0;
     this.lastPartialContent = "";
+    this.turnTakingState = "CONFIRMED_END";
+    this.lastMeaningfulPartialText = "";
+    this.lastMeaningfulPartialAt = 0;
+    this.lastMeaningfulGrowthAt = 0;
     // 同时取消正在进行的预判
     this.cancelPrediction();
+    this.backchannelSentThisTurn = false;
+    this.pendingDuplexInterrupt = false;
+    this.pendingListeningPromotion = false;
+  }
+
+  private maybeConfirmPendingDuplexInterrupt(): void {
+    if (!this.pendingDuplexInterrupt) return;
+    if (!this.interrupt.active) {
+      this.pendingDuplexInterrupt = false;
+      return;
+    }
+    const speechDurationMs = (this.speechBufferBytes / 2 / this.duplexSampleRate) * 1000;
+    if (speechDurationMs < duplexInterruptMinSpeechMs()) return;
+    this.pendingDuplexInterrupt = false;
+    this.sendInterrupt();
+    this.interrupt.interrupt();
+    logger.info("[VAD] → interrupted pipeline (confirmed duplex speech)", {
+      connId: this.connId,
+      speechMs: Math.round(speechDurationMs),
+    });
+    this.publishTurnState("interrupted_by_user", "user_interrupt", {
+      generationId: this.activeGenerationId ?? undefined,
+      interruptionType: "emotional_interrupt",
+      force: true,
+    });
+  }
+
+  private resetDuplexRxMetrics(): void {
+    this.duplexRxStartedAt = Date.now();
+    this.duplexRxFrames = 0;
+    this.duplexRxBytes = 0;
+    this.duplexRxLastRms = 0;
+    this.duplexRxLastPeak = 0;
+    this.duplexRxMaxRms = 0;
+    this.duplexRxVadStarts = 0;
+    this.duplexRxLastLogAt = 0;
+    this.pendingListeningPromotion = false;
+    this.utteranceFrameCount = 0;
+    this.utteranceStrongFrames = 0;
+    this.utteranceMaxRms = 0;
+    this.utteranceMaxPeak = 0;
+    this.lastVadStartMode = null;
+  }
+
+  private armSuppressedNoiseCooldown(reason: string, mode?: string | null): void {
+    const cooldownMs = suppressedNoiseCooldownMs();
+    if (cooldownMs <= 0) return;
+    this.suppressedNoiseCooldownUntil = Date.now() + cooldownMs;
+    logger.info("[Duplex] noise cooldown armed", {
+      connId: this.connId,
+      reason,
+      mode: mode ?? undefined,
+      cooldownMs,
+    });
+  }
+
+  private logDuplexRxSummary(force = false): void {
+    if (this.duplexRxStartedAt <= 0) return;
+    const now = Date.now();
+    if (!force && now - this.duplexRxLastLogAt < 1000) return;
+    this.duplexRxLastLogAt = now;
+    logger.info("[DuplexRx]", {
+      connId: this.connId,
+      frames: this.duplexRxFrames,
+      bytes: this.duplexRxBytes,
+      durationMs: now - this.duplexRxStartedAt,
+      lastRms: Number(this.duplexRxLastRms.toFixed(4)),
+      lastPeak: Number(this.duplexRxLastPeak.toFixed(4)),
+      maxRms: Number(this.duplexRxMaxRms.toFixed(4)),
+      vadStarts: this.duplexRxVadStarts,
+      speaking: this.vad.speaking,
+    });
+  }
+
+  private resetSpeechConfidenceMetrics(): void {
+    this.utteranceFrameCount = 0;
+    this.utteranceStrongFrames = 0;
+    this.utteranceMaxRms = 0;
+    this.utteranceMaxPeak = 0;
+  }
+
+  private trackSpeechConfidence(rms: number, peak: number): void {
+    this.utteranceFrameCount += 1;
+    this.utteranceMaxRms = Math.max(this.utteranceMaxRms, rms);
+    this.utteranceMaxPeak = Math.max(this.utteranceMaxPeak, peak);
+    if (rms >= fallbackStrongFrameRms() || peak >= fallbackStrongFramePeak()) {
+      this.utteranceStrongFrames += 1;
+    }
+  }
+
+  private hasPromotableSpeechShape(): boolean {
+    return (
+      this.utteranceStrongFrames >= strictCandidateMinStrongFrames() &&
+      strongFrameRatio(this.utteranceFrameCount, this.utteranceStrongFrames) >=
+        strictCandidateMinStrongRatio()
+    );
+  }
+
+  private maybePromoteListeningTurn(speechDurationMs: number): void {
+    if (!this.pendingListeningPromotion) return;
+    if (getMeaningfulTurnPreview(this.lastMeaningfulPartialText || this.lastPreviewText)) {
+      this.pendingListeningPromotion = false;
+      return;
+    }
+    if (speechDurationMs < strictCandidateMinSpeechMs()) return;
+    if (!this.hasPromotableSpeechShape()) return;
+
+    this.pendingListeningPromotion = false;
+    this.turnTakingState = "HOLD";
+    this.publishTurnState("listening_active", "speech_start", { force: true });
+  }
+
+  private publishTurnState(
+    state: RemTurnState,
+    reason: RemTurnStateReason,
+    extras?: {
+      generationId?: number;
+      preview?: string;
+      interruptionType?: InterruptionType | null;
+      force?: boolean;
+    },
+  ): void {
+    const now = Date.now();
+    const preview = extras?.preview?.trim();
+    if (!extras?.force && this.lastPublishedTurnState === state && this.lastPublishedTurnReason === reason) {
+      if (!preview && !extras?.interruptionType) {
+        return;
+      }
+    }
+    const previousState = this.turnState;
+    const previousReason = this.lastPublishedTurnReason;
+    const stateEnteredAt = this.turnStateEnteredAt || now;
+    const timing = buildTurnTimingSnapshot({
+      previousState,
+      nextState: state,
+      reason,
+      nowMs: now,
+      stateEnteredAtMs: stateEnteredAt,
+      speechStartAtMs: this.lastSpeechStartAt || null,
+      speechEndAtMs: this.lastSpeechEndAt || null,
+      sttFinalAtMs: this.lastSttFinalAt || null,
+      assistantEnterAtMs: this.lastAssistantEnterAt || null,
+      playbackStartAtMs: this.lastPlaybackStartAt || null,
+      partialGrowthAtMs: this.lastMeaningfulGrowthAt || null,
+      partialUpdateAtMs: this.lastMeaningfulPartialAt || null,
+    });
+    this.turnState = state;
+    if (previousState !== state || this.turnStateEnteredAt === 0) {
+      this.turnStateEnteredAt = now;
+    }
+    if (state === "assistant_entering") {
+      this.lastAssistantEnterAt = now;
+    } else if (state === "assistant_speaking") {
+      this.lastPlaybackStartAt = now;
+    }
+    this.lastPublishedTurnState = state;
+    this.lastPublishedTurnReason = reason;
+    logger.info("[TurnState]", {
+      connId: this.connId,
+      state,
+      reason,
+      generationId: extras?.generationId,
+      preview: preview || undefined,
+      interruptionType: extras?.interruptionType ?? undefined,
+    });
+    const shouldLogTiming =
+      previousState !== state || previousReason !== reason || extras?.force;
+    if (shouldLogTiming) {
+      logger.info("[TurnTiming]", {
+        connId: this.connId,
+        state,
+        reason,
+        generationId: extras?.generationId,
+        metrics: timing,
+      });
+    }
+    send(this.ws, {
+      type: "turn_state",
+      state,
+      reason,
+      generationId: extras?.generationId,
+      preview: preview || undefined,
+      interruptionType: extras?.interruptionType ?? undefined,
+    });
+  }
+
+  private maybeSendBackchannel(input: {
+    state: TurnTakingState;
+    previewText: string;
+    stableMs: number | null;
+    recentGrowth: boolean;
+    semanticallyComplete: boolean;
+    incompleteTail: boolean;
+  }, generationId?: number): void {
+    if (!voiceBackchannelEnabled()) return;
+    const now = Date.now();
+    const decision = evaluateBackchannelDecision({
+      emotion: this.brain.emotion.getEmotion() as any,
+      state: input.state,
+      previewText: input.previewText,
+      stableMs: input.stableMs,
+      recentGrowth: input.recentGrowth,
+      semanticallyComplete: input.semanticallyComplete,
+      incompleteTail: input.incompleteTail,
+      alreadySentThisTurn: this.backchannelSentThisTurn,
+      cooldownActive: now - this.lastBackchannelAt < voiceBackchannelCooldownMs(),
+      cooldownStableMs: voiceBackchannelStableMs(),
+      minPreviewChars: 6,
+    });
+    if (!decision.allowed) {
+      logger.debug("[Backchannel] suppressed", {
+        connId: this.connId,
+        reason: decision.reason,
+        turnState: input.state,
+        stableMs: input.stableMs ?? 0,
+        preview: getMeaningfulTurnPreview(input.previewText) || undefined,
+      });
+      return;
+    }
+
+    this.backchannelSentThisTurn = true;
+    this.lastBackchannelAt = now;
+    const text = decision.text ?? "嗯";
+    logger.info("[Backchannel] trigger", {
+      connId: this.connId,
+      reason: decision.reason,
+      thinkingPause: decision.thinkingPause,
+      text,
+      generationId,
+    });
+    void synthesize(text, undefined, this.brain.emotion.getEmotion() as any)
+      .then((buf) => {
+        send(this.ws, {
+          type: "voice",
+          audio: buf.toString("base64"),
+          generationId,
+        });
+      })
+      .catch(() => {
+        this.backchannelSentThisTurn = false;
+      });
+  }
+
+  private classifyCarryForward(userText: string): {
+    interruptionType: InterruptionType | null;
+    carryForwardHint?: string;
+  } {
+    const interruptedReply =
+      this.brain.lastInterruptedReply?.trim() ||
+      this.brain.currentAssistantDraft?.trim() ||
+      null;
+    if (!interruptedReply) {
+      this.lastInterruptionType = null;
+      return { interruptionType: null, carryForwardHint: undefined };
+    }
+    const interruptionType = classifyInterruption(userText, interruptedReply);
+    this.lastInterruptionType = interruptionType;
+    return {
+      interruptionType,
+      carryForwardHint: buildCarryForwardHint(
+        interruptionType,
+        interruptedReply,
+      ),
+    };
+  }
+
+  private trackTurnTakingPartial(content: string): void {
+    const preview = getMeaningfulTurnPreview(content);
+    if (!preview) return;
+
+    const normalized = normalizeSpeechText(preview);
+    if (!normalized) return;
+
+    const now = Date.now();
+    const prevNormalized = normalizeSpeechText(this.lastMeaningfulPartialText);
+    if (!this.lastMeaningfulPartialText || normalized !== prevNormalized) {
+      this.lastMeaningfulGrowthAt = now;
+    }
+    this.lastMeaningfulPartialText = preview;
+    this.lastMeaningfulPartialAt = now;
   }
 
   private async runPrediction(text: string): Promise<void> {
@@ -352,6 +774,11 @@ export class ConnectionSession {
     send(this.ws, { type: "stt_partial", content });
     this.lastPartialEmitAt = now;
     this.lastPartialContent = content;
+    this.trackTurnTakingPartial(content);
+    this.pendingListeningPromotion = false;
+    this.publishTurnState("listening_active", "partial_growth", {
+      preview: getMeaningfulTurnPreview(content),
+    });
 
     // 开启预判功能的话，防抖触发预判
     if (this.predictionEnabled && content.trim() && content !== this.currentPartialText) {
@@ -448,6 +875,96 @@ export class ConnectionSession {
       }
     }
     return gap;
+  }
+
+  private resolveTurnTakingDecision(speechDurationMs: number): {
+    state: TurnTakingState;
+    gapMs: number;
+    previewText: string;
+    stableMs: number | null;
+    recentGrowth: boolean;
+    semanticallyComplete: boolean;
+    incompleteTail: boolean;
+  } {
+    const baseGap = this.resolveUtteranceGapMs(speechDurationMs);
+    if (!turnTakingEnabled()) {
+      const preview = getMeaningfulTurnPreview(this.lastMeaningfulPartialText || this.lastPreviewText);
+      this.publishTurnState("confirmed_end", "confirmed_end", {
+        preview,
+      });
+      return {
+        state: "CONFIRMED_END",
+        gapMs: baseGap,
+        previewText: preview,
+        stableMs: null,
+        recentGrowth: false,
+        semanticallyComplete: false,
+        incompleteTail: false,
+      };
+    }
+
+    const releaseMs = parseNonNegativeMs(process.env.VAD_UTTERANCE_GAP_PREVIEW_RELEASE_MS, 60);
+    const minGapMs = parseNonNegativeMs(process.env.VAD_UTTERANCE_GAP_PREVIEW_MIN_MS, 80);
+    const decision = decideTurnTaking({
+      baseGapMs: baseGap,
+      previewText: this.lastMeaningfulPartialText || this.lastPreviewText,
+      nowMs: Date.now(),
+      lastPartialUpdateAt: this.lastMeaningfulPartialAt,
+      lastGrowthAt: this.lastMeaningfulGrowthAt,
+      hesitationHoldMs: hesitationHoldMs(),
+      growthHoldMs: turnTakingGrowthHoldMs(),
+      likelyStableMs: turnTakingLikelyStableMs(),
+      confirmedStableMs: turnTakingConfirmedStableMs(),
+      releaseMs,
+      minGapMs,
+    });
+
+    this.turnTakingState = decision.state;
+    logger.info("[TurnTaking] decision", {
+      connId: this.connId,
+      decision: {
+        state: decision.state,
+      },
+      state: decision.state,
+      gapMs: decision.gapMs,
+      speechMs: Math.round(speechDurationMs),
+      previewText: decision.previewText,
+      preview: decision.previewText,
+      reasons: decision.reasons,
+      fallback: decision.usedFallback,
+      stableMs: decision.stableMs ?? undefined,
+      lastPartialUpdateAt: this.lastMeaningfulPartialAt || undefined,
+      lastGrowthAt: this.lastMeaningfulGrowthAt || undefined,
+      recentGrowth: decision.recentGrowth,
+      semanticallyComplete: decision.semanticallyComplete,
+      sentenceClosed: decision.sentenceClosed,
+    });
+
+    this.publishTurnState(
+      decision.state === "CONFIRMED_END"
+        ? "confirmed_end"
+        : decision.state === "LIKELY_END"
+          ? "likely_end"
+          : "listening_hold",
+      decision.state === "CONFIRMED_END"
+        ? "confirmed_end"
+        : decision.state === "LIKELY_END"
+          ? "likely_end"
+          : "semantic_hold",
+      {
+        preview: decision.previewText,
+      },
+    );
+
+    return {
+      state: decision.state,
+      gapMs: decision.gapMs,
+      previewText: decision.previewText ?? "",
+      stableMs: decision.stableMs,
+      recentGrowth: decision.recentGrowth,
+      semanticallyComplete: decision.semanticallyComplete,
+      incompleteTail: decision.incompleteTail,
+    };
   }
 
   private scheduleSttPreview(speechMs: number): void {
@@ -586,6 +1103,11 @@ export class ConnectionSession {
 
   /** Feed accumulated speechBuffer into STT and run pipeline (buffer cleared after feed). */
   private enqueueSttFromSpeechBuffer(): void {
+    const speechDurationMs = (this.speechBufferBytes / 2 / this.duplexSampleRate) * 1000;
+    const turnPreview = this.lastMeaningfulPartialText || this.lastPreviewText;
+    const utteranceMaxRms = this.utteranceMaxRms;
+    const utteranceFrameCount = this.utteranceFrameCount;
+    const utteranceStrongFrames = this.utteranceStrongFrames;
     this.stt.cancelPreview();
     for (const chunk of this.speechBuffer) {
       this.stt.feedPcm(chunk);
@@ -598,6 +1120,43 @@ export class ConnectionSession {
         try {
           const text = await this.stt.endPcm();
           if (!text) return;
+          if (shouldSuppressFallbackNoiseUtterance({
+            vadMode: this.lastVadStartMode,
+            previewText: turnPreview,
+            speechDurationMs,
+            suppressionMaxMs: fallbackNoiseSuppressMaxMs(),
+            utteranceMaxRms,
+            minUtteranceRms: fallbackNoiseSuppressMinRms(),
+            utteranceFrameCount,
+            utteranceStrongFrames,
+            minStrongFrames: fallbackMinStrongFrames(),
+            minStrongRatio: fallbackMinStrongRatio(),
+            recognizedText: text,
+            tinyTextMaxChars: fallbackNoiseTinyTextMaxChars(),
+          }) || shouldSuppressStrictNoPreviewUtterance({
+            vadMode: this.lastVadStartMode,
+            previewText: turnPreview,
+            utteranceFrameCount,
+            utteranceStrongFrames,
+            minStrongFrames: strictCandidateMinStrongFrames(),
+            minStrongRatio: strictCandidateMinStrongRatio(),
+            recognizedText: text,
+          })) {
+            logger.info("[STT] suppress noise utterance", {
+              connId: this.connId,
+              mode: this.lastVadStartMode,
+              speechMs: Math.round(speechDurationMs),
+              utteranceMaxRms: Number(utteranceMaxRms.toFixed(4)),
+              utteranceFrameCount,
+              utteranceStrongFrames,
+              text,
+            });
+            this.pendingVoiceTraceId = null;
+            this.resetPreviewState();
+            this.resetSpeechConfidenceMetrics();
+            this.armSuppressedNoiseCooldown("stt_post_buffer", this.lastVadStartMode);
+            return;
+          }
           if (this.duplexActive && isTentativeSpeechText(text)) {
             logger.info("[STT] suppress tentative duplex utterance", {
               connId: this.connId,
@@ -609,10 +1168,17 @@ export class ConnectionSession {
           }
           const generationId = this.nextGenerationId();
           this.bindActiveGeneration(generationId, traceId, "voice");
+          this.lastSttFinalAt = Date.now();
           getLatencyTracer(this.connId).mark("stt_final", traceId);
           send(this.ws, { type: "stt_final", content: text });
           logger.info(`[用户·语音] ${text}`, { connId: this.connId });
           this.touchUserActivity();
+          const { interruptionType, carryForwardHint } = this.classifyCarryForward(text);
+          this.publishTurnState("assistant_entering", "tts_prepare", {
+            generationId,
+            interruptionType,
+            force: true,
+          });
 
           // 优先使用预判结果，如果存在且匹配
           const hasValidPrediction = this.predictedReply && 
@@ -634,7 +1200,11 @@ export class ConnectionSession {
               this.brain,
               generationId,
               traceId,
-              { pregeneratedReply: this.predictedReply }
+              {
+                pregeneratedReply: this.predictedReply,
+                carryForwardHint,
+                interruptionType: interruptionType ?? undefined,
+              }
             );
           } else {
             logger.debug("[预判] 未命中，走正常生成流程", {
@@ -651,6 +1221,10 @@ export class ConnectionSession {
               this.brain,
               generationId,
               traceId,
+              {
+                carryForwardHint,
+                interruptionType: interruptionType ?? undefined,
+              },
             );
           }
           // 用完清空预判状态
@@ -664,34 +1238,36 @@ export class ConnectionSession {
   }
 
   private setupVadEvents(): void {
-    this.vad.on("speech_start", () => {
-      logger.info("[VAD] speech_start", { connId: this.connId });
+    this.vad.on("speech_start", (meta?: { mode?: string; energy?: number; zcr?: number; crest?: number; activeRatio?: number }) => {
+      this.lastSpeechStartAt = Date.now();
+      this.lastVadStartMode = meta?.mode ?? null;
+      this.resetSpeechConfidenceMetrics();
+      logger.info("[VAD] speech_start", {
+        connId: this.connId,
+        mode: meta?.mode ?? "unknown",
+        energy: meta?.energy !== undefined ? Number(meta.energy.toFixed(4)) : undefined,
+        zcr: meta?.zcr !== undefined ? Number(meta.zcr.toFixed(4)) : undefined,
+        crest: meta?.crest !== undefined ? Number(meta.crest.toFixed(2)) : undefined,
+        activeRatio: meta?.activeRatio !== undefined ? Number(meta.activeRatio.toFixed(3)) : undefined,
+      });
+      this.turnTakingState = "HOLD";
+      if (this.duplexActive) {
+        this.duplexRxVadStarts += 1;
+      }
 
-      const interruptReactionEnabled = process.env.interrupt_reaction !== "0" && isTtsEnabled();
-      if (this.interrupt.active && interruptReactionEnabled) {
-        // 先播放打断反应音，再停止当前播放
-        void synthesize(randomInterruptReaction(), undefined, this.brain.emotion.getEmotion() as any)
-          .then((buf) => {
-            send(this.ws, { type: "voice", audio: buf.toString("base64"), generationId: this.activeGenerationId ?? 0 });
-            // 发送反应音后再通知客户端停止之前的播放
-            this.sendInterrupt();
-          })
-          .catch(() => {
-            // 合成失败直接发中断
-            this.sendInterrupt();
-          });
-        this.interrupt.interrupt();
-        logger.info("[VAD] → interrupted pipeline with reaction", { connId: this.connId });
-      } else {
-        // 没有反应音的情况直接发中断
-        this.sendInterrupt();
-        if (this.interrupt.active) {
-          this.interrupt.interrupt();
-          logger.info("[VAD] → interrupted pipeline", { connId: this.connId });
-        }
+      if (this.interrupt.active) {
+        this.pendingDuplexInterrupt = true;
+        logger.info("[VAD] pending duplex interrupt", {
+          connId: this.connId,
+          minSpeechMs: duplexInterruptMinSpeechMs(),
+        });
       }
 
       this.resetPreviewState();
+      this.pendingListeningPromotion = true;
+      if (this.interrupt.active) {
+        this.pendingDuplexInterrupt = true;
+      }
       this.stt.cancelPcm();
 
       const merging = this.pendingUtteranceTimer !== null;
@@ -718,6 +1294,7 @@ export class ConnectionSession {
     });
 
     this.vad.on("speech_end", () => {
+      this.lastSpeechEndAt = Date.now();
       logger.info("[VAD] speech_end", { connId: this.connId });
       if (this.pendingVoiceTraceId) {
         getLatencyTracer(this.connId).mark("vad_speech_end", this.pendingVoiceTraceId);
@@ -727,13 +1304,69 @@ export class ConnectionSession {
 
       const MIN_SPEECH_MS = minSpeechMs();
       const speechDurationMs = (this.speechBufferBytes / 2 / this.duplexSampleRate) * 1000;
-      const gap = this.resolveUtteranceGapMs(speechDurationMs);
+      if (this.pendingDuplexInterrupt && speechDurationMs >= duplexInterruptMinSpeechMs()) {
+        this.maybeConfirmPendingDuplexInterrupt();
+      } else if (this.pendingDuplexInterrupt && speechDurationMs < duplexInterruptMinSpeechMs()) {
+        logger.info("[VAD] ignore tentative duplex interrupt", {
+          connId: this.connId,
+          speechMs: Math.round(speechDurationMs),
+          minSpeechMs: duplexInterruptMinSpeechMs(),
+        });
+        this.pendingDuplexInterrupt = false;
+      }
+      const turnPreview = this.lastMeaningfulPartialText || this.lastPreviewText;
+      if (shouldSuppressFallbackNoiseUtterance({
+        vadMode: this.lastVadStartMode,
+        previewText: turnPreview,
+        speechDurationMs,
+        suppressionMaxMs: fallbackNoiseSuppressMaxMs(),
+        utteranceMaxRms: this.utteranceMaxRms,
+        minUtteranceRms: fallbackNoiseSuppressMinRms(),
+        utteranceFrameCount: this.utteranceFrameCount,
+        utteranceStrongFrames: this.utteranceStrongFrames,
+        minStrongFrames: fallbackMinStrongFrames(),
+        minStrongRatio: fallbackMinStrongRatio(),
+      }) || shouldSuppressStrictNoPreviewUtterance({
+        vadMode: this.lastVadStartMode,
+        previewText: turnPreview,
+        utteranceFrameCount: this.utteranceFrameCount,
+        utteranceStrongFrames: this.utteranceStrongFrames,
+        minStrongFrames: strictCandidateMinStrongFrames(),
+        minStrongRatio: strictCandidateMinStrongRatio(),
+      }) || (
+        this.lastVadStartMode === "fallback_energy" &&
+        speechDurationMs < fallbackWeakSpeechSuppressMaxMs() &&
+        this.utteranceStrongFrames < fallbackMinStrongFrames()
+      )) {
+        logger.info("[VAD] suppress fallback noise utterance", {
+          connId: this.connId,
+          mode: this.lastVadStartMode,
+          speechMs: Math.round(speechDurationMs),
+          suppressionMaxMs: fallbackNoiseSuppressMaxMs(),
+          weakSpeechSuppressMaxMs: fallbackWeakSpeechSuppressMaxMs(),
+          utteranceFrameCount: this.utteranceFrameCount,
+          strongFrames: this.utteranceStrongFrames,
+          maxRms: Number(this.utteranceMaxRms.toFixed(4)),
+          maxPeak: Number(this.utteranceMaxPeak.toFixed(4)),
+        });
+        this.clearSpeechBuffer();
+        this.resetPreviewState();
+        this.pendingVoiceTraceId = null;
+        this.stt.cancelPcm();
+        this.resetSpeechConfidenceMetrics();
+        this.armSuppressedNoiseCooldown("vad_suppress", this.lastVadStartMode);
+        return;
+      }
+      const turnDecision = this.resolveTurnTakingDecision(speechDurationMs);
+      const { state, gapMs: gap } = turnDecision;
+      this.maybeSendBackchannel(turnDecision);
       logger.debug("[VAD] utterance_gap", {
         connId: this.connId,
+        turnState: state,
         speechMs: Math.round(speechDurationMs),
         gapMs: gap,
         adaptive: process.env.VAD_UTTERANCE_GAP_ADAPTIVE !== "0",
-        preview: this.lastPreviewText || undefined,
+        preview: getMeaningfulTurnPreview(this.lastMeaningfulPartialText || this.lastPreviewText) || undefined,
       });
 
       if (gap <= 0) {
@@ -743,6 +1376,7 @@ export class ConnectionSession {
           this.resetPreviewState();
           this.pendingVoiceTraceId = null;
           this.stt.cancelPcm();
+          this.resetSpeechConfidenceMetrics();
           return;
         }
         this.clearPreviewTimer();
@@ -839,6 +1473,8 @@ export class ConnectionSession {
     this.clearPendingUtteranceTimer();
     this.resetPreviewState();
     this.pendingVoiceTraceId = null;
+    this.lastVadStartMode = null;
+    this.resetDuplexRxMetrics();
     // 启动双工前同步VAD阈值
     this.syncVadSilenceThreshold();
     logger.info(`[Duplex] 已启动`, { connId: this.connId, sampleRate: rate });
@@ -852,8 +1488,56 @@ export class ConnectionSession {
     this.preRollChunks = [];
     this.preRollBytes = 0;
     this.suppressNextSpeechChunk = false;
+    this.lastVadStartMode = null;
+    this.logDuplexRxSummary(true);
+    if (this.duplexRxFrames === 0) {
+      logger.warn("[Duplex] stopped with no audio frames received", {
+        connId: this.connId,
+      });
+    } else if (this.duplexRxVadStarts === 0) {
+      logger.warn("[Duplex] received audio but never triggered VAD", {
+        connId: this.connId,
+        frames: this.duplexRxFrames,
+        bytes: this.duplexRxBytes,
+        maxRms: Number(this.duplexRxMaxRms.toFixed(4)),
+        lastPeak: Number(this.duplexRxLastPeak.toFixed(4)),
+      });
+    }
 
     if (this.speechBuffer.length > 0) {
+      const speechDurationMs = (this.speechBufferBytes / 2 / this.duplexSampleRate) * 1000;
+      const turnPreview = this.lastMeaningfulPartialText || this.lastPreviewText;
+      if (shouldSuppressFallbackNoiseUtterance({
+        vadMode: this.lastVadStartMode,
+        previewText: turnPreview,
+        speechDurationMs,
+        suppressionMaxMs: fallbackNoiseSuppressMaxMs(),
+        utteranceMaxRms: this.utteranceMaxRms,
+        minUtteranceRms: fallbackNoiseSuppressMinRms(),
+        utteranceFrameCount: this.utteranceFrameCount,
+        utteranceStrongFrames: this.utteranceStrongFrames,
+        minStrongFrames: fallbackMinStrongFrames(),
+        minStrongRatio: fallbackMinStrongRatio(),
+      }) || shouldSuppressStrictNoPreviewUtterance({
+        vadMode: this.lastVadStartMode,
+        previewText: turnPreview,
+        utteranceFrameCount: this.utteranceFrameCount,
+        utteranceStrongFrames: this.utteranceStrongFrames,
+        minStrongFrames: strictCandidateMinStrongFrames(),
+        minStrongRatio: strictCandidateMinStrongRatio(),
+      })) {
+        logger.info("[Duplex] suppress fallback noise utterance on stop", {
+          connId: this.connId,
+          mode: this.lastVadStartMode,
+          speechMs: Math.round(speechDurationMs),
+          suppressionMaxMs: fallbackNoiseSuppressMaxMs(),
+        });
+        this.clearSpeechBuffer();
+        this.pendingVoiceTraceId = null;
+        this.stt.cancelPcm();
+        this.armSuppressedNoiseCooldown("duplex_stop_pre_stt", this.lastVadStartMode);
+        return;
+      }
       this.stt.cancelPreview();
       for (const chunk of this.speechBuffer) this.stt.feedPcm(chunk);
       this.clearSpeechBuffer();
@@ -864,6 +1548,41 @@ export class ConnectionSession {
           try {
             const text = await this.stt.endPcm();
             if (!text) return;
+            if (shouldSuppressFallbackNoiseUtterance({
+              vadMode: this.lastVadStartMode,
+              previewText: turnPreview,
+              speechDurationMs,
+              suppressionMaxMs: fallbackNoiseSuppressMaxMs(),
+              utteranceMaxRms: this.utteranceMaxRms,
+              minUtteranceRms: fallbackNoiseSuppressMinRms(),
+              utteranceFrameCount: this.utteranceFrameCount,
+              utteranceStrongFrames: this.utteranceStrongFrames,
+              minStrongFrames: fallbackMinStrongFrames(),
+              minStrongRatio: fallbackMinStrongRatio(),
+              recognizedText: text,
+              tinyTextMaxChars: fallbackNoiseTinyTextMaxChars(),
+            }) || shouldSuppressStrictNoPreviewUtterance({
+              vadMode: this.lastVadStartMode,
+              previewText: turnPreview,
+              utteranceFrameCount: this.utteranceFrameCount,
+              utteranceStrongFrames: this.utteranceStrongFrames,
+              minStrongFrames: strictCandidateMinStrongFrames(),
+              minStrongRatio: strictCandidateMinStrongRatio(),
+              recognizedText: text,
+            })) {
+              logger.info("[STT] suppress fallback noise utterance on duplex stop", {
+                connId: this.connId,
+                mode: this.lastVadStartMode,
+                speechMs: Math.round(speechDurationMs),
+                utteranceMaxRms: Number(this.utteranceMaxRms.toFixed(4)),
+                text,
+              });
+              this.pendingVoiceTraceId = null;
+              this.resetPreviewState();
+              this.resetSpeechConfidenceMetrics();
+              this.armSuppressedNoiseCooldown("duplex_stop_post_stt", this.lastVadStartMode);
+              return;
+            }
             if (this.duplexActive && isTentativeSpeechText(text)) {
               logger.info("[STT] suppress tentative duplex utterance", {
                 connId: this.connId,
@@ -879,6 +1598,12 @@ export class ConnectionSession {
             send(this.ws, { type: "stt_final", content: text });
             logger.info(`[用户·语音] ${text}`, { connId: this.connId });
             this.touchUserActivity();
+            const { interruptionType, carryForwardHint } = this.classifyCarryForward(text);
+            this.publishTurnState("assistant_entering", "tts_prepare", {
+              generationId,
+              interruptionType,
+              force: true,
+            });
             await runPipeline(
               this.ws,
               text,
@@ -888,6 +1613,10 @@ export class ConnectionSession {
               this.brain,
               generationId,
               traceId,
+              {
+                carryForwardHint,
+                interruptionType: interruptionType ?? undefined,
+              },
             );
           } catch (err) {
             logger.warn("[STT]", { error: (err as Error).message, connId: this.connId });
@@ -975,11 +1704,41 @@ export class ConnectionSession {
     const sampleRate = rate > 0 ? rate : this.duplexSampleRate;
     this.duplexSampleRate = sampleRate;
     this.stt.setSampleRate(sampleRate);
+    const rms = pcmRms(pcm);
+    const peak = pcmPeak(pcm);
+    this.duplexRxFrames += 1;
+    this.duplexRxBytes += pcm.length;
+    this.duplexRxLastRms = rms;
+    this.duplexRxLastPeak = peak;
+    this.duplexRxMaxRms = Math.max(this.duplexRxMaxRms, rms);
+    this.logDuplexRxSummary();
 
     this.appendPreRoll(pcm);
+    const now = Date.now();
+    if (
+      !this.vad.speaking &&
+      this.suppressedNoiseCooldownUntil > now &&
+      !getMeaningfulTurnPreview(this.lastMeaningfulPartialText || this.lastPreviewText)
+    ) {
+      if (rms >= suppressedNoiseBypassRms() || peak >= suppressedNoiseBypassPeak()) {
+        this.suppressedNoiseCooldownUntil = 0;
+      } else {
+        if (now - this.lastSuppressedNoiseLogAt > 250) {
+          this.lastSuppressedNoiseLogAt = now;
+          logger.debug("[Duplex] suppressing weak audio during noise cooldown", {
+            connId: this.connId,
+            cooldownRemainingMs: this.suppressedNoiseCooldownUntil - now,
+            rms: Number(rms.toFixed(4)),
+            peak: Number(peak.toFixed(4)),
+          });
+        }
+        return;
+      }
+    }
     this.vad.feed(pcm);
 
     if (this.vad.speaking) {
+      this.trackSpeechConfidence(rms, peak);
       if (this.suppressNextSpeechChunk) {
         this.suppressNextSpeechChunk = false;
       } else {
@@ -987,6 +1746,8 @@ export class ConnectionSession {
       }
 
       const durMs = (this.speechBufferBytes / 2 / sampleRate) * 1000;
+      this.maybePromoteListeningTurn(durMs);
+      this.maybeConfirmPendingDuplexInterrupt();
       this.scheduleSttPreview(durMs);
     }
   }
@@ -1014,14 +1775,22 @@ export class ConnectionSession {
               connId: this.connId,
               text,
             });
+            this.lastSttFinalAt = 0;
             return;
           }
           const generationId = this.nextGenerationId();
           this.bindActiveGeneration(generationId, traceId, "voice");
+          this.lastSttFinalAt = Date.now();
           getLatencyTracer(this.connId).mark("stt_final", traceId);
           send(this.ws, { type: "stt_final", content: text });
           logger.info(`[用户·语音] ${text}`, { connId: this.connId });
           this.touchUserActivity();
+          const { interruptionType, carryForwardHint } = this.classifyCarryForward(text);
+          this.publishTurnState("assistant_entering", "tts_prepare", {
+            generationId,
+            interruptionType,
+            force: true,
+          });
           await runPipeline(
             this.ws,
             text,
@@ -1031,6 +1800,10 @@ export class ConnectionSession {
             this.brain,
             generationId,
             traceId,
+            {
+              carryForwardHint,
+              interruptionType: interruptionType ?? undefined,
+            },
           );
         } catch (err) {
           logger.warn("[STT]", { error: (err as Error).message, connId: this.connId });
@@ -1053,13 +1826,21 @@ export class ConnectionSession {
     if (generationId != null && Number.isFinite(generationId)) {
       const traceId = tracer.findActiveTraceIdByGenerationId(Math.floor(generationId));
       if (traceId) {
+        this.lastPlaybackStartAt = Date.now();
         tracer.mark("playback_start", traceId);
+        this.publishTurnState("assistant_speaking", "playback_start", {
+          generationId: Math.floor(generationId),
+        });
         return;
       }
     }
 
     if (this.activeTraceId) {
+      this.lastPlaybackStartAt = Date.now();
       tracer.mark("playback_start", this.activeTraceId);
+      this.publishTurnState("assistant_speaking", "playback_start", {
+        generationId: this.activeGenerationId ?? undefined,
+      });
     }
   }
 
@@ -1071,6 +1852,10 @@ export class ConnectionSession {
     }
     logger.info(`[用户] ${content}`, { connId: this.connId });
     this.touchUserActivity();
+    if (this.interrupt.active && this.brain.currentAssistantDraft?.trim()) {
+      this.brain.lastInterruptedReply = this.brain.currentAssistantDraft.trim();
+    }
+    const { interruptionType, carryForwardHint } = this.classifyCarryForward(content);
 
     const interruptReactionEnabled = process.env.interrupt_reaction !== "0" && isTtsEnabled();
     if (this.interrupt.active && interruptReactionEnabled) {
@@ -1087,17 +1872,32 @@ export class ConnectionSession {
         });
       this.interrupt.interrupt();
       logger.info("[Chat] → interrupted pipeline with reaction", { connId: this.connId });
+      this.publishTurnState("interrupted_by_user", "user_interrupt", {
+        generationId: this.activeGenerationId ?? undefined,
+        interruptionType: interruptionType ?? "unknown",
+        force: true,
+      });
     } else {
       // 没有反应音的情况直接发中断
       this.sendInterrupt();
       if (this.interrupt.active) {
         this.interrupt.interrupt();
+        this.publishTurnState("interrupted_by_user", "user_interrupt", {
+          generationId: this.activeGenerationId ?? undefined,
+          interruptionType: interruptionType ?? "unknown",
+          force: true,
+        });
       }
     }
 
     const generationId = this.nextGenerationId();
     const traceId = this.createTraceId("text", generationId);
     this.bindActiveGeneration(generationId, traceId, "text");
+    this.publishTurnState("assistant_entering", "tts_prepare", {
+      generationId,
+      interruptionType,
+      force: true,
+    });
 
     this.pipelineChain = this.pipelineChain
       .then(() =>
@@ -1110,6 +1910,10 @@ export class ConnectionSession {
           this.brain,
           generationId,
           traceId,
+          {
+            carryForwardHint,
+            interruptionType: interruptionType ?? undefined,
+          },
         ),
       )
       .catch((err) => logger.error("[pipeline]", { error: err, connId: this.connId }));

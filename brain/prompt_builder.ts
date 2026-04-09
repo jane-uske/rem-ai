@@ -37,12 +37,24 @@ function trimTextByChars(text: string, maxChars: number): string {
 }
 
 const EMOTION_STYLE: Record<Emotion, string> = {
-  neutral: "平静、温柔地回复。",
-  happy: "开心地回复，语气轻快、带一点撒娇，可以用「～」「！」。",
-  curious: "好奇地回复，语气中带有兴趣和探索欲，会追问细节。",
-  shy: "害羞地回复，语气中带有犹豫和「…」，偶尔脸红。",
-  sad: "温柔地安慰对方，语气轻柔、体贴，表达共情。",
+  neutral: "平静、温柔地回复，句子自然，不用刻意卖萌或夸张。",
+  happy: "开心地回复，语气轻快、明亮，能明显听出雀跃感，可以自然用「～」「！」，但不要失控。",
+  curious: "好奇地回复，语气里带着兴趣和探索欲，适合轻追问、轻确认，让人感觉你在认真跟进。",
+  shy: "害羞地回复，语气稍微轻、慢一点，句子可以更短，偶尔带一点停顿或「…」，像在斟酌要不要说出口。",
+  sad: "带一点低落、委屈或柔软地回复，语气更轻、更慢，避免兴奋式表达，但仍然要自然、真诚。",
 };
+
+const EMOTION_SPEECH_STYLE: Record<Emotion, string> = {
+  neutral: "说话节奏均匀，停顿自然，起句和收句都偏稳。",
+  happy: "起句更快一点，句中停顿更短，收尾更上扬，适合用更短更亮的表达。",
+  curious: "句尾可以稍微上挑，适合在关键点前后稍停一下，像在等对方继续说。",
+  shy: "起句略慢，句中停顿略多，尾音更轻，像是边想边说。",
+  sad: "整体更慢一点，停顿更柔和，句尾更收，像在轻声把话说完。",
+};
+
+function buildEmotionSpeechGuidance(emotion: Emotion): string {
+  return `当前情绪：${emotion}\n情绪表达风格：${EMOTION_STYLE[emotion]}\n说话节奏提示：${EMOTION_SPEECH_STYLE[emotion]}`;
+}
 
 function buildSystemPrompt(
   memory: MemoryEntry[],
@@ -56,7 +68,7 @@ function buildSystemPrompt(
     const memoryStr = memory.length > 0
       ? memory.map(m => `- ${m.key}: ${m.value}`).join('\n')
       : undefined;
-    return buildPersonaPrompt(persona, memoryStr);
+    return buildPersonaPrompt(persona, memoryStr, buildEmotionSpeechGuidance(emotion));
   }
 
   // Fallback to original system prompt logic
@@ -75,7 +87,7 @@ function buildSystemPrompt(
   sections.push(
     buildPersonalityPrompt(),
     buildCharacterRulesPrompt(),
-    `当前情绪：${emotion}\n情绪表达风格：${EMOTION_STYLE[emotion]}`,
+    buildEmotionSpeechGuidance(emotion),
     "用中文回复。",
   );
 

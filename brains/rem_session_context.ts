@@ -16,6 +16,8 @@ export class RemSessionContext {
   private slowBrainController: AbortController | null = null;
   /** 最后一次被打断的AI回复内容，用于回答「刚才说到哪了」 */
   lastInterruptedReply: string | null = null;
+  /** 当前正在生成中的 AI 回复草稿，用于打断瞬间承接上下文。 */
+  currentAssistantDraft: string | null = null;
 
   constructor(readonly connId: string) {
     this.emotion = new EmotionRuntime(connId);

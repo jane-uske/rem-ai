@@ -15,12 +15,29 @@ import { isDbReady } from "../../infra/app_state";
 import { getLatencyTracer } from "../../infra/latency_tracer";
 import { saveMessage } from "../../storage/repositories/message_repository";
 import { send } from "../gateway";
+import type { InterruptionType } from "../../avatar/types";
 
 const logger = createLogger("pipeline");
+
+function parseNonNegativeMs(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return n;
+}
+
+function thinkingFillerDelayMs(): number {
+  return parseNonNegativeMs(process.env.REM_THINKING_FILLER_DELAY_MS, 520);
+}
 
 export type RunPipelineOptions = {
   /** 用户久未说话时的主动搭话：不写入 user 消息、不跑慢脑/记忆 */
   silenceNudge?: boolean;
+  /** partial transcript 预判命中时复用提前生成的回复，未命中则留空走正常路径。 */
+  pregeneratedReply?: string;
+  /** 打断承接提示，帮助本轮回复接住上一轮被打断的语义。 */
+  carryForwardHint?: string;
+  interruptionType?: InterruptionType;
 };
 
 export async function runPipeline(
@@ -36,6 +53,7 @@ export async function runPipeline(
 ): Promise<void> {
   const connId = ctx.connId;
   const signal = ic.begin();
+  ctx.currentAssistantDraft = "";
   const latencyTracer = getLatencyTracer(connId);
   const traceContext = options?.silenceNudge
     ? { generationId, source: "silence_nudge" as const }
@@ -65,15 +83,6 @@ export async function runPipeline(
       !options?.silenceNudge &&
       (process.env.rem_thinking_filler === "1" ||
         process.env.REM_THINKING_FILLER === "1");
-    if (thinkingFiller && isTtsEnabled() && !signal.aborted) {
-      void synthesize("嗯", signal, replyEmotion as any)
-        .then((buf) => {
-          if (!signal.aborted) {
-            send(ws, { type: "voice", audio: buf.toString("base64"), generationId });
-          }
-        })
-        .catch(() => {});
-    }
 
     // ── Producer-consumer TTS: synthesize sentences as they stream in ──
 
@@ -104,6 +113,26 @@ export async function runPipeline(
     signal.addEventListener("abort", onAbort, { once: true });
 
     let firstAudioSent = false;
+    let thinkingFillerTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearThinkingFillerTimer = () => {
+      if (thinkingFillerTimer) {
+        clearTimeout(thinkingFillerTimer);
+        thinkingFillerTimer = null;
+      }
+    };
+    if (thinkingFiller && isTtsEnabled() && !signal.aborted) {
+      thinkingFillerTimer = setTimeout(() => {
+        thinkingFillerTimer = null;
+        if (signal.aborted || firstAudioSent) return;
+        void synthesize("嗯", signal, replyEmotion as any)
+          .then((buf) => {
+            if (!signal.aborted && !firstAudioSent) {
+              send(ws, { type: "voice", audio: buf.toString("base64"), generationId });
+            }
+          })
+          .catch(() => {});
+      }, thinkingFillerDelayMs());
+    }
     let ttsError: Error | null = null;
 
     const ttsTask = (async () => {
@@ -128,7 +157,10 @@ export async function runPipeline(
               latencyTracer,
               !firstAudioSent,
             );
-            if (!firstAudioSent) firstAudioSent = true;
+            if (!firstAudioSent) {
+              firstAudioSent = true;
+              clearThinkingFillerTimer();
+            }
           } catch (err) {
             if ((err as Error).name === "AbortError") break;
             logger.warn("[TTS]", { error: (err as Error).message, connId });
@@ -157,16 +189,29 @@ export async function runPipeline(
       text,
       replyEmotion,
       signal,
-      options?.silenceNudge ? { systemTriggered: true } : undefined,
+      options?.silenceNudge
+        ? { systemTriggered: true }
+        : options?.pregeneratedReply
+          ? {
+              pregeneratedReply: options.pregeneratedReply,
+              carryForwardHint: options.carryForwardHint,
+            }
+          : options?.carryForwardHint
+            ? {
+                carryForwardHint: options.carryForwardHint,
+              }
+          : undefined,
     )) {
       if (signal.aborted) break;
 
       if (!firstTokenReceived) {
         firstTokenReceived = true;
         latencyTracer.mark("llm_first_token", traceId);
+        clearThinkingFillerTimer();
       }
 
       full += token;
+      ctx.currentAssistantDraft = full;
       send(ws, { type: "chat_chunk", content: token, generationId });
 
       for (const sentence of chunker.push(token)) {
@@ -213,6 +258,7 @@ export async function runPipeline(
       // 正常完成的话清空上次被打断的内容
       ctx.lastInterruptedReply = null;
     }
+    ctx.currentAssistantDraft = null;
 
     if (isDbReady() && sessionId && full) {
       try {
@@ -247,6 +293,7 @@ export async function runPipeline(
 
     // Wait for TTS consumer to finish
     await ttsTask;
+    clearThinkingFillerTimer();
 
     decayEmotion(ctx.emotion);
 
@@ -258,6 +305,9 @@ export async function runPipeline(
       send(ws, { type: "error", content: "AI 回复生成失败" });
     }
   } finally {
+    if (ctx.currentAssistantDraft !== null) {
+      ctx.currentAssistantDraft = null;
+    }
     ic.finish();
   }
 }
