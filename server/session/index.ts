@@ -10,6 +10,7 @@ import { createLogger } from "../../infra/logger";
 import { isDbReady } from "../../infra/app_state";
 import { getLatencyTracer, removeLatencyTracer } from "../../infra/latency_tracer";
 import { ensureDevUser } from "../../storage/repositories/dev_identity";
+import { getPgMemoryRepository } from "../../storage/repositories/pg_memory_repository";
 import { createSession as createDbSession, endSession } from "../../storage/repositories/session_repository";
 import { RemSessionContext } from "../../brains/rem_session_context";
 import { runPipeline } from "../pipeline";
@@ -19,6 +20,10 @@ import { fastBrainPredictOnly } from "../../brains/fast_brain";
 import { retrieveMemory } from "../../memory/memory_agent";
 import { trimHistoryToTokenBudget } from "../../brains/history_budget";
 import type { InterruptionType, RemTurnState, RemTurnStateReason } from "../../avatar/types";
+import {
+  persistentMemoryOverlayEnabled,
+  persistentMemoryPreloadLimit,
+} from "../../memory/session_memory_overlay";
 import {
   decideTurnTaking,
   endsWithSentencePunctuation,
@@ -68,6 +73,31 @@ function parseNonNegativeMs(raw: string | undefined, fallback: number): number {
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0) return fallback;
   return n;
+}
+
+function parseBooleanFlag(raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined || raw === "") return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "1" || normalized === "true") return true;
+  if (normalized === "0" || normalized === "false") return false;
+  return fallback;
+}
+
+type PredictionBudgetConfig = {
+  enabled: boolean;
+  pushEnabled: boolean;
+  debounceMs: number;
+};
+
+function predictionBudgetConfig(): PredictionBudgetConfig {
+  const enabled = parseBooleanFlag(process.env.STT_PARTIAL_PREDICTION_ENABLED, false);
+  const pushRequested = parseBooleanFlag(process.env.STT_PREDICTION_PUSH_ENABLED, false);
+  return {
+    enabled,
+    // Push 是 prediction 的附属能力，不能单独开启。
+    pushEnabled: enabled && pushRequested,
+    debounceMs: parseNonNegativeMs(process.env.STT_PREDICTION_DEBOUNCE_MS, 300),
+  };
 }
 
 function sttPreviewIntervalMs(): number {
@@ -308,9 +338,10 @@ export class ConnectionSession {
   private readonly VAD_DEFAULT_SILENCE_FRAMES = 10; // 默认静默帧阈值
 
   // --- 增量STT预判相关 --- 
-  private predictionEnabled: boolean = process.env.STT_PARTIAL_PREDICTION_ENABLED === "1";
-  private predictionPushEnabled: boolean = process.env.STT_PREDICTION_PUSH_ENABLED === "1";
-  private predictionDebounceMs: number = parseNonNegativeMs(process.env.STT_PREDICTION_DEBOUNCE_MS, 300);
+  private readonly predictionBudget: PredictionBudgetConfig = predictionBudgetConfig();
+  private predictionEnabled: boolean = this.predictionBudget.enabled;
+  private predictionPushEnabled: boolean = this.predictionBudget.pushEnabled;
+  private predictionDebounceMs: number = this.predictionBudget.debounceMs;
   private predictionTimer: ReturnType<typeof setTimeout> | null = null;
   private predictionAbort: AbortController | null = null;
   private currentPartialText: string = "";
@@ -373,6 +404,19 @@ export class ConnectionSession {
         const sess = await createDbSession(devUserId);
         this.sessionId = sess.id;
         logger.info("[Storage] Session created", { sessionId: this.sessionId });
+
+        if (persistentMemoryOverlayEnabled()) {
+          const persistentRepo = getPgMemoryRepository(devUserId);
+          this.brain.memory.attachPersistent(persistentRepo);
+          void this.brain.memory
+            .hydrateFromPersistent(persistentMemoryPreloadLimit())
+            .then(() => {
+              logger.debug("[Memory] persistent facts hydrated into session overlay", {
+                connId: this.connId,
+                sessionId: this.sessionId,
+              });
+            });
+        }
       } catch (err) {
         logger.warn("[Storage] Failed to create session", { error: err });
       }
@@ -1878,9 +1922,9 @@ export class ConnectionSession {
         force: true,
       });
     } else {
-      // 没有反应音的情况直接发中断
-      this.sendInterrupt();
       if (this.interrupt.active) {
+        // 仅在确有在途 generation 时发送 interrupt，避免把正常 text send 伪装成真实打断。
+        this.sendInterrupt();
         this.interrupt.interrupt();
         this.publishTurnState("interrupted_by_user", "user_interrupt", {
           generationId: this.activeGenerationId ?? undefined,

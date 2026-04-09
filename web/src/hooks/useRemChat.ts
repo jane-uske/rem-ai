@@ -13,6 +13,10 @@ import type {
   RemTurnStateReason,
 } from "@/types/avatar";
 import { useAudioBase64Queue } from "@/hooks/useAudioBase64Queue";
+import {
+  shouldAwaitPlaybackDrain,
+  shouldFinalizeDeferredChatEnd,
+} from "./useRemChatTurnState";
 import { startPcmCapture, type PcmCapture } from "@/lib/pcmCapture";
 import { deriveAvatarIntent } from "@/lib/rem3d/avatarIntent";
 import {
@@ -86,6 +90,7 @@ const USER_SPEAKING_END_DEBOUNCE_MS = 260;
 const STT_FALLBACK_PREFIX = "录音中";
 const STT_USER_MERGE_WINDOW_MS = 2200;
 const MIC_TX_LOG_INTERVAL_MS = 900;
+const CHAT_END_PLAYBACK_GRACE_MS = 220;
 
 function isListeningFallbackText(text: string): boolean {
   return text.startsWith(STT_FALLBACK_PREFIX);
@@ -177,6 +182,12 @@ export function useRemChat() {
   const activeGenerationRef = useRef<number | null>(null);
   const blockedGenerationsRef = useRef<Set<number>>(new Set());
   const loggedVoiceGenerationsRef = useRef<Set<number>>(new Set());
+  const playedGenerationIdsRef = useRef<Set<number>>(new Set());
+  const pendingChatEndRef = useRef<{
+    generationId: number | null;
+    awaitingPlaybackDrain: boolean;
+  } | null>(null);
+  const pendingChatEndTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const turnStateRef = useRef<RemTurnState>("confirmed_end");
   const turnStateMetaRef = useRef<{
     state: RemTurnState;
@@ -283,10 +294,24 @@ export function useRemChat() {
     [],
   );
 
+  const clearPendingChatEnd = useCallback((generationId?: number | null) => {
+    const targetGeneration = generationId ?? pendingChatEndRef.current?.generationId ?? null;
+    pendingChatEndRef.current = null;
+    if (pendingChatEndTimerRef.current) {
+      clearTimeout(pendingChatEndTimerRef.current);
+      pendingChatEndTimerRef.current = null;
+    }
+    if (targetGeneration != null) {
+      playedGenerationIdsRef.current.delete(targetGeneration);
+    }
+  }, []);
+
   const clearGenerationState = useCallback(() => {
     activeGenerationRef.current = null;
     blockedGenerationsRef.current.clear();
-  }, []);
+    playedGenerationIdsRef.current.clear();
+    clearPendingChatEnd();
+  }, [clearPendingChatEnd]);
   const hasAnnouncedConnectedRef = useRef(false);
 
   const clearUserSpeakingEndTimer = useCallback(() => {
@@ -431,6 +456,28 @@ export function useRemChat() {
     return true;
   }, []);
 
+  const rememberPlayedGeneration = useCallback((id: number | null) => {
+    if (id == null) return;
+    const seen = playedGenerationIdsRef.current;
+    seen.add(id);
+    if (seen.size > 48) {
+      const oldest = seen.values().next();
+      if (!oldest.done) seen.delete(oldest.value);
+    }
+  }, []);
+
+  const finalizePendingChatEnd = useCallback(
+    (generationId?: number | null) => {
+      const targetGeneration = generationId ?? pendingChatEndRef.current?.generationId ?? null;
+      clearPendingChatEnd(targetGeneration);
+      commitTurnState("confirmed_end", "confirmed_end", {
+        generationId: targetGeneration,
+        kind: "ws",
+      });
+    },
+    [clearPendingChatEnd, commitTurnState],
+  );
+
   const handlePlaybackStart = useCallback((generationId: number | null) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -502,6 +549,16 @@ export function useRemChat() {
     return () => clearTimeout(timer);
   }, [avatarAction]);
 
+  useEffect(() => {
+    if (!shouldFinalizeDeferredChatEnd({
+      awaitingPlaybackDrain: pendingChatEndRef.current?.awaitingPlaybackDrain ?? false,
+      voiceActive,
+    })) {
+      return;
+    }
+    finalizePendingChatEnd();
+  }, [finalizePendingChatEnd, voiceActive]);
+
   /* ── Streaming text helpers ── */
 
   const appendStreaming = useCallback((chunk: string) => {
@@ -559,6 +616,7 @@ export function useRemChat() {
     startingDuplexRef.current = true;
     // Local pre-barge-in: stop any queued/playing TTS immediately.
     clearQueue();
+    clearPendingChatEnd();
     setSttPartialText("");
     void unlockPlayback();
 
@@ -654,7 +712,7 @@ export function useRemChat() {
     } finally {
       startingDuplexRef.current = false;
     }
-  }, [clearQueue, handleMicCaptureFault, unlockPlayback]);
+  }, [clearPendingChatEnd, clearQueue, handleMicCaptureFault, unlockPlayback]);
 
   const stopVoiceSession = useCallback((options?: { preserveAutoResume?: boolean }) => {
     const ws = wsRef.current;
@@ -852,10 +910,26 @@ export function useRemChat() {
             activeGenerationRef.current = null;
           }
           if (data.emotion != null) setEmotion(String(data.emotion));
-          commitTurnState("confirmed_end", "confirmed_end", {
-            generationId: endGenerationId,
-            kind: "ws",
+          const awaitingPlaybackDrain = shouldAwaitPlaybackDrain({
+            voiceActive,
+            playbackSeenForGeneration:
+              endGenerationId != null && playedGenerationIdsRef.current.has(endGenerationId),
           });
+          pendingChatEndRef.current = {
+            generationId: endGenerationId,
+            awaitingPlaybackDrain,
+          };
+          if (!awaitingPlaybackDrain) {
+            if (pendingChatEndTimerRef.current) {
+              clearTimeout(pendingChatEndTimerRef.current);
+            }
+            pendingChatEndTimerRef.current = setTimeout(() => {
+              if (!pendingChatEndRef.current) return;
+              if (pendingChatEndRef.current.generationId !== endGenerationId) return;
+              if (pendingChatEndRef.current.awaitingPlaybackDrain) return;
+              finalizePendingChatEnd(endGenerationId);
+            }, CHAT_END_PLAYBACK_GRACE_MS);
+          }
           break;
         }
 
@@ -863,6 +937,17 @@ export function useRemChat() {
           if (!allowServerGeneration("voice", data.generationId)) break;
           if (typeof data.audio === "string") {
             const generationId = parseGenerationId(data.generationId);
+            rememberPlayedGeneration(generationId);
+            if (pendingChatEndRef.current?.generationId === generationId) {
+              pendingChatEndRef.current = {
+                generationId,
+                awaitingPlaybackDrain: true,
+              };
+              if (pendingChatEndTimerRef.current) {
+                clearTimeout(pendingChatEndTimerRef.current);
+                pendingChatEndTimerRef.current = null;
+              }
+            }
             commitTurnState("assistant_speaking", "playback_start", {
               generationId,
               kind: "ws",
@@ -883,6 +968,17 @@ export function useRemChat() {
           if (typeof data.audio === "string") {
             const rate = Number(data.sampleRate);
             const generationId = parseGenerationId(data.generationId);
+            rememberPlayedGeneration(generationId);
+            if (pendingChatEndRef.current?.generationId === generationId) {
+              pendingChatEndRef.current = {
+                generationId,
+                awaitingPlaybackDrain: true,
+              };
+              if (pendingChatEndTimerRef.current) {
+                clearTimeout(pendingChatEndTimerRef.current);
+                pendingChatEndTimerRef.current = null;
+              }
+            }
             commitTurnState("assistant_speaking", "playback_start", {
               generationId,
               kind: "ws",
@@ -997,6 +1093,7 @@ export function useRemChat() {
 
         case "interrupt": {
           const interruptedGeneration = parseGenerationId(data.generationId);
+          clearPendingChatEnd(interruptedGeneration);
           if (interruptedGeneration != null) {
             blockGeneration(interruptedGeneration);
           } else {
@@ -1079,6 +1176,7 @@ export function useRemChat() {
         }
 
         case "error": {
+          clearPendingChatEnd();
           clearUserSpeakingEndTimer();
           setUserSpeaking(false);
           setTyping(false);
@@ -1157,7 +1255,7 @@ export function useRemChat() {
       if (reconnectRef.current) clearTimeout(reconnectRef.current);
       wsRef.current?.close();
     };
-  }, [allowServerGeneration, appendStreaming, appendUserTranscript, blockGeneration, clearAvatarIntentSchedule, clearGenerationState, clearQueue, clearUserSpeakingEndTimer, enqueueBase64, enqueuePcmChunk, mergeIntentBeat, parseGenerationId, resetStreaming, startDuplex, stopVoiceSession, triggerIntentGestureAction]);
+  }, [allowServerGeneration, appendStreaming, appendUserTranscript, blockGeneration, clearAvatarIntentSchedule, clearGenerationState, clearPendingChatEnd, clearQueue, clearUserSpeakingEndTimer, enqueueBase64, enqueuePcmChunk, finalizePendingChatEnd, mergeIntentBeat, parseGenerationId, rememberPlayedGeneration, resetStreaming, startDuplex, stopVoiceSession, triggerIntentGestureAction, voiceActive]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -1187,6 +1285,7 @@ export function useRemChat() {
       if (!trimmed || !ws || ws.readyState !== WebSocket.OPEN) return;
       // Sending a new user text should immediately stop current/queued playback.
       clearQueue();
+      clearPendingChatEnd();
       void unlockPlayback();
       const interruptedGeneration = activeGenerationRef.current;
       if (interruptedGeneration != null) {
@@ -1218,7 +1317,7 @@ export function useRemChat() {
       setTyping(true);
       resetStreaming();
     },
-    [blockGeneration, clearAvatarIntentSchedule, clearQueue, commitTurnState, resetStreaming, unlockPlayback],
+    [blockGeneration, clearAvatarIntentSchedule, clearPendingChatEnd, clearQueue, commitTurnState, resetStreaming, unlockPlayback],
   );
 
   return {

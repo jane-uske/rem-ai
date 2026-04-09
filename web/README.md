@@ -16,8 +16,9 @@ npm run web:dev
 |------|------|
 | [docs/FRONTEND_PITFALLS.md](./docs/FRONTEND_PITFALLS.md) | 网关、WebSocket、VRM、布局等踩坑与处理方式 |
 | [VIBE_PLAN.md](./VIBE_PLAN.md) | 前端迭代计划（连接态、情绪 UI 等） |
-| [docs/REM_VRM_WEB_POC.md](./docs/REM_VRM_WEB_POC.md) | Web-first VRM 运行时收口方案 |
-| [docs/REM_VRM_WEB_POC_ACCEPTANCE_2026-04-06.md](./docs/REM_VRM_WEB_POC_ACCEPTANCE_2026-04-06.md) | 本轮 POC 非视觉验收记录 |
+| [docs/REM_3D_TALKING_ARCHITECTURE.md](./docs/REM_3D_TALKING_ARCHITECTURE.md) | 3D 说话层接线与运行时架构 |
+| [docs/REM_3D_TALKING_INTEGRATION_GUIDE.md](./docs/REM_3D_TALKING_INTEGRATION_GUIDE.md) | 3D 说话层接入与联调说明 |
+| [docs/REM_3D_TALKING_ACCEPTANCE_2026-04-05.md](./docs/REM_3D_TALKING_ACCEPTANCE_2026-04-05.md) | 3D 说话线程验收记录 |
 
 ## 技术栈摘要
 

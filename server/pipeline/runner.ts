@@ -30,6 +30,11 @@ function thinkingFillerDelayMs(): number {
   return parseNonNegativeMs(process.env.REM_THINKING_FILLER_DELAY_MS, 520);
 }
 
+function avatarIntentEnabled(): boolean {
+  const raw = (process.env.REM_AVATAR_INTENT_ENABLED ?? "1").trim().toLowerCase();
+  return raw !== "0" && raw !== "false";
+}
+
 export type RunPipelineOptions = {
   /** 用户久未说话时的主动搭话：不写入 user 消息、不跑慢脑/记忆 */
   silenceNudge?: boolean;
@@ -232,12 +237,13 @@ export async function runPipeline(
       chunker.reset();
     }
 
-    const avatarIntentTask =
-      full && !signal.aborted
-        ? inferAvatarIntentFromReply(full, replyEmotion as any, signal)
-            .then((result) => (signal.aborted ? null : result))
-            .catch(() => null)
-        : Promise.resolve(null);
+    const shouldInferAvatarIntent =
+      Boolean(full) && !signal.aborted && avatarIntentEnabled();
+    const avatarIntentTask = shouldInferAvatarIntent
+      ? inferAvatarIntentFromReply(full, replyEmotion as any, signal)
+          .then((result) => (signal.aborted ? null : result))
+          .catch(() => null)
+      : Promise.resolve(null);
 
     endProducer();
     signal.removeEventListener("abort", onAbort);
@@ -260,7 +266,7 @@ export async function runPipeline(
     }
     ctx.currentAssistantDraft = null;
 
-    if (isDbReady() && sessionId && full) {
+    if (isDbReady() && sessionId && full && !signal.aborted) {
       try {
         await saveMessage(sessionId, "assistant", full);
       } catch (err) {
@@ -281,6 +287,11 @@ export async function runPipeline(
         type: "avatar_intent",
         intent: avatarIntentEnvelope.intent,
         beats: avatarIntentEnvelope.beats,
+      });
+    } else if (full && !signal.aborted && !shouldInferAvatarIntent) {
+      logger.debug("[AvatarIntent] skipped by budget gate", {
+        connId,
+        generationId,
       });
     }
 

@@ -1,8 +1,35 @@
 const assert = require("assert").strict;
+const path = require("path");
 const { InterruptController } = require("../../../voice/interrupt_controller");
 const { RemSessionContext } = require("../../../brains/rem_session_context");
 const { routeMessage } = require("../../../brains/brain_router");
 const { loadSessionHarness, waitFor } = require("../../helpers/session_harness");
+
+function loadMockedRouteMessage({ fastBrainStream, runSlowBrain }) {
+  const fastBrainModulePath = path.resolve(__dirname, "../../../brains/fast_brain.ts");
+  const slowBrainModulePath = path.resolve(__dirname, "../../../brains/slow_brain.ts");
+  const brainRouterModulePath = path.resolve(__dirname, "../../../brains/brain_router.ts");
+  const fastBrainModule = require(fastBrainModulePath);
+  const slowBrainModule = require(slowBrainModulePath);
+
+  const originalFastBrainStream = fastBrainModule.fastBrainStream;
+  const originalRunSlowBrain = slowBrainModule.runSlowBrain;
+
+  fastBrainModule.fastBrainStream = fastBrainStream;
+  slowBrainModule.runSlowBrain = runSlowBrain;
+
+  delete require.cache[brainRouterModulePath];
+  const { routeMessage: mockedRouteMessage } = require(brainRouterModulePath);
+
+  return {
+    routeMessage: mockedRouteMessage,
+    restore() {
+      fastBrainModule.fastBrainStream = originalFastBrainStream;
+      slowBrainModule.runSlowBrain = originalRunSlowBrain;
+      delete require.cache[brainRouterModulePath];
+    },
+  };
+}
 
 describe("interruption handling", () => {
   it("tracks interrupt controller lifecycle", () => {
@@ -37,10 +64,13 @@ describe("interruption handling", () => {
     assert.ok(ctx.persona.liveState.lastTopicSummary.length > 0);
   });
 
-  it("keeps interruption flags within the public persona state", () => {
+  it("only marks a real interruption, not slow brain cancellation", () => {
     const ctx = new RemSessionContext("test-conn");
     ctx.beginSlowBrain();
     ctx.cancelSlowBrain();
+    assert.equal(ctx.persona.liveState.wasInterrupted, false);
+
+    ctx.markInterrupted();
     assert.equal(ctx.persona.liveState.wasInterrupted, true);
 
     ctx.updateLiveState("happy", "随便聊聊", "好呀");
@@ -65,7 +95,45 @@ describe("interruption handling", () => {
     assert.equal(chunks.join(""), "我刚才说到：我刚才说到语音真人感最重要的是接话时机。");
   });
 
-  it("uses the in-flight assistant draft for carry-forward on immediate text interruption", async () => {
+  it("keeps interrupted partials out of history and slow brain", async () => {
+    let releasePending = () => {};
+    const pending = new Promise((resolve) => {
+      releasePending = resolve;
+    });
+    const slowBrainCalls = [];
+    const { routeMessage: mockedRouteMessage, restore } = loadMockedRouteMessage({
+      fastBrainStream: async function* () {
+        yield "我先说一半";
+        await pending;
+      },
+      runSlowBrain: async (...args) => {
+        slowBrainCalls.push(args);
+      },
+    });
+
+    try {
+      const ctx = new RemSessionContext("test-conn");
+      const ac = new AbortController();
+      const chunks = [];
+
+      for await (const chunk of mockedRouteMessage(ctx, "请继续", "neutral", ac.signal)) {
+        chunks.push(chunk);
+        ac.abort();
+        releasePending();
+      }
+
+      assert.deepEqual(chunks, ["我先说一半"]);
+      assert.equal(ctx.history.length, 0);
+      assert.equal(slowBrainCalls.length, 0);
+      assert.equal(ctx.lastInterruptedReply, "我先说一半");
+      assert.equal(ctx.persona.liveState.wasInterrupted, true);
+    } finally {
+      restore();
+    }
+  });
+
+  it("uses the in-flight assistant draft for carry-forward on immediate text interruption", async function () {
+    this.timeout(5000);
     const { ws, session, pipelineCalls, restore } = loadSessionHarness();
     try {
       session.brain.currentAssistantDraft = "我刚才想说先把打断承接做好。";
@@ -84,6 +152,26 @@ describe("interruption handling", () => {
       assert.equal(pipelineCalls[0].options?.interruptionType, "correction");
       assert.ok(pipelineCalls[0].options?.carryForwardHint?.includes("先把打断承接做好"));
       assert.equal(session.brain.lastInterruptedReply, "我刚才想说先把打断承接做好。");
+    } finally {
+      restore();
+    }
+  });
+
+  it("does not emit interrupt when text chat starts from idle", async () => {
+    const { ws, pipelineCalls, restore } = loadSessionHarness();
+    try {
+      ws.emitMessage(
+        Buffer.from(
+          JSON.stringify({
+            type: "chat",
+            content: "这是一条正常开始的新消息",
+          }),
+        ),
+      );
+
+      await waitFor(() => pipelineCalls.length === 1);
+      const interrupts = ws.parsedMessages().filter((msg) => msg?.type === "interrupt");
+      assert.equal(interrupts.length, 0, `messages=${JSON.stringify(ws.parsedMessages())}`);
     } finally {
       restore();
     }

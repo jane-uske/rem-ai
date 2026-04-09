@@ -1,6 +1,6 @@
 import type { PromptMessage } from "../brain/prompt_builder";
 import { EmotionRuntime } from "../emotion/emotion_runtime";
-import { InMemoryRepository } from "../memory/memory_store";
+import { SessionMemoryOverlayRepository } from "../memory/session_memory_overlay";
 import { SlowBrainStore } from "./slow_brain_store";
 import { createDefaultPersona, type PersonaState } from "../persona";
 
@@ -10,7 +10,7 @@ import { createDefaultPersona, type PersonaState } from "../persona";
 export class RemSessionContext {
   readonly emotion: EmotionRuntime;
   readonly slowBrain: SlowBrainStore;
-  readonly memory: InMemoryRepository;
+  readonly memory: SessionMemoryOverlayRepository;
   readonly history: PromptMessage[] = [];
   readonly persona: PersonaState;
   private slowBrainController: AbortController | null = null;
@@ -22,7 +22,7 @@ export class RemSessionContext {
   constructor(readonly connId: string) {
     this.emotion = new EmotionRuntime(connId);
     this.slowBrain = new SlowBrainStore();
-    this.memory = new InMemoryRepository();
+    this.memory = new SessionMemoryOverlayRepository();
     this.persona = createDefaultPersona();
   }
 
@@ -30,7 +30,12 @@ export class RemSessionContext {
     if (!this.slowBrainController) return;
     this.slowBrainController.abort();
     this.slowBrainController = null;
-    // 标记会话刚被打断
+  }
+
+  /**
+   * 只在真实用户打断时调用，不能由后台慢脑取消来触发。
+   */
+  markInterrupted(): void {
     this.persona.liveState.wasInterrupted = true;
   }
 

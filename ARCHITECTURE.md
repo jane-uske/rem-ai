@@ -17,7 +17,7 @@
                      ▼
 ┌────────────────────────────────────────────────────────────────┐
 │                    server/gateway/                             │
-│              Express + WebSocket Gateway                        │
+│          HTTP + Next.js + WebSocket Gateway                    │
 │  ┌───────────────┐  ┌──────────────┐  ┌─────────────────────┐ │
 │  │ 消息路由       │  │ 会话创建      │  │ send() to client    │ │
 │  │ (type-based)  │  │ onConnection  │  │                     │ │
@@ -92,12 +92,13 @@
 
 ### 1. Gateway — `server/gateway/`
 
-HTTP + WebSocket 网关层，负责创建服务器和连接升级。
+HTTP + Next.js + WebSocket 网关层，负责创建服务器、连接升级和基础健康检查。
 
 | 职责 | 实现 |
 |------|------|
-| HTTP 服务 | Express + Next.js 集成 |
+| HTTP 服务 | Node.js `http` + Next.js 集成 |
 | WebSocket | ws 库 noServer 模式，`/ws` 路径升级 |
+| 健康检查 | `GET /health` 直接返回轻量 JSON |
 | `send()` | 向客户端发送 WebSocket 消息 |
 | ServerMessage | 消息类型定义 |
 
@@ -121,7 +122,7 @@ HTTP + WebSocket 网关层，负责创建服务器和连接升级。
 |------|------|
 | `runPipeline()` | 情绪更新 → LLM 流式 → 逐句 TTS → 推送客户端 |
 | 情绪更新 | `updateEmotion()` + Avatar 表情过渡 |
-| 消息持久化 | DB 可用时保存 user/assistant 消息 |
+| 消息持久化 | DB 可用时保存 user 消息；assistant 仅在非中断完成态保存 |
 | Avatar 动作 | 从回复文本检测动作并推送 |
 | 情绪衰减 | 回复后调用 `decayEmotion()` |
 
@@ -140,26 +141,36 @@ HTTP + WebSocket 网关层，负责创建服务器和连接升级。
 
 ```
 // 客户端 → 服务端
-{ type: "chat", content: string }          // 文本消息
-{ type: "duplex_start" }                   // 开始实时语音
-{ type: "audio_stream", data: base64 }     // PCM 音频流
-{ type: "duplex_stop" }                    // 结束实时语音
-{ type: "audio_chunk", data: base64 }      // 旧版 WebM 音频块
-{ type: "audio_end" }                      // 旧版录音结束
+{ type: "chat", content: string }                // 文本消息
+{ type: "duplex_start", sampleRate?: number }    // 开始实时语音
+<RAUD PCM binary frame>                          // PCM 音频流（主路径）
+{ type: "audio_stream", audio: base64 }          // 兼容回退路径
+{ type: "duplex_stop" }                          // 结束实时语音
+{ type: "playback_start", generationId?: number } // 客户端确认本地播放开始
 
 // 服务端 → 客户端
-{ type: "emotion", emotion: string }       // 情绪状态更新
-{ type: "chat_chunk", text: string }       // 流式回复 token
-{ type: "chat_end" }                       // 回复完成
-{ type: "voice", data: base64 }            // TTS 音频
-{ type: "interrupt" }                      // 管线被打断
-{ type: "stt_partial", text: string }      // STT 部分识别
-{ type: "stt_final", text: string }        // STT 最终识别
-{ type: "vad_start" }                      // 检测到语音开始
-{ type: "vad_end" }                        // 检测到语音结束
-{ type: "avatar_frame", frame: ... }       // Avatar 帧（新增）
-{ type: "error", message: string }         // 错误
+{ type: "emotion", emotion: string }
+{ type: "chat_chunk", content: string, generationId: number }
+{ type: "chat_end", generationId: number, emotion?: string, content?: "[interrupted]" }
+{ type: "voice", audio: base64, generationId?: number }
+{ type: "voice_pcm_chunk", audio: base64, sampleRate: number, generationId: number }
+{ type: "interrupt", generationId?: number }
+{ type: "stt_partial", content: string }
+{ type: "stt_prediction", status: "finished", preview: string }
+{ type: "stt_final", content: string }
+{ type: "vad_start" }
+{ type: "vad_end" }
+{ type: "turn_state", state: RemTurnState, reason: RemTurnStateReason, generationId?: number }
+{ type: "avatar_frame", frame: ... }
+{ type: "avatar_intent", intent: ..., beats?: [...] }
+{ type: "error", content: string }
 ```
+
+**协议语义约定：**
+
+- `interrupt` 只在抢占一个已激活 generation 时发送，不再用于 idle 文本发送时的“清队列”。
+- `chat_end` 只表示文本流结束，不表示客户端本地播放已经完成。
+- `turn_state` 是前后端共享的主状态语义，`confirmed_end` 允许晚于 `chat_end`。
 
 ### 5. 双脑系统 — `brains/`
 
@@ -172,8 +183,8 @@ HTTP + WebSocket 网关层，负责创建服务器和连接升级。
 2. 提取 + 检索记忆
 3. 获取慢脑上下文（上一轮分析结果）
 4. 调用快脑流式生成回复
-5. 维护对话历史（滑动窗口，最近 10 轮）
-6. 异步触发慢脑后台分析
+5. 仅在非中断完成态维护正式对话历史（滑动窗口，最近 10 轮）
+6. 仅在非中断完成态异步触发慢脑后台分析
 
 **Fast Brain (`fast_brain.ts`)**
 
@@ -241,7 +252,8 @@ OpenAI 兼容的流式聊天客户端。
 
 统一记忆存储接口：
 - `upsert(key, value)` / `getAll()` / `getByKey()` / `delete()` / `touch()` / `getStale()`
-- `InMemoryRepository`（`memory_store.ts`）：进程内默认实现
+- `InMemoryRepository`（`memory_store.ts`）：进程内基础实现
+- `SessionMemoryOverlayRepository`（`session_memory_overlay.ts`）：每连接本地优先 overlay，支持启动预加载和异步写回持久层
 - `PostgreSQL 实现`（`storage/repositories/memory_repository.ts`）：持久化 + pgvector 向量语义检索
 
 **Memory Decay (`memory_decay.ts`)**
@@ -343,6 +355,7 @@ LLM tokens → SentenceChunker（按 。！？.!? 断句）→ 逐句 TTS → ba
 | `interrupt()` | 调用 abort()，立即回到 idle，发出 interrupted 事件 |
 
 用户在 AI 回复过程中发送新消息或开始说话时，触发 `interrupt()` 终止当前管线。
+被打断的半句回复会进入 `lastInterruptedReply` 供 carry-forward 使用，但不会进入正式 history / slow brain / assistant 持久化。
 
 ### 13. Avatar — `avatar/`
 
@@ -388,7 +401,7 @@ LLM tokens → SentenceChunker（按 。！？.!? 断句）→ 逐句 TTS → ba
 
 ### 15. 旧版前端 — `public/`
 
-原生 HTML/CSS/JS 实现，功能基本对应 Next.js 版本但不支持双工语音和打断控制。通过 Express 静态文件托管。
+原生 HTML/CSS/JS 实现，功能基本对应 Next.js 版本但不支持双工语音和打断控制。由当前 HTTP 网关兼容托管。
 
 ## 全局数据流
 
@@ -425,8 +438,12 @@ LLM tokens → SentenceChunker（按 。！？.!? 断句）→ 逐句 TTS → ba
 7. 后台慢脑分析
    Slow Brain ──(异步)──► 分析对话 + 二次记忆提取
 
-8. 管线结束
-   Client ◄──(chat_end)──
+8. 文本流结束
+   Client ◄──(chat_end)──                → 文本完成，可提交消息
+   （若仍在播音频，前端继续保持 assistant_speaking）
+
+9. 播放真正结束
+   Client 本地音频队列 drain             → confirmed_end
    decayEmotion()                        → 情绪衰减
 ```
 
@@ -505,7 +522,7 @@ server/
 | 语音打断 | 全双工 VAD + 打断控制已实现 | 优化回声消除、VAD 阈值、TTS 分段 |
 | 认证限流 | WebSocket 限流已集成，HTTP 限流待集成 | 完整集成 Auth + HTTP Rate Limiter |
 | TTS 工程 | Edge 默认同参数连接池 + 短句缓存 + 全链路重试；`edge_tts_pool=0` 可关闭池化 | 极端负载下池化策略与多音色隔离可再调 |
-| 每连接对话状态 | `RemSessionContext`：情绪 / 历史 / 慢脑 / 会话内记忆（**C1 ✅**） | 用户级持久记忆与 DB 双写、向量检索等 |
+| 每连接对话状态 | `RemSessionContext`：情绪 / 历史 / 慢脑 / session memory overlay（**C1 ✅**） | 用户级持久记忆继续异步写回；向量检索暂未接入 live path |
 | 部署 | Dockerfile + Docker Compose 已完成 | 生产环境验证 + CI/CD |
 
 **文档：** 已完成与待办的工程项清单见根目录 [OPTIMIZATION.md](OPTIMIZATION.md)（含 M1–M9、S9/S10、C1–C5 状态）。

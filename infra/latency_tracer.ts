@@ -27,6 +27,17 @@ export interface LatencyMetrics {
   tts_first_to_playback?: number;
 }
 
+export interface LatencyMetricSnapshot {
+  stt_latency: number | null;
+  llm_first_token: number | null;
+  tts_latency: number | null;
+  total_response: number | null;
+  speech_end_to_stt_final: number | null;
+  stt_final_to_llm_first: number | null;
+  llm_first_to_tts_first: number | null;
+  tts_first_to_playback: number | null;
+}
+
 export interface LatencyTraceContext {
   generationId?: number;
   source?: "voice" | "text" | "silence_nudge";
@@ -165,6 +176,23 @@ export class LatencyTracer {
   }
 
   /**
+   * Normalize a metrics object into a stable, regression-friendly snapshot.
+   * Missing values are preserved explicitly as `null` so the log shape stays fixed.
+   */
+  static normalizeMetrics(metrics: LatencyMetrics): LatencyMetricSnapshot {
+    return {
+      stt_latency: metrics.stt_latency ?? null,
+      llm_first_token: metrics.llm_first_token ?? null,
+      tts_latency: metrics.tts_latency ?? null,
+      total_response: metrics.total_response ?? null,
+      speech_end_to_stt_final: metrics.speech_end_to_stt_final ?? null,
+      stt_final_to_llm_first: metrics.stt_final_to_llm_first ?? null,
+      llm_first_to_tts_first: metrics.llm_first_to_tts_first ?? null,
+      tts_first_to_playback: metrics.tts_first_to_playback ?? null,
+    };
+  }
+
+  /**
    * Log the latency metrics as structured JSON.
    * Call this after all stages are complete.
    */
@@ -181,12 +209,14 @@ export class LatencyTracer {
       return;
     }
 
+    const metricSnapshot = LatencyTracer.normalizeMetrics(metrics);
+
     logger.info("[Latency]", {
       connId: this.connId,
       traceId,
       generationId: trace.context?.generationId,
       source: trace.context?.source,
-      metrics,
+      metrics: metricSnapshot,
       timestamps: trace.timestamps,
     });
   }

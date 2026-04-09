@@ -18,7 +18,7 @@
 | 层级 | 技术 |
 |------|------|
 | 运行时 | Node.js + TypeScript |
-| HTTP 框架 | Express |
+| HTTP 网关 | Node.js `http` + Next.js + `ws` |
 | 实时通信 | ws (WebSocket) |
 | LLM | OpenAI 兼容 API（LM Studio / Qwen 等） |
 | 语音识别 | Whisper API / whisper-cpp |
@@ -59,6 +59,31 @@ npm run typecheck
 浏览器远程开发与办公网实时预览见 **`REMOTE_DEV.md`**。
 如果 Next 开发态缓存异常，可先执行 **`npm run dev:web:clean`** 再重启服务。
 
+### 本地验证
+
+```bash
+# 后端健康检查
+curl http://127.0.0.1:3000/health
+
+# 冒烟：主页 + /health + WebSocket chat
+node scripts/smoke.mjs
+
+# 后端测试
+npm test
+
+# 前端测试
+npm run test --prefix web
+```
+
+`/health` 现在由网关直接返回轻量 JSON（`ok` / `service` / `uptimeSec`），用于本地 smoke 和基础连通性检查，不表示 DB/Redis readiness。
+
+### 实时语义约定
+
+- `interrupt` 只表示“一个已激活 generation 被新输入抢占”，不再用于 idle 文本发送时的清队列。
+- `chat_end` 只表示文本流结束，不等于本地音频已经播放完；前端会在播放 drain 后再回到 `confirmed_end`。
+- 被打断的 assistant 半句只保留为 carry-forward 上下文，不进入正式 history、不进入 slow brain、也不会按正常 assistant 消息持久化。
+- 跨连接记忆当前采用“session overlay”方式：会话启动时可从持久层预加载少量事实型记忆到本地副本，live path 只读本地副本，持久层写回异步进行。
+
 ### 环境变量
 
 | 变量 | 说明 |
@@ -78,6 +103,13 @@ npm run typecheck
 | `PORT` | 服务端口（默认 `3000`） |
 | `REM_SILENCE_NUDGE_MS` | 用户无消息后多久由 Rem 主动搭话（毫秒）；`0` 或不设为关闭 |
 | `REM_SILENCE_NUDGE_MIN_TURNS` | 至少聊过几轮才允许沉默搭话（默认 `2`） |
+| `REM_SLOW_BRAIN_ENABLED` | 是否启用 slow brain 后台分析（默认 `1`）。设为 `0`/`false` 可关闭后台提炼，避免与 fast path 抢同一模型预算。 |
+| `REM_AVATAR_INTENT_ENABLED` | 是否启用 reply-based avatar intent 推断（默认 `1`）。设为 `0`/`false` 时不再发送 `avatar_intent`，但主回复/TTS/turn lifecycle 不变。 |
+| `REM_PERSISTENT_MEMORY_OVERLAY_ENABLED` | 是否启用持久记忆 overlay（默认 `1`）。数据库可用时，会话启动阶段预加载少量事实型记忆到本地副本；设为 `0`/`false` 则完全回到纯会话内 memory。 |
+| `REM_PERSISTENT_MEMORY_PRELOAD_LIMIT` | 持久记忆启动预加载上限（默认 `12`）。prompt 仍会继续受 `MAX_PROMPT_MEMORY_ENTRIES` 裁剪。 |
+| `STT_PARTIAL_PREDICTION_ENABLED` | 是否启用 partial transcript 预判（默认关闭）。设为 `1`/`true` 后才会触发额外 prediction 调用。 |
+| `STT_PREDICTION_PUSH_ENABLED` | 是否把 prediction 结果以 `stt_prediction` 推到前端（默认关闭）。只有 `STT_PARTIAL_PREDICTION_ENABLED` 已开启时才生效。 |
+| `STT_PREDICTION_DEBOUNCE_MS` | partial prediction 的防抖毫秒数（默认 `300`）。 |
 | `NEXT_PUBLIC_VRM_URL` | （前端）自定义 VRM 路径；不设则使用 `web/public/vrm/` 下默认模型。根目录 `npm run web:dev` 时 `next.config` 会读取**仓库根** `.env`。 |
 | `NEXT_PUBLIC_WS_URL` | WebSocket 地址，须含 `ws://` 或 `wss://`（勿写 `localhost:3000/ws` 无前缀）。 |
 | `NEXT_PUBLIC_VRM_YAW` | VRM 绕 Y 轴旋转（弧度），模型背对镜头时可调。 |
@@ -93,7 +125,10 @@ npm run typecheck
 ```
 rem-ai/
 ├── server/
-│   └── server.ts              # Express + WebSocket 入口，管线编排
+│   ├── server.ts              # 服务入口，负责全局初始化和网关启动
+│   ├── gateway/               # HTTP + Next.js + WebSocket 网关（含 /health）
+│   ├── session/               # 每连接会话、VAD、turn state、打断接入点
+│   └── pipeline/              # runPipeline，LLM/TTS/持久化编排
 ├── agents/
 │   └── conversation_agent.ts  # 对话 Agent 门面
 ├── brains/
@@ -111,6 +146,7 @@ rem-ai/
 ├── memory/
 │   ├── memory_agent.ts        # 记忆提取（正则匹配 + 慢脑二次提取）
 │   ├── memory_store.ts        # 内存 KV 记忆存储（InMemoryRepository）
+│   ├── session_memory_overlay.ts # 会话内本地优先 overlay：启动预加载 + 异步写回持久层
 │   ├── memory_repository.ts   # MemoryRepository 接口定义
 │   └── memory_decay.ts        # 记忆衰减与遗忘（重要性 × 频率 × 时间）
 ├── emotion/
@@ -140,6 +176,7 @@ rem-ai/
 │   ├── auth.ts                # JWT 认证中间件 + WebSocket 认证
 │   ├── rate_limiter.ts        # HTTP + WebSocket 限流
 │   ├── logger.ts              # pino 结构化日志
+│   ├── latency_tracer.ts      # 语音主链路延迟指标（speech_end→stt_final→llm→tts→playback）
 │   └── emotion_logger.ts      # 情绪日志（环形缓冲区）
 ├── avatar/
 │   ├── types.ts               # Avatar 驱动协议（FaceParams / Viseme / AvatarFrame）
@@ -189,3 +226,10 @@ rem-ai/
 | P4 | Docker 容器化部署 | **已完成** |
 
 > 主管线已拆分为 `server/gateway` / `session` / `pipeline`，多数模块已集成；细节见 [ARCHITECTURE.md](ARCHITECTURE.md)。体验与工程向的增量优化（重试、历史 token、情绪惯性、本地消息、**Edge TTS 连接池**、whisper 一次重试等）见 [OPTIMIZATION.md](OPTIMIZATION.md) 顶部 **「已完成优化」** 与 **「尚未完成」**。
+
+## 当前已收口的体验/观测点
+
+- 打断语义已收口：真实用户打断与 slow-brain cancel 已分离。
+- turn lifecycle 已收口：`interrupt`、`chat_end`、`assistant_speaking`、`confirmed_end` 的职责不再混用。
+- latency tracer 已固定输出 shape，便于做前后版本对比。
+- duplex harness 已固定场景名，便于回归比较。

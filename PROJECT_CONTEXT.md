@@ -61,6 +61,18 @@ It already has many correct bones:
 
 But the current live experience is still limited by structural bottlenecks.
 
+### Recently tightened foundations
+
+- interruption semantics are cleaner than before:
+  - real user interruption is now separated from background slow-brain cancellation
+  - interrupted assistant partials no longer pollute formal history / slow brain / normal persistence
+- turn lifecycle semantics are clearer:
+  - `interrupt` is no longer used as an idle text-send queue-clear signal
+  - `chat_end` is now understood as text completion, not guaranteed playback completion
+- observability is more usable for iteration:
+  - `/health` exists as a lightweight gateway health endpoint
+  - latency metrics and duplex harness scenario names are now stable enough for before/after comparison
+
 ### Main bottlenecks
 1. input understanding begins too late
    - current flow is still too dependent on end-of-utterance recognition
@@ -72,8 +84,9 @@ But the current live experience is still limited by structural bottlenecks.
 3. fast brain is still "fast reply" more than "fast reaction"
    - it becomes active too late in the user speech timeline
 
-4. interruption currently behaves more like stopping than carrying forward
-   - good stop is not the same as good conversational recovery
+4. interruption is better scoped semantically, but recovery quality is still limited
+   - correctness improved, but conversational branch recovery is still not yet rich enough
+   - current system can preserve carry-forward context, but still does not fully behave like a live reactive character
 
 ---
 

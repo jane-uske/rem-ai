@@ -3,6 +3,7 @@ const { loadSessionHarness } = require("../../helpers/session_harness");
 const {
   makeBroadbandNoiseFrame,
   makeRaudFrame,
+  makeSilenceFrame,
   makeSparseClickFrame,
   makeSineFrame,
   repeatFrames,
@@ -63,14 +64,18 @@ async function runHumanScenario(name, transcript, frames) {
     const turnStates = messages
       .filter((msg) => msg && typeof msg === "object" && msg.type === "turn_state")
       .map((msg) => msg.state);
-    const sttFinal = messages.find((msg) => msg && msg.type === "stt_final");
-    const assistantEntering = messages.find(
+    const sttFinals = messages.filter((msg) => msg && msg.type === "stt_final");
+    const assistantEnterings = messages.filter(
       (msg) => msg && msg.type === "turn_state" && msg.state === "assistant_entering",
     );
+    const sttFinal = sttFinals[0];
+    const assistantEntering = assistantEnterings[0];
 
     assert.ok(sttFinal, `${name}: should emit stt_final`);
     assert.ok(assistantEntering, `${name}: should enter assistant`);
     assert.equal(sttFinal.content, transcript);
+    assert.equal(sttFinals.length, 1, `${name}: should emit exactly one stt_final`);
+    assert.equal(assistantEnterings.length, 1, `${name}: should enter assistant exactly once`);
 
     return { name, messageTypes: types, turnStates };
   } finally {
@@ -90,19 +95,39 @@ async function main() {
     ...repeatFrames(makeBroadbandNoiseFrame(0.05, 320, 11), 2),
     ...repeatFrames(makeSineFrame(0.18), 4),
   ];
+  const speechWithShortInternalSilence = [
+    ...repeatFrames(makeSineFrame(0.18), 6),
+    ...repeatFrames(makeSilenceFrame(), 6),
+    ...repeatFrames(makeSineFrame(0.18), 6),
+  ];
+  const speechResumeBeforeGapCommit = [
+    ...repeatFrames(makeSineFrame(0.18), 6),
+    ...repeatFrames(makeSilenceFrame(), 12),
+    ...repeatFrames(makeSineFrame(0.18), 6),
+  ];
 
-  const sparseNoiseResult = await runNoiseScenario("sparse-click-noise", "词曲 李宗盛", sparseClickNoise);
+  const sparseNoiseResult = await runNoiseScenario("sparseClickNoise", "词曲 李宗盛", sparseClickNoise);
   const strictNoiseResult = await runNoiseScenario(
-    "strict-no-preview-noise",
+    "strictNoPreviewNoise",
     "词曲 李宗盛",
     strictNoPreviewNoise,
   );
   const lowEnergyHumResult = await runNoiseScenario(
-    "fallback-long-hum-noise",
+    "fallbackLongHumNoise",
     "请不吝点赞 订阅 转发 打赏支持明镜与点点栏目",
     lowEnergyHumNoise,
   );
-  const humanResult = await runHumanScenario("human-speech", "你好，我在这里。", humanSpeech);
+  const humanResult = await runHumanScenario("humanSpeech", "你好，我在这里。", humanSpeech);
+  const shortSilenceResult = await runHumanScenario(
+    "speechWithShortInternalSilence",
+    "我中间停一下再继续。",
+    speechWithShortInternalSilence,
+  );
+  const mergeAfterPauseResult = await runHumanScenario(
+    "speechResumeBeforeGapCommit",
+    "我停一下然后接着说完。",
+    speechResumeBeforeGapCommit,
+  );
 
   console.log(
     `HARNESS_RESULT ${JSON.stringify({
@@ -111,6 +136,8 @@ async function main() {
       strictNoPreviewNoise: strictNoiseResult,
       fallbackLongHumNoise: lowEnergyHumResult,
       humanSpeech: humanResult,
+      speechWithShortInternalSilence: shortSilenceResult,
+      speechResumeBeforeGapCommit: mergeAfterPauseResult,
     })}`,
   );
 }

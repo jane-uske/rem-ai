@@ -29,6 +29,10 @@
   - ws 库 noServer 模式，`/ws` 路径升级
   - 每连接独立管理 SttStream / VadDetector / InterruptController
 
+- [x] **T-006.1** 基础健康检查与 smoke 验证
+  - 网关直接提供 `GET /health` 轻量 JSON
+  - `scripts/smoke.mjs` 可验证主页 + `/health` + WebSocket chat
+
 - [x] **T-007** 实现消息协议与路由
   - 完整 WebSocket 消息格式（type / payload）
   - 支持：chat / audio_stream / duplex_start / duplex_stop / audio_chunk / audio_end
@@ -136,6 +140,14 @@
 - [x] **T-029.1** 实现管线打断控制
   - `voice/interrupt_controller.ts`：AbortSignal + 状态机
 
+- [x] **T-029.2** 打断语义收口
+  - 被打断的 assistant partial 不进入 formal history / slow brain / 正常 assistant 持久化
+  - `wasInterrupted` 仅由真实用户打断触发
+
+- [x] **T-029.3** turn lifecycle 协议收口
+  - idle 文本发送不再误发 `interrupt`
+  - `chat_end` 与本地 playback drain 分离，前端在 drain 后再回到 `confirmed_end`
+
 ## Phase 7 · 虚拟形象
 
 - [x] **T-030** 定义 Avatar 驱动协议
@@ -185,6 +197,10 @@
 
 - [x] **T-036** 端到端流程联调
   - 文本/语音 → 情绪 + 记忆 → LLM → 流式回复 → TTS → 客户端
+
+- [x] **T-036.1** 延迟与回放基线收口
+  - `infra/latency_tracer.ts` 固定输出回归友好的 metrics shape
+  - `test/server/session/duplex_harness.ts` 固定 `sparseClickNoise` / `strictNoPreviewNoise` / `fallbackLongHumNoise` / `humanSpeech` 四个场景名
 
 - [x] **T-037** 实现认证与限流
   - `infra/auth.ts`：JWT 中间件 + generateToken / verifyToken / wsAuthenticateOnce

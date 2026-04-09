@@ -30,13 +30,23 @@ Key current strengths:
 - sentence-level TTS
 - memory layer
 - avatar controller
+- interruption semantics have been tightened
+- turn lifecycle semantics are clearer
+- latency and replay baselines now exist for iterative tuning
 
 Key current weaknesses:
 - turn-taking too dependent on silence
 - STT and live understanding still not real-time enough
-- interruption carry-forward weak
+- interruption carry-forward is now cleaner, but still not expressive enough
 - fast brain enters too late
 - voice UX still partly pipeline-like
+
+### Current status after the latest semantics pass
+
+- `interrupt` now means a real preemption of an active generation, not a generic queue-clear hint.
+- `chat_end` now means text stream completion; the client can remain in `assistant_speaking` until local playback drains.
+- interrupted assistant partials now stay out of formal history / slow brain / normal assistant persistence.
+- `/health`, latency tracer snapshots, and duplex harness scenario keys are now usable as a repeatable baseline.
 
 ---
 
@@ -90,6 +100,10 @@ Move toward VAD + transcript growth + basic semantic completion signals.
 - classify turn state into hold / likely_end / confirmed_end
 - reduce premature AI responses during short user pauses
 
+### Current implementation note
+- the project already exposes `listening_hold / likely_end / confirmed_end` style turn states
+- the remaining work is not naming the states, but improving the decision quality behind them
+
 ### Why
 Poor turn-taking kills aliveness even when models are good.
 
@@ -109,6 +123,13 @@ Move from "interrupt = hard stop" to "interrupt = conversational branch change."
 - classify interruption type
 - preserve interruption context
 - generate different carry-forward behavior for correction, continuation, topic switch, emotional interruption
+
+### Current implementation note
+- interruption types and carry-forward hints already exist
+- the recent fix was mainly about correctness:
+  - only real interruptions should set interruption state
+  - interrupted partials should not corrupt formal history
+- the remaining work is behavioral richness, not basic semantics
 
 ### Why
 Humans do not merely stop when interrupted. They adapt.

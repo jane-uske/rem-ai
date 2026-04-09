@@ -1,6 +1,7 @@
 const assert = require("assert").strict;
 const { buildPrompt } = require("../../brain/prompt_builder");
 const { createDefaultPersona } = require("../../persona");
+const { RemSessionContext } = require("../../brains/rem_session_context");
 
 describe("prompt builder emotion speech style", () => {
   it("includes richer happy expression and speech rhythm hints", () => {
@@ -85,5 +86,23 @@ describe("prompt builder emotion speech style", () => {
     const system = messages[0].content;
     assert.ok(system.includes("你刚刚被打断过"));
     assert.ok(system.includes("先用一句很短的话接住上下文"));
+  });
+
+  it("does not add interruption guidance after slow brain cancellation alone", () => {
+    const ctx = new RemSessionContext("test-conn");
+    ctx.beginSlowBrain();
+    ctx.cancelSlowBrain();
+
+    const messages = buildPrompt({
+      memory: [],
+      emotion: "neutral",
+      history: [],
+      userMessage: "继续说",
+      persona: ctx.persona,
+    });
+
+    const system = messages[0].content;
+    assert.ok(!system.includes("你刚刚被打断过"));
+    assert.ok(!system.includes("先用一句很短的话接住上下文"));
   });
 });

@@ -10,6 +10,11 @@ import { createLogger } from "../infra/logger";
 const MAX_HISTORY = 10;
 const logger = createLogger("brain_router");
 
+function slowBrainEnabled(): boolean {
+  const raw = (process.env.REM_SLOW_BRAIN_ENABLED ?? "1").trim().toLowerCase();
+  return raw !== "0" && raw !== "false";
+}
+
 export interface RouteMessageOptions {
   /** 服务端触发的陪伴搭话：不跑记忆提取与慢脑，历史中 user 用短占位 */
   systemTriggered?: boolean;
@@ -87,6 +92,17 @@ export async function* routeMessage(
     }
   }
 
+  if (signal?.aborted) {
+    if (!opts?.systemTriggered && fullReply.trim()) {
+      ctx.lastInterruptedReply = fullReply;
+    }
+    ctx.updateLiveState(emotion);
+    if (!opts?.systemTriggered) {
+      ctx.markInterrupted();
+    }
+    return;
+  }
+
   const historyUserContent = opts?.systemTriggered
     ? "［你主动开口陪对方聊天］"
     : userMessage;
@@ -104,7 +120,7 @@ export async function* routeMessage(
     fullReply
   );
 
-  if (!opts?.systemTriggered) {
+  if (!opts?.systemTriggered && slowBrainEnabled()) {
     const slowBrainSignal = ctx.beginSlowBrain();
     runSlowBrain({
       userMessage,
@@ -117,6 +133,10 @@ export async function* routeMessage(
       logger.warn("后台分析失败", { error: (err as Error).message }),
     ).finally(() => {
       ctx.endSlowBrain(slowBrainSignal);
+    });
+  } else if (!opts?.systemTriggered) {
+    logger.debug("slow brain skipped by budget gate", {
+      connId: ctx.connId,
     });
   }
 }

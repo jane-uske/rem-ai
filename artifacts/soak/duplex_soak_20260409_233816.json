@@ -1,0 +1,307 @@
+{
+  "runConfig": {
+    "behaviorLoops": 10,
+    "latencyLoops": 10,
+    "seed": 20260409,
+    "outputDir": "/Users/rare/Desktop/rem-ai/artifacts/soak",
+    "generatedAt": "2026-04-09T15:37:53.414Z"
+  },
+  "behaviorSummary": {
+    "totals": {
+      "unexpected_interrupt_count": 0,
+      "noise_promoted_to_assistant_count": 0,
+      "missing_stt_final_count": 0,
+      "duplicate_stt_final_count": 0,
+      "duplicate_assistant_entering_count": 0,
+      "missing_chat_end_count": 0,
+      "stuck_turn_state_count": 30
+    },
+    "scenarios": [
+      {
+        "name": "sparseClickNoise",
+        "loops": 10,
+        "passCount": 10,
+        "failureCount": 0,
+        "anomalies": {
+          "unexpected_interrupt_count": 0,
+          "noise_promoted_to_assistant_count": 0,
+          "missing_stt_final_count": 0,
+          "duplicate_stt_final_count": 0,
+          "duplicate_assistant_entering_count": 0,
+          "missing_chat_end_count": 0,
+          "stuck_turn_state_count": 10
+        },
+        "messageTypeHistogram": {},
+        "turnStateHistogram": {}
+      },
+      {
+        "name": "strictNoPreviewNoise",
+        "loops": 10,
+        "passCount": 10,
+        "failureCount": 0,
+        "anomalies": {
+          "unexpected_interrupt_count": 0,
+          "noise_promoted_to_assistant_count": 0,
+          "missing_stt_final_count": 0,
+          "duplicate_stt_final_count": 0,
+          "duplicate_assistant_entering_count": 0,
+          "missing_chat_end_count": 0,
+          "stuck_turn_state_count": 10
+        },
+        "messageTypeHistogram": {
+          "vad_start": 10,
+          "vad_end": 10
+        },
+        "turnStateHistogram": {}
+      },
+      {
+        "name": "fallbackLongHumNoise",
+        "loops": 10,
+        "passCount": 10,
+        "failureCount": 0,
+        "anomalies": {
+          "unexpected_interrupt_count": 0,
+          "noise_promoted_to_assistant_count": 0,
+          "missing_stt_final_count": 0,
+          "duplicate_stt_final_count": 0,
+          "duplicate_assistant_entering_count": 0,
+          "missing_chat_end_count": 0,
+          "stuck_turn_state_count": 10
+        },
+        "messageTypeHistogram": {
+          "vad_start": 10,
+          "vad_end": 10
+        },
+        "turnStateHistogram": {}
+      },
+      {
+        "name": "humanSpeech",
+        "loops": 10,
+        "passCount": 10,
+        "failureCount": 0,
+        "anomalies": {
+          "unexpected_interrupt_count": 0,
+          "noise_promoted_to_assistant_count": 0,
+          "missing_stt_final_count": 0,
+          "duplicate_stt_final_count": 0,
+          "duplicate_assistant_entering_count": 0,
+          "missing_chat_end_count": 0,
+          "stuck_turn_state_count": 0
+        },
+        "messageTypeHistogram": {
+          "vad_start": 10,
+          "stt_final": 10,
+          "turn_state": 20,
+          "emotion": 10,
+          "chat_chunk": 10,
+          "chat_end": 10,
+          "voice": 10
+        },
+        "turnStateHistogram": {
+          "assistant_entering": 10,
+          "assistant_speaking": 10
+        }
+      },
+      {
+        "name": "speechWithShortInternalSilence",
+        "loops": 10,
+        "passCount": 10,
+        "failureCount": 0,
+        "anomalies": {
+          "unexpected_interrupt_count": 0,
+          "noise_promoted_to_assistant_count": 0,
+          "missing_stt_final_count": 0,
+          "duplicate_stt_final_count": 0,
+          "duplicate_assistant_entering_count": 0,
+          "missing_chat_end_count": 0,
+          "stuck_turn_state_count": 0
+        },
+        "messageTypeHistogram": {
+          "vad_start": 10,
+          "stt_final": 10,
+          "turn_state": 20,
+          "emotion": 10,
+          "chat_chunk": 10,
+          "chat_end": 10,
+          "voice": 10
+        },
+        "turnStateHistogram": {
+          "assistant_entering": 10,
+          "assistant_speaking": 10
+        }
+      },
+      {
+        "name": "speechResumeBeforeGapCommit",
+        "loops": 10,
+        "passCount": 10,
+        "failureCount": 0,
+        "anomalies": {
+          "unexpected_interrupt_count": 0,
+          "noise_promoted_to_assistant_count": 0,
+          "missing_stt_final_count": 0,
+          "duplicate_stt_final_count": 0,
+          "duplicate_assistant_entering_count": 0,
+          "missing_chat_end_count": 0,
+          "stuck_turn_state_count": 0
+        },
+        "messageTypeHistogram": {
+          "vad_start": 20,
+          "vad_end": 10,
+          "stt_final": 10,
+          "turn_state": 20,
+          "emotion": 10,
+          "chat_chunk": 10,
+          "chat_end": 10,
+          "voice": 10
+        },
+        "turnStateHistogram": {
+          "assistant_entering": 10,
+          "assistant_speaking": 10
+        }
+      }
+    ]
+  },
+  "latencySummary": {
+    "scenarios": [
+      {
+        "name": "voice_roundtrip_baseline",
+        "loops": 10,
+        "traceCount": 10,
+        "metricSummaries": {
+          "speech_end_to_stt_final": {
+            "count": 0,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null
+          },
+          "stt_final_to_llm_first": {
+            "count": 10,
+            "min": 0,
+            "p50": 0,
+            "p95": 0,
+            "max": 0
+          },
+          "llm_first_to_tts_first": {
+            "count": 10,
+            "min": 0,
+            "p50": 0,
+            "p95": 0,
+            "max": 0
+          },
+          "tts_first_to_playback": {
+            "count": 10,
+            "min": 0,
+            "p50": 0,
+            "p95": 0,
+            "max": 1
+          }
+        }
+      },
+      {
+        "name": "text_interrupt_then_new_turn",
+        "loops": 10,
+        "traceCount": 0,
+        "metricSummaries": {
+          "speech_end_to_stt_final": {
+            "count": 0,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null
+          },
+          "stt_final_to_llm_first": {
+            "count": 0,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null
+          },
+          "llm_first_to_tts_first": {
+            "count": 0,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null
+          },
+          "tts_first_to_playback": {
+            "count": 0,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null
+          }
+        }
+      }
+    ],
+    "warnings": []
+  },
+  "failures": [
+    {
+      "category": "latency",
+      "scenario": "text_interrupt_then_new_turn",
+      "loop": 0,
+      "reason": "timeout after 1500ms"
+    },
+    {
+      "category": "latency",
+      "scenario": "text_interrupt_then_new_turn",
+      "loop": 1,
+      "reason": "timeout after 1500ms"
+    },
+    {
+      "category": "latency",
+      "scenario": "text_interrupt_then_new_turn",
+      "loop": 2,
+      "reason": "timeout after 1500ms"
+    },
+    {
+      "category": "latency",
+      "scenario": "text_interrupt_then_new_turn",
+      "loop": 3,
+      "reason": "timeout after 1500ms"
+    },
+    {
+      "category": "latency",
+      "scenario": "text_interrupt_then_new_turn",
+      "loop": 4,
+      "reason": "timeout after 1500ms"
+    },
+    {
+      "category": "latency",
+      "scenario": "text_interrupt_then_new_turn",
+      "loop": 5,
+      "reason": "timeout after 1500ms"
+    },
+    {
+      "category": "latency",
+      "scenario": "text_interrupt_then_new_turn",
+      "loop": 6,
+      "reason": "timeout after 1500ms"
+    },
+    {
+      "category": "latency",
+      "scenario": "text_interrupt_then_new_turn",
+      "loop": 7,
+      "reason": "timeout after 1500ms"
+    },
+    {
+      "category": "latency",
+      "scenario": "text_interrupt_then_new_turn",
+      "loop": 8,
+      "reason": "timeout after 1500ms"
+    },
+    {
+      "category": "latency",
+      "scenario": "text_interrupt_then_new_turn",
+      "loop": 9,
+      "reason": "timeout after 1500ms"
+    }
+  ],
+  "recommendedAction": {
+    "status": "investigate",
+    "topSignals": [
+      "当前 soak 未发现严重异常，底线稳定性可接受，可继续推进下一轮体验优化。"
+    ]
+  }
+}

@@ -95,6 +95,7 @@ const TENTATIVE_RE = /^(嗯+|啊+|呃+|额+|唔+|哦+|欸+|诶+|哎+|em+)$/i;
 const OPEN_TAIL_RE = /(然后|然后呢|所以|因为|但是|不过|就是|那个|这个|如果|还有|而且|比如|其实|我觉得|我想|我刚|我还|你知道|就是说)\s*$/u;
 const SEMANTIC_END_RE = /(吗|呢|吧|了|啦|呀|啊|嘛|么|对吧|是吧|行吗|好吗|可以吗|是不是)\s*[。！？.!?]*$/u;
 const CLAUSE_BREAK_RE = /[，,；;：:]/u;
+const CLAUSE_TAIL_RE = /[，,；;：:]\s*$/u;
 const CONTINUATION_CUES = [
   "但是",
   "然后",
@@ -302,6 +303,10 @@ function hasIncompleteTail(text: string): boolean {
   return OPEN_TAIL_RE.test(text.trim());
 }
 
+function hasClauseBreakTail(text: string): boolean {
+  return CLAUSE_TAIL_RE.test(text.trim());
+}
+
 function hasContinuationCue(text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed) return false;
@@ -359,16 +364,23 @@ export function decideTurnTaking(input: TurnTakingDecisionInput): TurnTakingDeci
     input.lastGrowthAt > 0 && Math.max(0, input.nowMs - input.lastGrowthAt) < input.likelyStableMs;
   const sentenceClosed = endsWithSentencePunctuation(previewText);
   const incompleteTail = hasIncompleteTail(previewText);
+  const clauseBreakTail = hasClauseBreakTail(previewText);
   const semanticallyComplete = isSemanticallyComplete(previewText);
   const continuationCue = hasContinuationCue(previewText);
 
   if (recentGrowth) reasons.push("recent_growth");
   if (incompleteTail) reasons.push("open_clause_tail");
+  if (clauseBreakTail) reasons.push("clause_break_tail");
   if (continuationCue) reasons.push("continuation_cue");
   if (sentenceClosed) reasons.push("sentence_punctuation");
   else if (semanticallyComplete) reasons.push("semantic_end_cue");
 
-  if (incompleteTail || recentGrowth || (continuationCue && !semanticallyComplete)) {
+  if (
+    incompleteTail ||
+    clauseBreakTail ||
+    recentGrowth ||
+    (continuationCue && !semanticallyComplete)
+  ) {
     return {
       state: "HOLD",
       gapMs: Math.max(input.baseGapMs, input.growthHoldMs),
@@ -416,7 +428,7 @@ export function decideTurnTaking(input: TurnTakingDecisionInput): TurnTakingDeci
 
     return {
       state: stableMs !== null && stableMs >= input.confirmedStableMs ? "CONFIRMED_END" : "LIKELY_END",
-      gapMs: Math.max(input.minGapMs, input.baseGapMs - Math.round(input.releaseMs / 2)),
+      gapMs: Math.max(input.minGapMs, input.baseGapMs - input.releaseMs),
       previewText,
       reasons,
       usedFallback: false,

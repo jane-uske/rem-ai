@@ -33,6 +33,9 @@
 | M7  | Edge TTS **连接池**：同 voice/lang/rate/pitch/fmt 复用 WebSocket，仅 SSML 多轮；`edge_tts_pool=0` 关闭           | `voice/tts.ts`                                                                      |
 | M8  | 可选服务端短填充音：环境变量 `rem_thinking_filler=1` 时与 LLM 并行异步播「嗯」                                             | `server/pipeline/runner.ts`                                                         |
 | M9  | 前端 user/rem 消息 localStorage 持久化（最近 50 条）                                                           | `web/src/hooks/useRemChat.ts`                                                       |
+| M10 | 打断语义修复：被打断 partial 不进 formal history / slow brain / assistant 持久化；`wasInterrupted` 仅由真实打断触发 | `brains/brain_router.ts`, `brains/rem_session_context.ts`, `server/pipeline/runner.ts` |
+| M11 | 观测性收口：网关 `/health`、稳定 latency snapshot、固定 duplex harness 场景名                                  | `server/gateway/index.ts`, `infra/latency_tracer.ts`, `test/server/session/duplex_harness.ts` |
+| M12 | turn lifecycle 收口：idle text send 不再误发 `interrupt`；`chat_end` 与 playback drain 分离                    | `server/session/index.ts`, `web/src/hooks/useRemChat.ts`                           |
 
 
 ---
@@ -59,6 +62,7 @@
 | **§3 其他**   | 全局 per-session 状态（C1）、流式 STT（C3）、**HTTP 限流**：网关 `createServer` 已对非 WebSocket 请求做 IP 桶（100/min），与 `infra/rate_limiter` 中 Express 中间件互补；生产可再调 `JWT` + 反向代理；ServerMessage 更细字段约束等，见下文与 **🔴 复杂任务** |
 | **产品**      | 口型同步（TASKS **T-032**）、向量记忆检索与对话历史的深度整合                                                                                                                                                          |
 | **3.15 体验** | 语音结束淡入淡出、断线后 **服务端上下文恢复**（仅本地消息已持久化）                                                                                                                                                            |
+| **已收口**     | `interrupt` / `chat_end` / `confirmed_end` 语义边界，见 `README.md` / `PIPELINE.md`                                                                                                                                      |
 
 
 ---
@@ -761,5 +765,4 @@ C1 ✅ → C3 → C4 → C5
 | 用户觉得在和"人"聊天                | 低                       | 高 (通过 A/B 测试)  |
 | 多连接状态隔离                    | `RemSessionContext`（C1） | 无跨连接共享情绪/历史/慢脑 |
 | TTS 缓存命中率                  | 0%                      | > 30% (短句)     |
-
 
