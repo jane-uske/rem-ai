@@ -256,6 +256,19 @@ OpenAI 兼容的流式聊天客户端。
 - `SessionMemoryOverlayRepository`（`session_memory_overlay.ts`）：每连接本地优先 overlay，支持启动预加载和异步写回持久层
 - `PostgreSQL 实现`（`storage/repositories/memory_repository.ts`）：持久化 + pgvector 向量语义检索
 
+**Relationship State（当前主线程相关）**
+
+- `memory/relationship_state.ts`：定义用户级 relationship state 的持久化契约与开关
+- `brains/slow_brain_store.ts`：聚合 relationship / topic / mood / proactive runtime state，并输出 `synthesizeContext()` 与 `buildConversationStrategyHints()`
+- `brains/slow_brain.ts`：在非中断完成态结束后异步写回 relationship state
+- `brains/rem_session_context.ts`：提供 `hydratePersistentRelationshipState(...)` 作为恢复入口
+
+当前已确认现状：
+- relationship state 的持久化写回已存在
+- live path 仍主要通过 `SessionMemoryOverlayRepository` + `retrieveMemory()->getAll()` 读取 prompt memory
+- relationship restore 入口已存在，但 session 初始化主链路尚未完整接上
+- 现在的主要缺口是恢复链路与相关召回，而不是底层完全没有能力
+
 **Memory Decay (`memory_decay.ts`)**
 
 记忆衰减与遗忘：
@@ -522,7 +535,7 @@ server/
 | 语音打断 | 全双工 VAD + 打断控制已实现 | 优化回声消除、VAD 阈值、TTS 分段 |
 | 认证限流 | WebSocket 限流已集成，HTTP 限流待集成 | 完整集成 Auth + HTTP Rate Limiter |
 | TTS 工程 | Edge 默认同参数连接池 + 短句缓存 + 全链路重试；`edge_tts_pool=0` 可关闭池化 | 极端负载下池化策略与多音色隔离可再调 |
-| 每连接对话状态 | `RemSessionContext`：情绪 / 历史 / 慢脑 / session memory overlay（**C1 ✅**） | 用户级持久记忆继续异步写回；向量检索暂未接入 live path |
+| 每连接对话状态 | `RemSessionContext`：情绪 / 历史 / 慢脑 / session memory overlay（**C1 ✅**） | relationship state 需接入 session init 恢复；相关召回需替换当前 `getAll()` live retrieval |
 | 部署 | Dockerfile + Docker Compose 已完成 | 生产环境验证 + CI/CD |
 
 **文档：** 已完成与待办的工程项清单见根目录 [OPTIMIZATION.md](OPTIMIZATION.md)（含 M1–M9、S9/S10、C1–C5 状态）。

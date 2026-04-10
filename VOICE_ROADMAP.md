@@ -8,6 +8,25 @@ This should be done in stages, not via a full rewrite.
 
 ---
 
+## Current Priority Before Voice Expansion
+
+Before expanding further into voice behavior, the current main thread is:
+- relationship layer phase 1
+
+Why this comes first:
+- fast brain behavior upgrades only matter if relationship state can already be consumed consistently
+- proactive behavior only feels natural if proactive hooks already exist and survive across reconnects
+- otherwise the system risks becoming a smoother voice bot instead of a more continuous companion
+
+Current focus:
+- restore per-user relationship state
+- restore continuity across reconnects
+- inject relationship summary / topic continuity / mood trajectory / proactive hooks into prompt context
+
+See [CURRENT_FOCUS.md](CURRENT_FOCUS.md) for the short execution view.
+
+---
+
 ## Current Architecture Summary
 
 Current broad flow:
@@ -47,6 +66,7 @@ Key current weaknesses:
 - `chat_end` now means text stream completion; the client can remain in `assistant_speaking` until local playback drains.
 - interrupted assistant partials now stay out of formal history / slow brain / normal assistant persistence.
 - `/health`, latency tracer snapshots, and duplex harness scenario keys are now usable as a repeatable baseline.
+- the next bottleneck is no longer only voice semantics; relationship continuity is now the main missing layer
 
 ---
 

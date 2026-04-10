@@ -1,6 +1,8 @@
 // ── Slow Brain State Store ──────────────────────────────────
 // 每条 WebSocket 连接独立一份（C1）。
 
+import type { PersistentRelationshipStateV1 } from "../memory/relationship_state";
+
 export interface UserProfile {
   facts: Map<string, string>;
   interests: string[];
@@ -26,6 +28,15 @@ export interface MoodSnapshot {
   mood: string;
 }
 
+export interface SharedMoment {
+  summary: string;
+  topic: string;
+  mood: string;
+  hook: string;
+  turn: number;
+  createdAt: number;
+}
+
 export interface SlowBrainSnapshot {
   userProfile: UserProfile;
   relationship: RelationshipState;
@@ -33,6 +44,7 @@ export interface SlowBrainSnapshot {
   moodTrajectory: MoodSnapshot[];
   conversationSummary: string;
   proactiveTopics: string[];
+  sharedMoments: SharedMoment[];
 }
 
 export class SlowBrainStore {
@@ -53,6 +65,7 @@ export class SlowBrainStore {
   private readonly moodTrajectory: MoodSnapshot[] = [];
   private conversationSummary = "";
   private proactiveTopics: string[] = [];
+  private readonly sharedMoments: SharedMoment[] = [];
 
   addFact(key: string, value: string): void {
     this.profile.facts.set(key, value);
@@ -73,11 +86,14 @@ export class SlowBrainStore {
     }
   }
 
+  recordTurn(): void {
+    this.relationship.turnCount++;
+  }
+
   bumpRelationship(opts: {
     familiarityDelta?: number;
     emotionalBondDelta?: number;
   }): void {
-    this.relationship.turnCount++;
     if (opts.familiarityDelta) {
       this.relationship.familiarity = clamp01(
         this.relationship.familiarity + opts.familiarityDelta,
@@ -129,6 +145,111 @@ export class SlowBrainStore {
     this.proactiveTopics = topics.slice(0, 5);
   }
 
+  recordSharedMoment(input: {
+    summary: string;
+    topic?: string;
+    mood?: string;
+    hook?: string;
+    createdAt?: number;
+  }): void {
+    const summary = input.summary.trim();
+    if (!summary) return;
+
+    const topic = input.topic?.trim() ?? "";
+    const mood = input.mood?.trim() ?? "";
+    const hook = input.hook?.trim() ?? "";
+    const normalized = summary.toLowerCase();
+    const existingIndex = this.sharedMoments.findIndex((entry) => {
+      if (entry.summary.toLowerCase() === normalized) return true;
+      if (topic && entry.topic === topic && entry.turn === this.relationship.turnCount) {
+        return true;
+      }
+      return false;
+    });
+
+    const nextMoment: SharedMoment = {
+      summary,
+      topic,
+      mood,
+      hook,
+      turn: this.relationship.turnCount,
+      createdAt: input.createdAt ?? Date.now(),
+    };
+
+    if (existingIndex >= 0) {
+      this.sharedMoments.splice(existingIndex, 1);
+    }
+    this.sharedMoments.unshift(nextMoment);
+    if (this.sharedMoments.length > 6) {
+      this.sharedMoments.length = 6;
+    }
+  }
+
+  exportPersistentState(updatedAt: number = Date.now()): PersistentRelationshipStateV1 {
+    const snap = this.getSnapshot();
+    return {
+      version: "v1",
+      updatedAt,
+      userProfile: {
+        interests: [...snap.userProfile.interests],
+        personalityNotes: [...snap.userProfile.personalityNotes],
+      },
+      relationship: {
+        ...snap.relationship,
+        preferredTopics: [...snap.relationship.preferredTopics],
+      },
+      topicHistory: snap.topicHistory.map((entry) => ({ ...entry })),
+      moodTrajectory: snap.moodTrajectory.map((entry) => ({ ...entry })),
+      conversationSummary: snap.conversationSummary,
+      proactiveTopics: [...snap.proactiveTopics],
+      sharedMoments: snap.sharedMoments.map((entry) => ({ ...entry })),
+    };
+  }
+
+  hydratePersistentState(state: PersistentRelationshipStateV1): void {
+    this.profile.interests.splice(
+      0,
+      this.profile.interests.length,
+      ...state.userProfile.interests,
+    );
+    this.profile.personalityNotes.splice(
+      0,
+      this.profile.personalityNotes.length,
+      ...state.userProfile.personalityNotes,
+    );
+
+    this.relationship.familiarity = clamp01(state.relationship.familiarity);
+    this.relationship.emotionalBond = clamp01(state.relationship.emotionalBond);
+    this.relationship.turnCount = Math.max(0, state.relationship.turnCount);
+    this.relationship.preferredTopics.splice(
+      0,
+      this.relationship.preferredTopics.length,
+      ...state.relationship.preferredTopics,
+    );
+
+    this.topicHistory.splice(
+      0,
+      this.topicHistory.length,
+      ...state.topicHistory.map((entry) => ({ ...entry })),
+    );
+    this.moodTrajectory.splice(
+      0,
+      this.moodTrajectory.length,
+      ...state.moodTrajectory.map((entry) => ({ ...entry })),
+    );
+    this.conversationSummary = state.conversationSummary;
+    this.proactiveTopics.splice(
+      0,
+      this.proactiveTopics.length,
+      ...state.proactiveTopics,
+    );
+    this.sharedMoments.splice(
+      0,
+      this.sharedMoments.length,
+      ...state.sharedMoments.map((entry) => ({ ...entry })),
+    );
+  }
+
   getSnapshot(): SlowBrainSnapshot {
     return {
       userProfile: {
@@ -141,6 +262,7 @@ export class SlowBrainStore {
       moodTrajectory: [...this.moodTrajectory],
       conversationSummary: this.conversationSummary,
       proactiveTopics: [...this.proactiveTopics],
+      sharedMoments: this.sharedMoments.map((entry) => ({ ...entry })),
     };
   }
 
@@ -212,6 +334,13 @@ export class SlowBrainStore {
       );
     }
 
+    if (this.sharedMoments.length > 0) {
+      const recentMoments = this.sharedMoments
+        .slice(0, 2)
+        .map((entry) => `- ${entry.summary}`);
+      sections.push(`【最近共同经历】\n${recentMoments.join("\n")}`);
+    }
+
     return sections.length > 0 ? sections.join("\n\n") : undefined;
   }
 
@@ -232,6 +361,11 @@ export class SlowBrainStore {
       lines.push("用户较信任你：语气可更温柔、少评判。");
     }
 
+    const relationshipStyle = buildRelationshipStyleGuidance(snap);
+    if (relationshipStyle) {
+      lines.push(relationshipStyle);
+    }
+
     const lastMoods = snap.moodTrajectory.slice(-3).map((m) => m.mood).join("");
     if (/难过|伤心|焦虑|疲惫|烦|丧/.test(lastMoods)) {
       lines.push("近期情绪偏负面：先共情与确认感受，少给大道理。");
@@ -246,6 +380,16 @@ export class SlowBrainStore {
       lines.push(
         `若用户话少或冷场，可从这些方向自然接话：${snap.proactiveTopics.slice(0, 2).join("、")}。`,
       );
+    }
+
+    const proactiveCandidate = pickProactiveHook(snap, userMessage);
+    if (proactiveCandidate) {
+      lines.push(`【主动提起候选】如果这轮适合自然续聊，可轻轻接回：${proactiveCandidate}`);
+    }
+
+    const sharedMomentCandidate = pickSharedMomentCue(snap, userMessage);
+    if (sharedMomentCandidate) {
+      lines.push(`【共同经历提醒】若用户提到相关线索，可自然承接：${sharedMomentCandidate}`);
     }
 
     return lines.length > 0 ? lines.join("\n") : undefined;
@@ -274,4 +418,116 @@ function clamp01(n: number): number {
 
 function sentimentLabel(s: TopicEntry["sentiment"]): string {
   return s === "positive" ? "正面" : s === "negative" ? "负面" : "中性";
+}
+
+function parseBooleanFlag(raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined || raw === "") return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "1" || normalized === "true") return true;
+  if (normalized === "0" || normalized === "false") return false;
+  return fallback;
+}
+
+function relationshipStyleGuidanceEnabled(): boolean {
+  return parseBooleanFlag(process.env.REM_RELATIONSHIP_STYLE_GUIDANCE_ENABLED, true);
+}
+
+function proactivePromptEnabled(): boolean {
+  return parseBooleanFlag(process.env.REM_PROACTIVE_PROMPT_ENABLED, true);
+}
+
+function normalizeText(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\u4e00-\u9fff]+/gu, " ")
+    .trim();
+}
+
+function extractKeywords(text: string): string[] {
+  const normalized = normalizeText(text);
+  if (!normalized) return [];
+  return normalized
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2);
+}
+
+function buildRelationshipStyleGuidance(snap: SlowBrainSnapshot): string | null {
+  if (!relationshipStyleGuidanceEnabled()) return null;
+
+  const { familiarity, emotionalBond } = snap.relationship;
+  const addressStyle =
+    familiarity > 0.6
+      ? "称呼可以更亲近、更口语"
+      : familiarity > 0.3
+        ? "称呼自然一点，不用太客套"
+        : "称呼保持自然礼貌，先别太自来熟";
+  const careStyle =
+    emotionalBond > 0.55
+      ? "关心可以更直接、更有陪伴感"
+      : emotionalBond > 0.3
+        ? "关心保持稳定温柔，轻轻接住情绪"
+        : "关心点到为止，先陪对方说完";
+  const followUpStyle =
+    familiarity > 0.5
+      ? "追问可以略深一层，但别连问太多"
+      : "追问只补一小步，留空间给对方";
+  const emotionCarryStyle =
+    emotionalBond > 0.45
+      ? "情绪承接时先共情，再顺着对方节奏继续"
+      : "情绪承接先确认感受，不急着给方案";
+
+  return `【关系表达风格】${addressStyle}；${careStyle}；${followUpStyle}；${emotionCarryStyle}。`;
+}
+
+function pickProactiveHook(snap: SlowBrainSnapshot, userMessage: string): string | null {
+  if (!proactivePromptEnabled()) return null;
+  if (snap.relationship.turnCount < 2 || snap.relationship.familiarity < 0.3) return null;
+
+  const message = userMessage.trim();
+  const messageKeywords = new Set(extractKeywords(message));
+  const candidates = [
+    ...snap.proactiveTopics,
+    ...snap.sharedMoments.map((entry) => entry.hook).filter(Boolean),
+  ].filter(Boolean);
+  if (candidates.length === 0) return null;
+
+  const uniqueCandidates = [...new Set(candidates)];
+  const ranked = uniqueCandidates
+    .map((candidate) => ({
+      candidate,
+      score: extractKeywords(candidate).reduce(
+        (sum, keyword) => sum + (messageKeywords.has(keyword) ? 1 : 0),
+        0,
+      ),
+    }))
+    .sort((a, b) => b.score - a.score || a.candidate.length - b.candidate.length);
+
+  if (ranked[0]?.score > 0) {
+    return ranked[0].candidate;
+  }
+
+  return message.length <= 12 ? ranked[0]?.candidate ?? null : null;
+}
+
+function pickSharedMomentCue(snap: SlowBrainSnapshot, userMessage: string): string | null {
+  if (snap.sharedMoments.length === 0) return null;
+
+  const messageKeywords = new Set(extractKeywords(userMessage));
+  const moments = snap.sharedMoments
+    .map((entry) => {
+      const text = `${entry.summary} ${entry.topic} ${entry.hook}`.trim();
+      const score = extractKeywords(text).reduce(
+        (sum, keyword) => sum + (messageKeywords.has(keyword) ? 1 : 0),
+        0,
+      );
+      return { entry, score };
+    })
+    .sort((a, b) => b.score - a.score || b.entry.turn - a.entry.turn);
+
+  if (moments[0]?.score && moments[0].score > 0) {
+    return moments[0].entry.summary;
+  }
+
+  return userMessage.trim().length <= 10 ? moments[0]?.entry.summary ?? null : null;
 }

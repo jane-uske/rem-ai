@@ -1,7 +1,4 @@
-import {
-  routeMessage,
-  type RouteMessageOptions,
-} from "../brains/brain_router";
+import type { RouteMessageOptions } from "../brains/brain_router";
 import type { RemSessionContext } from "../brains/rem_session_context";
 import type { Emotion } from "../emotion/emotion_state";
 
@@ -22,5 +19,24 @@ export async function* chatStream(
   signal?: AbortSignal,
   routeOpts?: RouteMessageOptions,
 ): AsyncGenerator<string> {
-  yield* routeMessage(ctx, message, emotion, signal, routeOpts);
+  yield* loadBrainRouter().routeMessage(ctx, message, emotion, signal, routeOpts);
+}
+
+function loadBrainRouter(): {
+  routeMessage: (
+    ctx: RemSessionContext,
+    message: string,
+    emotion: Emotion,
+    signal?: AbortSignal,
+    routeOpts?: RouteMessageOptions,
+  ) => AsyncGenerator<string>;
+} {
+  try {
+    return require("../brains/brain_router");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "MODULE_NOT_FOUND") {
+      throw err;
+    }
+    return require("../brains/brain_router.ts");
+  }
 }

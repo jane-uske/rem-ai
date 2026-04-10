@@ -3,6 +3,7 @@ const path = require("path");
 
 const { waitFor } = require("../../helpers/session_harness");
 const { FakeWebSocket } = require("../../helpers/fake_ws");
+const { RELATIONSHIP_STATE_KEY } = require("../../../memory/relationship_state");
 
 function applyEnv(values) {
   const previous = {};
@@ -25,7 +26,10 @@ function applyEnv(values) {
   };
 }
 
-function loadSessionWithPersistentMemory({ overlayEnabled = "1", entries = [] } = {}) {
+function loadSessionWithPersistentMemory({
+  overlayEnabled = "1",
+  entries = [],
+} = {}) {
   const restoreEnv = applyEnv({
     REM_PERSISTENT_MEMORY_OVERLAY_ENABLED: overlayEnabled,
     REM_PERSISTENT_MEMORY_PRELOAD_LIMIT: "12",
@@ -57,10 +61,12 @@ function loadSessionWithPersistentMemory({ overlayEnabled = "1", entries = [] } 
   const originalDevIdentity = require.cache[devIdentityPath];
   const originalSessionRepo = require.cache[sessionRepositoryPath];
   const originalPgRepo = require.cache[pgRepoPath];
-
-  const hooks = { getAllCalls: 0, createSessionCalls: 0, devUserCalls: 0 };
+  const hooks = { getAllCalls: 0, createSessionCalls: 0, devUserCalls: 0, upsertCalls: 0 };
   const persistentRepo = {
-    async upsert() {},
+    async upsert(key, value) {
+      hooks.upsertCalls += 1;
+      hooks.lastUpsert = { key, value };
+    },
     async getAll() {
       hooks.getAllCalls += 1;
       return entries.map((entry) => ({ ...entry }));
@@ -159,16 +165,62 @@ describe("persistent memory overlay session wiring", () => {
           createdAt: 100,
           lastAccessedAt: 200,
         },
+        {
+          key: RELATIONSHIP_STATE_KEY,
+          value: JSON.stringify({
+            version: "v1",
+            updatedAt: 120,
+            userProfile: {
+              interests: ["散步"],
+              personalityNotes: [],
+            },
+            relationship: {
+              familiarity: 0.4,
+              emotionalBond: 0.35,
+              turnCount: 4,
+              preferredTopics: ["睡眠"],
+            },
+            topicHistory: [
+              { topic: "睡眠", depth: 2, lastTurn: 4, sentiment: "negative" },
+            ],
+            moodTrajectory: [
+              { turn: 4, mood: "疲惫/烦躁" },
+            ],
+            conversationSummary: "最近一直在聊晚上睡不好。",
+            proactiveTopics: ["昨晚睡得怎么样"],
+            sharedMoments: [
+              {
+                summary: "上次你提到晚上睡不好，我们聊到睡前散步会不会有帮助。",
+                topic: "睡眠",
+                mood: "疲惫/烦躁",
+                hook: "昨晚睡得怎么样",
+                turn: 4,
+                createdAt: 110,
+              },
+            ],
+          }),
+          importance: 1,
+          accessCount: 0,
+          createdAt: 120,
+          lastAccessedAt: 220,
+        },
       ],
     });
 
     try {
       await waitFor(() => hooks.createSessionCalls === 1 && hooks.getAllCalls === 1, 800);
       const memories = await session.brain.memory.getAll();
+      const slowBrainSnapshot = session.brain.slowBrain.getSnapshot();
       assert.equal(hooks.devUserCalls, 1);
       assert.equal(session.sessionId, "sess-1");
       assert.equal(session.brain.memory.hasPersistentBackend(), true);
       assert.deepEqual(memories.map((entry) => [entry.key, entry.value]), [["名字", "阿宁"]]);
+      assert.equal(slowBrainSnapshot.relationship.turnCount, 4);
+      assert.equal(slowBrainSnapshot.sharedMoments.length, 1);
+      assert.equal(
+        slowBrainSnapshot.sharedMoments[0].summary,
+        "上次你提到晚上睡不好，我们聊到睡前散步会不会有帮助。",
+      );
     } finally {
       restore();
     }
@@ -200,4 +252,5 @@ describe("persistent memory overlay session wiring", () => {
       restore();
     }
   });
+
 });

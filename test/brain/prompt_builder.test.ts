@@ -71,6 +71,23 @@ describe("prompt builder emotion speech style", () => {
     assert.ok(system.includes("不要像全新话题重开"));
   });
 
+  it("includes priority relationship context even when persona mode is enabled", () => {
+    const persona = createDefaultPersona();
+
+    const messages = buildPrompt({
+      memory: [],
+      emotion: "neutral",
+      history: [],
+      userMessage: "我们继续",
+      priorityContext: "【对话摘要】我们刚聊到最近失眠和晚上的散步习惯。",
+      persona,
+    });
+
+    const system = messages[0].content;
+    assert.ok(system.includes("【优先参考"));
+    assert.ok(system.includes("【对话摘要】我们刚聊到最近失眠和晚上的散步习惯。"));
+  });
+
   it("includes interruption recovery guidance when persona was interrupted", () => {
     const persona = createDefaultPersona();
     persona.liveState.wasInterrupted = true;

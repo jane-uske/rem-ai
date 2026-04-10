@@ -11,6 +11,12 @@ export type PersonaState = {
   liveState: PersonaLiveState;
 };
 
+type BuildPersonaPromptOptions = {
+  priorityContext?: string;
+  memoryStr?: string;
+  emotionSpeechGuidance?: string;
+};
+
 export function createDefaultPersona(): PersonaState {
   return {
     liveState: {
@@ -26,15 +32,19 @@ export function createDefaultPersona(): PersonaState {
 
 export function buildPersonaPrompt(
   persona: PersonaState,
-  memoryStr?: string,
-  emotionSpeechGuidance?: string,
+  options: BuildPersonaPromptOptions = {},
 ): string {
   const sections: string[] = [];
 
+  if (options.priorityContext?.trim()) {
+    sections.push("【优先参考（请自然融入对话，不要逐条复述）】");
+    sections.push(options.priorityContext.trim());
+  }
+
   sections.push("你是 Rem，一个温暖的陪伴型 AI。");
   sections.push(`当前情绪：${persona.liveState.currentMood}，情感状态：${persona.liveState.emotionalState}`);
-  if (emotionSpeechGuidance?.trim()) {
-    sections.push(emotionSpeechGuidance.trim());
+  if (options.emotionSpeechGuidance?.trim()) {
+    sections.push(options.emotionSpeechGuidance.trim());
   }
 
   if (persona.liveState.recentInteractions.length > 0) {
@@ -50,9 +60,9 @@ export function buildPersonaPrompt(
     sections.push("你刚刚被打断过。重新开口时先用一句很短的话接住上下文或接住对方，再继续展开，不要机械重复上一句。");
   }
 
-  if (memoryStr) {
+  if (options.memoryStr) {
     sections.push("用户信息：");
-    sections.push(memoryStr);
+    sections.push(options.memoryStr);
   }
 
   return sections.join("\n\n");

@@ -1,4 +1,6 @@
 See also:
+- CURRENT_FOCUS.md
+- TASKS.md
 - PROJECT_CONTEXT.md
 - VOICE_ROADMAP.md
 - ARCHITECTURE.md
@@ -43,6 +45,29 @@ When making changes, optimize for these in order:
    - do not break existing text chat flow
    - do not break fallback modes
    - keep feature flags for risky changes
+
+---
+
+## Current Focus
+
+Current main thread: 关系层第一阶段。
+
+Current goal:
+- make "她记得我们" real across reconnects, not just inside one session
+
+Do not prioritize first:
+- pure VAD threshold tuning
+- TTS first-audio micro-optimizations by themselves
+- avatar presentation expansion without relationship continuity payoff
+
+Success means:
+- per-user relationship state
+- cross-reconnect restore
+- prompt consumption of relationship summary / topic continuity / mood trajectory / proactive hooks
+- interrupted partials do not pollute formal state
+
+Read [CURRENT_FOCUS.md](CURRENT_FOCUS.md) before touching `server/session/*`, `brains/*`, `memory/*`, or `brain/*` for roadmap-sensitive work.
+After finishing code for a current-thread task, update the corresponding task status in [TASKS.md](TASKS.md) and any directly affected roadmap docs before reporting completion.
 
 ---
 
@@ -160,6 +185,8 @@ Always report in this format:
 ### 5. Remaining gaps
 - what is still not solved
 - what this task did NOT do
+
+If the work maps to a tracked task, update that task's document status before saying it is complete.
 
 Do not say "all done" unless all acceptance criteria are explicitly verified.
 

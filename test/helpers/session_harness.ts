@@ -34,7 +34,7 @@ function restoreEnvPatches(previous: Record<string, string | undefined>): void {
 
 function loadSessionHarness(options: HarnessOptions = {}) {
   const previousEnv = applyEnvPatches();
-  const appState = require(path.resolve(__dirname, "../../infra/app_state"));
+  const appState = require(path.resolve(__dirname, "../../infra/app_state.ts"));
   const previousDbReady = appState.isDbReady();
   const previousRedisReady = appState.isRedisReady();
   const previousMemoryMode = appState.getMemoryMode();
@@ -42,7 +42,7 @@ function loadSessionHarness(options: HarnessOptions = {}) {
   appState.setRedisReady(false);
   appState.setMemoryMode("in-memory");
 
-  const runner = require(path.resolve(__dirname, "../../server/pipeline/runner"));
+  const runner = require(path.resolve(__dirname, "../../server/pipeline/runner.ts"));
   const originalRunPipeline = runner.runPipeline;
   const pipelineCalls: Array<{ text: string; options: any }> = [];
   runner.runPipeline = async (
@@ -59,7 +59,7 @@ function loadSessionHarness(options: HarnessOptions = {}) {
     pipelineCalls.push({ text, options: runOptions });
   };
 
-  const sessionPath = path.resolve(__dirname, "../../server/session/index");
+  const sessionPath = path.resolve(__dirname, "../../server/session/index.ts");
   delete require.cache[require.resolve(sessionPath)];
   const { createSession } = require(sessionPath);
 

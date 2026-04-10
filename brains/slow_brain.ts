@@ -6,6 +6,10 @@
 import { complete, type ChatMessage } from "../llm/qwen_client";
 import { extractMemory } from "../memory/memory_agent";
 import type { MemoryRepository } from "../memory/memory_repository";
+import {
+  relationshipStateEnabled,
+  savePersistentRelationshipState,
+} from "../memory/relationship_state";
 import type { PromptMessage } from "../brain/prompt_builder";
 import { createLogger } from "../infra/logger";
 import type { SlowBrainStore } from "./slow_brain_store";
@@ -18,6 +22,7 @@ export interface SlowBrainInput {
   history: PromptMessage[];
   slowBrain: SlowBrainStore;
   memoryRepo: MemoryRepository;
+  relationshipRepo?: MemoryRepository | null;
   signal?: AbortSignal;
 }
 
@@ -27,12 +32,15 @@ export async function runSlowBrain(input: SlowBrainInput): Promise<void> {
   const t0 = Date.now();
   const { userMessage, assistantReply, history, slowBrain, memoryRepo } =
     input;
+  const relationshipRepo = input.relationshipRepo ?? memoryRepo;
 
+  slowBrain.recordTurn();
   extractMemory(userMessage, memoryRepo);
   localAnalysis(slowBrain, userMessage);
 
   const configured =
     process.env.key && process.env.base_url && process.env.model;
+  let llmAborted = false;
 
   if (configured) {
     try {
@@ -47,15 +55,33 @@ export async function runSlowBrain(input: SlowBrainInput): Promise<void> {
     } catch (err) {
       if ((err as Error).name === "AbortError") {
         logger.info("LLM 分析已取消");
-        return;
+        llmAborted = true;
+      } else {
+        logger.warn("LLM 分析失败，仅使用本地分析", { error: (err as Error).message });
       }
-      logger.warn("LLM 分析失败，仅使用本地分析", { error: (err as Error).message });
     }
   }
 
   updateRelationship(slowBrain, userMessage);
+  maybeRecordSharedMoment(slowBrain, userMessage, assistantReply);
 
-  logger.info("分析完成", { duration: Date.now() - t0 });
+  if (relationshipStateEnabled() && relationshipRepo) {
+    try {
+      await savePersistentRelationshipState(
+        relationshipRepo,
+        slowBrain.exportPersistentState(),
+      );
+    } catch (err) {
+      logger.warn("关系状态持久化失败", {
+        error: (err as Error).message,
+      });
+    }
+  }
+
+  logger.info("分析完成", {
+    duration: Date.now() - t0,
+    llmAborted,
+  });
 }
 
 // ── Phase 1: Local heuristics (zero-cost) ──
@@ -253,4 +279,95 @@ function updateRelationship(store: SlowBrainStore, userMessage: string): void {
   if (/我(以前|之前|小时候|年轻|那时|曾经)/.test(userMessage)) {
     store.bumpRelationship({ emotionalBondDelta: 0.03 });
   }
+}
+
+function episodeMemoryEnabled(): boolean {
+  const raw = (process.env.REM_EPISODE_MEMORY_ENABLED ?? "1").trim().toLowerCase();
+  return raw !== "0" && raw !== "false";
+}
+
+function maybeRecordSharedMoment(
+  store: SlowBrainStore,
+  userMessage: string,
+  assistantReply: string,
+): void {
+  if (!episodeMemoryEnabled()) return;
+
+  const trimmedUser = userMessage.trim();
+  const trimmedReply = assistantReply.trim();
+  if (!trimmedUser || !trimmedReply) return;
+  if (trimmedUser.length < 8) return;
+  if (/^(继续说|继续刚才|刚才说到哪|接着说|然后呢|嗯|哦|好吧)$/i.test(trimmedUser)) {
+    return;
+  }
+
+  const topic = detectSharedMomentTopic(trimmedUser, store);
+  const mood = detectSharedMomentMood(trimmedUser, store);
+  const looksMeaningful =
+    Boolean(topic) ||
+    /今天|昨天|昨晚|最近|刚刚|第一次|一直|因为|结果|开心|难过|焦虑|累|失眠|散步|跑步|工作|朋友|家人/.test(trimmedUser);
+  if (!looksMeaningful) return;
+
+  store.recordSharedMoment({
+    summary: buildSharedMomentSummary(trimmedUser, topic),
+    topic,
+    mood,
+    hook: buildSharedMomentHook(topic, store, trimmedUser),
+  });
+}
+
+function detectSharedMomentTopic(
+  userMessage: string,
+  store: SlowBrainStore,
+): string {
+  for (const { pattern, topic } of TOPIC_PATTERNS) {
+    if (pattern.test(userMessage)) {
+      return topic;
+    }
+  }
+
+  const snapshot = store.getSnapshot();
+  return snapshot.topicHistory
+    .slice()
+    .sort((a, b) => b.lastTurn - a.lastTurn || b.depth - a.depth)[0]?.topic ?? "";
+}
+
+function detectSharedMomentMood(
+  userMessage: string,
+  store: SlowBrainStore,
+): string {
+  for (const { keywords, mood } of MOOD_KEYWORDS) {
+    if (keywords.some((kw) => userMessage.includes(kw))) {
+      return mood;
+    }
+  }
+  return store.getSnapshot().moodTrajectory.slice(-1)[0]?.mood ?? "平静";
+}
+
+function buildSharedMomentSummary(userMessage: string, topic: string): string {
+  const clipped = clipText(userMessage, 38);
+  if (topic) {
+    return `上次你提到「${clipped}」，我们在继续聊${topic}。`;
+  }
+  return `上次你提到「${clipped}」，我们顺着那个话题聊了下去。`;
+}
+
+function buildSharedMomentHook(
+  topic: string,
+  store: SlowBrainStore,
+  userMessage: string,
+): string {
+  const snapshot = store.getSnapshot();
+  const relevant = snapshot.proactiveTopics.find((entry) => {
+    if (!topic) return false;
+    return entry.includes(topic) || userMessage.includes(topic);
+  });
+  if (relevant) return relevant;
+  if (topic) return `上次聊到的${topic}，后来怎么样了？`;
+  return snapshot.proactiveTopics[0] ?? "上次那个情况，后来有新进展吗？";
+}
+
+function clipText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
 }

@@ -1,4 +1,3 @@
-import { complete } from "../llm/qwen_client";
 import { createLogger } from "../infra/logger";
 import type {
   AvatarIntent,
@@ -186,7 +185,7 @@ export async function inferAvatarIntentFromReply(
   if (!trimmed) return fallbackIntent(replyText, emotion);
 
   try {
-    const raw = await complete(
+    const raw = await loadQwenClient().complete(
       [
         { role: "system", content: SYSTEM_PROMPT },
         {
@@ -211,5 +210,22 @@ export async function inferAvatarIntentFromReply(
       error: err instanceof Error ? err.message : String(err),
     });
     return fallbackIntent(trimmed, emotion);
+  }
+}
+
+function loadQwenClient(): {
+  complete: (
+    messages: Array<{ role: string; content: string }>,
+    maxTokens?: number,
+    signal?: AbortSignal,
+  ) => Promise<string>;
+} {
+  try {
+    return require("../llm/qwen_client");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "MODULE_NOT_FOUND") {
+      throw err;
+    }
+    return require("../llm/qwen_client.ts");
   }
 }

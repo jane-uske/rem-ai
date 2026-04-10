@@ -1,5 +1,63 @@
 # Rem AI — 开发任务
 
+## Current Main Thread
+
+当前主线程以 [CURRENT_FOCUS.md](CURRENT_FOCUS.md) 为准。
+
+当前最高优先级：关系层第一阶段。
+
+当前成功标准：
+- per-user relationship state
+- 跨重连恢复
+- prompt 消费 relationship summary / topic continuity / mood trajectory / proactive hooks
+- interrupted partial 不污染正式状态
+
+说明：
+- 下面的 `T-*` 列表主要是历史建设清单
+- 当前迭代优先级不要按旧 Phase 顺序理解
+- 先看下面这组 `R-*` 任务，再决定是否进入旧任务表
+- 当前主线程相关代码改动完成后，必须同步更新这里对应任务的状态与说明
+
+## Current Main Thread Tasks
+
+- [ ] **R-001** 文档入口统一
+  - 目标：让 agent 一进仓库就知道当前主线程是“关系层第一阶段”
+  - 输入/输出：更新 `AGENTS.md`、新增 `CURRENT_FOCUS.md`、在 `TASKS.md` 增加当前主线程入口
+  - 不做什么：不修改运行时代码
+  - 验收标准：只看 `AGENTS.md` 就知道现在先做什么；只看 `TASKS.md` 就能找到当前任务入口
+
+- [ ] **R-002** 关系状态恢复链路文档化
+  - 目标：明确 relationship state 的持久化恢复链路
+  - 输入/输出：说明 session init 应加载 relationship state、`hydratePersistentRelationshipState(...)` 的职责、恢复失败时的降级行为
+  - 不做什么：不在本任务里实现 restore wiring
+  - 验收标准：文档能让实现者清楚 restore 接在哪里、失败后如何退回 session 级行为
+
+- [ ] **R-003** prompt 消费链路文档化
+  - 目标：明确 relationship state 如何进入 prompt
+  - 输入/输出：说明 `synthesizeContext()` 的用途、`buildConversationStrategyHints()` 的用途、哪些字段属于 priority context
+  - 不做什么：不重写 prompt builder
+  - 验收标准：实现者能分清“长期关系上下文”和“本轮说话策略”的来源与职责
+
+- [ ] **R-004** 记忆召回升级任务定义
+  - 目标：把 retrieval 从 `getAll()` 升级为相关召回
+  - 输入/输出：定义 topic / mood / relationship 优先级，分离 system memory key 与普通用户事实，并保留无向量回退
+  - 不做什么：不在本任务里推进大规模 embedding/索引改造
+  - 验收标准：后续实现者能按文档推进 relevant retrieval，而不是继续全量平铺
+
+- [ ] **R-005** 中断污染保护任务定义
+  - 目标：明确 interrupted partial 的污染保护边界
+  - 输入/输出：说明 interrupted partial 不进 formal history、不进 slow brain、不写 relationship state
+  - 不做什么：不改变现有 interrupt 语义
+  - 验收标准：后续任务不会把 carry-forward 草稿误写进正式状态
+
+- [ ] **R-006** fast brain 行为层准备任务定义
+  - 目标：为 acknowledgement、backchannel、interruption carry-forward、关系状态驱动的短句节奏做准备
+  - 输入/输出：定义 fast brain 行为层边界和预期能力
+  - 不做什么：不把深检索、慢脑分析或大阻塞任务塞进 fast path
+  - 验收标准：实现者能在不破坏快慢脑边界的前提下扩展 fast brain 行为
+
+---
+
 ## Phase 0 · 项目基础
 
 - [x] **T-001** 初始化 Node.js + TypeScript 项目

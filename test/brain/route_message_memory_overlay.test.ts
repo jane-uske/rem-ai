@@ -3,6 +3,27 @@ const path = require("path");
 
 const { RemSessionContext } = require("../../brains/rem_session_context");
 
+function applyEnv(values) {
+  const previous = {};
+  for (const [key, value] of Object.entries(values)) {
+    previous[key] = process.env[key];
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+  return () => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  };
+}
+
 function createPersistentRepo(entries = []) {
   const hooks = { getAllCalls: 0 };
   return {
@@ -81,6 +102,166 @@ describe("routeMessage with session memory overlay", () => {
       assert.deepEqual(captured[0].memory, [{ key: "名字", value: "小满" }]);
     } finally {
       restore();
+    }
+  });
+
+  it("limits prompt memory to relationship-relevant facts instead of flooding all facts", async () => {
+    const restoreEnv = applyEnv({ MAX_PROMPT_MEMORY_ENTRIES: "4" });
+    const ctx = new RemSessionContext("memory-overlay-relevant");
+    const { repo } = createPersistentRepo([
+      {
+        key: "名字",
+        value: "小满",
+        importance: 0.9,
+        accessCount: 0,
+        createdAt: 100,
+        lastAccessedAt: 300,
+      },
+      {
+        key: "城市",
+        value: "杭州",
+        importance: 0.7,
+        accessCount: 0,
+        createdAt: 110,
+        lastAccessedAt: 290,
+      },
+      {
+        key: "运动喜好",
+        value: "夜跑",
+        importance: 0.6,
+        accessCount: 0,
+        createdAt: 120,
+        lastAccessedAt: 310,
+      },
+      {
+        key: "睡眠困扰",
+        value: "失眠",
+        importance: 0.8,
+        accessCount: 0,
+        createdAt: 130,
+        lastAccessedAt: 320,
+      },
+      {
+        key: "收藏歌手",
+        value: "王菲",
+        importance: 0.95,
+        accessCount: 0,
+        createdAt: 140,
+        lastAccessedAt: 330,
+      },
+    ]);
+    ctx.memory.attachPersistent(repo);
+    await ctx.memory.hydrateFromPersistent(12);
+    ctx.slowBrain.recordTurn();
+    ctx.slowBrain.touchTopic("夜跑", "positive");
+    ctx.slowBrain.touchTopic("睡眠", "negative");
+    ctx.slowBrain.setConversationSummary("最近一直在聊夜跑和睡眠状态。");
+    ctx.slowBrain.setProactiveTopics(["昨晚睡得怎么样"]);
+
+    const captured = [];
+    const { routeMessage, restore } = loadMockedRouteMessage(async function* (input) {
+      captured.push({
+        memory: input.memory.map((entry) => ({ ...entry })),
+        strategyHints: input.strategyHints,
+      });
+      yield "接住了";
+    });
+
+    try {
+      const chunks = [];
+      for await (const chunk of routeMessage(ctx, "昨晚夜跑完还是有点失眠", "neutral")) {
+        chunks.push(chunk);
+      }
+
+      assert.deepEqual(chunks, ["接住了"]);
+      assert.equal(captured.length, 1);
+      assert.equal(captured[0].memory.length, 4);
+      assert.deepEqual(
+        captured[0].memory.map((entry) => entry.key),
+        ["名字", "城市", "运动喜好", "睡眠困扰"],
+      );
+    } finally {
+      restore();
+      restoreEnv();
+    }
+  });
+
+  it("injects shared-moment memory and proactive/style hints without flooding the fast path", async () => {
+    const restoreEnv = applyEnv({
+      MAX_PROMPT_MEMORY_ENTRIES: "4",
+      REM_PROACTIVE_PROMPT_ENABLED: "1",
+      REM_RELATIONSHIP_STYLE_GUIDANCE_ENABLED: "1",
+    });
+    const ctx = new RemSessionContext("memory-overlay-shared-moment");
+    const { repo } = createPersistentRepo([
+      {
+        key: "名字",
+        value: "小满",
+        importance: 0.9,
+        accessCount: 0,
+        createdAt: 100,
+        lastAccessedAt: 300,
+      },
+      {
+        key: "城市",
+        value: "杭州",
+        importance: 0.7,
+        accessCount: 0,
+        createdAt: 110,
+        lastAccessedAt: 290,
+      },
+      {
+        key: "收藏歌手",
+        value: "王菲",
+        importance: 0.95,
+        accessCount: 0,
+        createdAt: 140,
+        lastAccessedAt: 330,
+      },
+    ]);
+    ctx.memory.attachPersistent(repo);
+    await ctx.memory.hydrateFromPersistent(12);
+    ctx.slowBrain.recordTurn();
+    ctx.slowBrain.recordTurn();
+    ctx.slowBrain.bumpRelationship({ familiarityDelta: 0.45, emotionalBondDelta: 0.5 });
+    ctx.slowBrain.touchTopic("睡眠", "negative");
+    ctx.slowBrain.setConversationSummary("最近一直在聊失眠和晚上的状态。");
+    ctx.slowBrain.setProactiveTopics(["昨晚睡得怎么样"]);
+    ctx.slowBrain.recordSharedMoment({
+      summary: "上次你提到失眠反复醒来，我们还聊到睡前散步会不会好一点。",
+      topic: "睡眠",
+      mood: "疲惫/烦躁",
+      hook: "昨晚睡得怎么样",
+      createdAt: 500,
+    });
+
+    const captured = [];
+    const { routeMessage, restore } = loadMockedRouteMessage(async function* (input) {
+      captured.push({
+        memory: input.memory.map((entry) => ({ ...entry })),
+        strategyHints: input.strategyHints,
+      });
+      yield "我记得";
+    });
+
+    try {
+      const chunks = [];
+      for await (const chunk of routeMessage(ctx, "昨晚还是没睡好", "sad")) {
+        chunks.push(chunk);
+      }
+
+      assert.deepEqual(chunks, ["我记得"]);
+      assert.equal(captured.length, 1);
+      assert.equal(
+        captured[0].memory.some((entry) => entry.key === "最近共同经历"),
+        true,
+      );
+      assert.ok(captured[0].strategyHints.includes("【主动提起候选】"));
+      assert.ok(captured[0].strategyHints.includes("【关系表达风格】"));
+      assert.ok(captured[0].strategyHints.includes("【共同经历提醒】"));
+    } finally {
+      restore();
+      restoreEnv();
     }
   });
 });

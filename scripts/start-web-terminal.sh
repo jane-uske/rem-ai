@@ -22,24 +22,17 @@ if ! command -v tmux >/dev/null 2>&1; then
   exit 1
 fi
 
-PORT="${REM_TERMINAL_PORT:-7681}"
-USERNAME="${REM_TERMINAL_USERNAME:-rem}"
-PASSWORD="${REM_TERMINAL_PASSWORD:-${REM_ACCESS_PASSWORD:-}}"
-TMUX_CONF="$ROOT_DIR/scripts/tmux-web.conf"
+PUBLIC_PORT="${REM_TERMINAL_PORT:-7681}"
+INTERNAL_PORT="${REM_TERMINAL_INTERNAL_PORT:-7682}"
 
-if [ -z "$PASSWORD" ]; then
-  echo "REM_TERMINAL_PASSWORD is not set."
-  echo "Set REM_TERMINAL_PASSWORD in .env (or reuse REM_ACCESS_PASSWORD) before exposing the terminal."
+if lsof -nP -iTCP:"$PUBLIC_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Port $PUBLIC_PORT is already in use."
   exit 1
 fi
 
-if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "Port $PORT is already in use."
+if lsof -nP -iTCP:"$INTERNAL_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Port $INTERNAL_PORT is already in use."
   exit 1
 fi
 
-exec ttyd \
-  --port "$PORT" \
-  --writable \
-  --credential "$USERNAME:$PASSWORD" \
-  tmux -f "$TMUX_CONF" new-session -A -s rem-dev -c "$ROOT_DIR"
+exec node "$ROOT_DIR/scripts/web_terminal_proxy.js"

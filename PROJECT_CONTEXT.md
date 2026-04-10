@@ -47,6 +47,28 @@ This requires three layers working together:
 
 ---
 
+## Current Priority
+
+The biggest current gap is not that Rem cannot talk.
+The biggest current gap is that relationship continuity is not yet real.
+
+Current main thread:
+- relationship layer phase 1
+
+This means the project should currently prioritize:
+- per-user relationship state
+- cross-reconnect restore
+- prompt consumption of relationship summary / topic continuity / mood trajectory / proactive hooks
+
+This also means the project should not spend its main energy on:
+- more silence-threshold tuning by itself
+- isolated TTS first-audio optimizations
+- avatar presentation expansion without relationship payoff
+
+See [CURRENT_FOCUS.md](CURRENT_FOCUS.md) for the short execution-facing version.
+
+---
+
 ## Current Diagnosis
 
 The current system is not fundamentally wrong.

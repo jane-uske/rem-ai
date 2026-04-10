@@ -17,13 +17,17 @@ import { runPipeline } from "../pipeline";
 import { send, getWsRateLimiter } from "../gateway";
 import { synthesize, isTtsEnabled } from "../../voice/tts_stream";
 import { fastBrainPredictOnly } from "../../brains/fast_brain";
-import { retrieveMemory } from "../../memory/memory_agent";
+import { retrievePromptMemory } from "../../memory/memory_agent";
 import { trimHistoryToTokenBudget } from "../../brains/history_budget";
 import type { InterruptionType, RemTurnState, RemTurnStateReason } from "../../avatar/types";
 import {
   persistentMemoryOverlayEnabled,
   persistentMemoryPreloadLimit,
 } from "../../memory/session_memory_overlay";
+import {
+  loadPersistentRelationshipState,
+  relationshipStateEnabled,
+} from "../../memory/relationship_state";
 import {
   decideTurnTaking,
   endsWithSentencePunctuation,
@@ -405,8 +409,21 @@ export class ConnectionSession {
         this.sessionId = sess.id;
         logger.info("[Storage] Session created", { sessionId: this.sessionId });
 
+        const persistentRepo = getPgMemoryRepository(devUserId);
+        if (relationshipStateEnabled()) {
+          this.brain.attachPersistentRelationshipRepo(persistentRepo);
+          const persistedState = await loadPersistentRelationshipState(persistentRepo);
+          if (persistedState) {
+            this.brain.hydratePersistentRelationshipState(persistedState);
+            logger.debug("[Memory] relationship state restored", {
+              connId: this.connId,
+              sessionId: this.sessionId,
+              turns: persistedState.relationship.turnCount,
+            });
+          }
+        }
+
         if (persistentMemoryOverlayEnabled()) {
-          const persistentRepo = getPgMemoryRepository(devUserId);
           this.brain.memory.attachPersistent(persistentRepo);
           void this.brain.memory
             .hydrateFromPersistent(persistentMemoryPreloadLimit())
@@ -777,15 +794,30 @@ export class ConnectionSession {
     try {
       logger.debug("[预判] 开始预判", { text: text.slice(0, 30) });
       // 和正常回复一样组装输入，但是不更新状态
-      const memory = await retrieveMemory(this.brain.memory);
+      const memory = await retrievePromptMemory(this.brain.memory, {
+        userMessage: text,
+        slowBrainSnapshot: this.brain.slowBrain.getSnapshot(),
+      });
       const slowBrainContext = this.brain.slowBrain.synthesizeContext();
       const historyForPrompt = trimHistoryToTokenBudget([...this.brain.history]);
+      const interruptedReply =
+        this.brain.lastInterruptedReply?.trim() ||
+        this.brain.currentAssistantDraft?.trim() ||
+        null;
+      const carryForwardHint = interruptedReply
+        ? buildCarryForwardHint(classifyInterruption(text, interruptedReply), interruptedReply)
+        : undefined;
       const reply = await fastBrainPredictOnly({
         userMessage: text,
         emotion: this.brain.emotion.getEmotion(),
         memory,
         history: historyForPrompt,
-        strategyHints: this.brain.slowBrain.buildConversationStrategyHints(text),
+        strategyHints: [
+          this.brain.slowBrain.buildConversationStrategyHints(text),
+          carryForwardHint,
+        ]
+          .filter((part): part is string => Boolean(part?.trim()))
+          .join("\n\n"),
         slowBrainContext,
         signal: abort.signal,
         persona: this.brain.persona,

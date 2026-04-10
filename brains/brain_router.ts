@@ -1,7 +1,7 @@
 import { fastBrainStream } from "./fast_brain";
 import { trimHistoryToTokenBudget } from "./history_budget";
 import { runSlowBrain } from "./slow_brain";
-import { extractMemory, retrieveMemory } from "../memory/memory_agent";
+import { extractMemory, retrievePromptMemory } from "../memory/memory_agent";
 import type { PromptMessage } from "../brain/prompt_builder";
 import type { Emotion } from "../emotion/emotion_state";
 import type { RemSessionContext } from "./rem_session_context";
@@ -56,7 +56,10 @@ export async function* routeMessage(
   if (!opts?.systemTriggered) {
     extractMemory(userMessage, ctx.memory);
   }
-  const memory = await retrieveMemory(ctx.memory);
+  const memory = await retrievePromptMemory(ctx.memory, {
+    userMessage,
+    slowBrainSnapshot: ctx.slowBrain.getSnapshot(),
+  });
 
   const slowBrainContext = ctx.slowBrain.synthesizeContext();
   const historyForPrompt = trimHistoryToTokenBudget([...ctx.history]);
@@ -128,6 +131,10 @@ export async function* routeMessage(
       history: [...ctx.history],
       slowBrain: ctx.slowBrain,
       memoryRepo: ctx.memory,
+      relationshipRepo:
+        ctx.persistentRelationshipRepo ??
+        ctx.memory.getPersistentBackend() ??
+        ctx.memory,
       signal: slowBrainSignal,
     }).catch((err) =>
       logger.warn("后台分析失败", { error: (err as Error).message }),

@@ -132,4 +132,31 @@ describe("session memory overlay", () => {
     const local = await overlay.getAll();
     assert.deepEqual(local.map((entry) => [entry.key, entry.value]), [["工作", "设计师"]]);
   });
+
+  it("does not hydrate reserved relationship state keys into prompt memory overlay", async () => {
+    const overlay = new SessionMemoryOverlayRepository();
+    overlay.attachPersistent(createPersistentRepo([
+      {
+        key: "__rem_relationship_state_v1",
+        value: '{"version":"v1"}',
+        importance: 1,
+        accessCount: 0,
+        createdAt: 100,
+        lastAccessedAt: 900,
+      },
+      {
+        key: "名字",
+        value: "小林",
+        importance: 0.5,
+        accessCount: 0,
+        createdAt: 300,
+        lastAccessedAt: 800,
+      },
+    ]));
+
+    await overlay.hydrateFromPersistent(12);
+
+    const hydrated = await overlay.getAll();
+    assert.deepEqual(hydrated.map((entry) => [entry.key, entry.value]), [["名字", "小林"]]);
+  });
 });

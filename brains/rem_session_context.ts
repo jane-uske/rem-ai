@@ -1,5 +1,7 @@
 import type { PromptMessage } from "../brain/prompt_builder";
 import { EmotionRuntime } from "../emotion/emotion_runtime";
+import type { MemoryRepository } from "../memory/memory_repository";
+import type { PersistentRelationshipStateV1 } from "../memory/relationship_state";
 import { SessionMemoryOverlayRepository } from "../memory/session_memory_overlay";
 import { SlowBrainStore } from "./slow_brain_store";
 import { createDefaultPersona, type PersonaState } from "../persona";
@@ -13,6 +15,7 @@ export class RemSessionContext {
   readonly memory: SessionMemoryOverlayRepository;
   readonly history: PromptMessage[] = [];
   readonly persona: PersonaState;
+  persistentRelationshipRepo: MemoryRepository | null = null;
   private slowBrainController: AbortController | null = null;
   /** 最后一次被打断的AI回复内容，用于回答「刚才说到哪了」 */
   lastInterruptedReply: string | null = null;
@@ -24,6 +27,32 @@ export class RemSessionContext {
     this.slowBrain = new SlowBrainStore();
     this.memory = new SessionMemoryOverlayRepository();
     this.persona = createDefaultPersona();
+  }
+
+  hydratePersistentRelationshipState(
+    state: PersistentRelationshipStateV1 | null,
+  ): void {
+    if (!state) return;
+    this.slowBrain.hydratePersistentState(state);
+
+    const snapshot = this.slowBrain.getSnapshot();
+    const topicSummary =
+      snapshot.conversationSummary.trim() ||
+      snapshot.sharedMoments[0]?.summary ||
+      snapshot.topicHistory
+        .slice()
+        .sort((a, b) => b.lastTurn - a.lastTurn || b.depth - a.depth)
+        .slice(0, 3)
+        .map((entry) => entry.topic)
+        .join("、");
+
+    if (topicSummary) {
+      this.persona.liveState.lastTopicSummary = topicSummary;
+    }
+  }
+
+  attachPersistentRelationshipRepo(repo: MemoryRepository): void {
+    this.persistentRelationshipRepo = repo;
   }
 
   cancelSlowBrain(): void {
@@ -91,32 +120,32 @@ export class RemSessionContext {
    * @returns 是否延续上一话题
    */
   private isContinuingPreviousTopic(currentUserInput?: string): boolean {
-    // 没有当前输入或者没有历史对话，不算延续
-    if (!currentUserInput || this.persona.liveState.recentInteractions.length === 0) {
+    if (!currentUserInput) {
       return false;
     }
 
-    // 匹配明确的延续话术
     const continuationPhrases = ["继续说", "刚才说到哪", "接着说", "然后呢", "还有吗", "之前说的", "刚才的话题", "继续刚才的"];
     const inputLower = currentUserInput.toLowerCase();
     if (continuationPhrases.some(phrase => inputLower.includes(phrase))) {
       return true;
     }
 
-    // 计算关键词重叠度
     const currentKeywords = this.extractKeywords(currentUserInput);
     if (currentKeywords.length === 0) return false;
 
-    // 提取最近3轮对话的关键词
     const recentContent = this.persona.liveState.recentInteractions.slice(-3)
       .map(line => line.replace(/^(用户|你)：/, ""))
       .join(" ");
-    const recentKeywords = this.extractKeywords(recentContent);
+    const fallbackSummary = this.persona.liveState.lastTopicSummary;
+    const sourceText = recentContent || fallbackSummary;
+    if (!sourceText || sourceText === "无最近话题") {
+      return false;
+    }
+
+    const recentKeywords = this.extractKeywords(sourceText);
     const recentKeywordSet = new Set(recentKeywords);
 
-    // 重叠关键词数量
     const overlap = currentKeywords.filter(keyword => recentKeywordSet.has(keyword)).length;
-    // 重叠度超过30%就算延续
     return overlap / currentKeywords.length > 0.3;
   }
 

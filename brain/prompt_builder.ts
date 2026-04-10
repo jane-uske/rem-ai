@@ -62,20 +62,29 @@ function buildSystemPrompt(
   priorityContext?: string,
   persona?: PersonaState,
 ): string {
+  const maxPriorityChars = parsePositiveInt(process.env.MAX_PRIORITY_CONTEXT_CHARS, 700);
+  const maxMemoryEntries = parsePositiveInt(process.env.MAX_PROMPT_MEMORY_ENTRIES, 6);
+  const maxMemoryValueChars = parsePositiveInt(process.env.MAX_PROMPT_MEMORY_VALUE_CHARS, 48);
+
   // Use new persona system if provided
   if (persona) {
-    // Convert memory entries to string for injection
     const memoryStr = memory.length > 0
-      ? memory.map(m => `- ${m.key}: ${m.value}`).join('\n')
+      ? memory
+          .slice(0, maxMemoryEntries)
+          .map((m) => `- ${m.key}：${trimTextByChars(m.value, maxMemoryValueChars)}`)
+          .join("\n")
       : undefined;
-    return buildPersonaPrompt(persona, memoryStr, buildEmotionSpeechGuidance(emotion));
+    return buildPersonaPrompt(persona, {
+      priorityContext: priorityContext?.trim()
+        ? trimTextByChars(priorityContext.trim(), maxPriorityChars)
+        : undefined,
+      memoryStr,
+      emotionSpeechGuidance: buildEmotionSpeechGuidance(emotion),
+    });
   }
 
   // Fallback to original system prompt logic
   const sections: string[] = [];
-  const maxPriorityChars = parsePositiveInt(process.env.MAX_PRIORITY_CONTEXT_CHARS, 700);
-  const maxMemoryEntries = parsePositiveInt(process.env.MAX_PROMPT_MEMORY_ENTRIES, 6);
-  const maxMemoryValueChars = parsePositiveInt(process.env.MAX_PROMPT_MEMORY_VALUE_CHARS, 48);
 
   if (priorityContext?.trim()) {
     sections.push(

@@ -1,7 +1,32 @@
 import type { Emotion } from "./tts_emotion";
-import { textToSpeech, isTtsEnabled } from "./tts";
 
-export { isTtsEnabled };
+type TtsModule = {
+  textToSpeech: (
+    sentence: string,
+    signal?: AbortSignal,
+    emotion?: Emotion,
+  ) => Promise<Buffer>;
+  isTtsEnabled: () => boolean;
+};
+
+let cachedTtsModule: TtsModule | null = null;
+
+function loadTtsModule(): TtsModule {
+  if (cachedTtsModule) return cachedTtsModule;
+  try {
+    cachedTtsModule = require("./tts") as TtsModule;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "MODULE_NOT_FOUND") {
+      throw err;
+    }
+    cachedTtsModule = require("./tts.ts") as TtsModule;
+  }
+  return cachedTtsModule;
+}
+
+export function isTtsEnabled(): boolean {
+  return loadTtsModule().isTtsEnabled();
+}
 
 /**
  * Synthesize a single sentence to audio.
@@ -14,5 +39,5 @@ export async function synthesize(
   emotion?: Emotion,
 ): Promise<Buffer> {
   if (signal?.aborted) throw new DOMException("TTS aborted", "AbortError");
-  return textToSpeech(sentence, signal, emotion);
+  return loadTtsModule().textToSpeech(sentence, signal, emotion);
 }

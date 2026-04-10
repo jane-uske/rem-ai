@@ -1,4 +1,5 @@
 import { createLogger } from "../infra/logger";
+import { isSystemMemoryKey } from "./relationship_state";
 import type { MemoryEntry, MemoryRepository } from "./memory_repository";
 import { InMemoryRepository } from "./memory_store";
 
@@ -34,6 +35,10 @@ export class SessionMemoryOverlayRepository implements MemoryRepository {
     return this.persistent !== null;
   }
 
+  getPersistentBackend(): MemoryRepository | null {
+    return this.persistent;
+  }
+
   async hydrateFromPersistent(limit: number): Promise<void> {
     if (!this.persistent || limit <= 0) return;
     if (this.hydratePromise) {
@@ -43,6 +48,7 @@ export class SessionMemoryOverlayRepository implements MemoryRepository {
     this.hydratePromise = (async () => {
       const entries = await this.persistent!.getAll();
       const selected = [...entries]
+        .filter((entry) => !isSystemMemoryKey(entry.key))
         .sort((a, b) => {
           if (b.lastAccessedAt !== a.lastAccessedAt) {
             return b.lastAccessedAt - a.lastAccessedAt;

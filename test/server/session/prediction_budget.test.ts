@@ -144,4 +144,25 @@ describe("prediction budget gates", () => {
       restore();
     }
   });
+
+  it("keeps prediction read-only but still passes carry-forward continuity hints", async () => {
+    const { session, predictionCalls, restore } = loadPredictionSession({
+      predictionEnabled: "1",
+      predictionPushEnabled: "0",
+      predictedReply: "我接住了",
+    });
+
+    try {
+      session.brain.lastInterruptedReply = "我刚才想说先别太逼自己。";
+      session.emitSttPartial("不是那个意思，我是想说昨晚还是没睡好");
+      await waitFor(() => predictionCalls.length === 1);
+
+      const input = predictionCalls[0][0];
+      assert.ok(input.strategyHints.includes("先别太逼自己"));
+      assert.equal(session.brain.slowBrain.getSnapshot().relationship.turnCount, 0);
+      assert.equal(session.brain.slowBrain.getSnapshot().sharedMoments.length, 0);
+    } finally {
+      restore();
+    }
+  });
 });
