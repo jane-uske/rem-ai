@@ -1246,6 +1246,9 @@ export function useRemChat() {
   };
 
   useEffect(() => {
+    // connectRef 已使用 ref pattern，总是读取最新闭包，因此依赖必须保持为空 —
+    // 否则任何 useCallback 身份变化或 voiceActive 翻转都会触发 cleanup，主动 close WS，
+    // 导致用户看到假的「连接已断开，3 秒后重连…」。
     mountedRef.current = true;
     connectRef.current?.();
     return () => {
@@ -1255,7 +1258,8 @@ export function useRemChat() {
       if (reconnectRef.current) clearTimeout(reconnectRef.current);
       wsRef.current?.close();
     };
-  }, [allowServerGeneration, appendStreaming, appendUserTranscript, blockGeneration, clearAvatarIntentSchedule, clearGenerationState, clearPendingChatEnd, clearQueue, clearUserSpeakingEndTimer, enqueueBase64, enqueuePcmChunk, finalizePendingChatEnd, mergeIntentBeat, parseGenerationId, rememberPlayedGeneration, resetStreaming, startDuplex, stopVoiceSession, triggerIntentGestureAction, voiceActive]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
