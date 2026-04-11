@@ -50,6 +50,7 @@ const CORE_FACT_KEYS = new Set([
   "喜好",
 ]);
 const CORE_FACT_LIMIT = 2;
+const MAX_PROMPT_EPISODES = 1;
 const STOP_WORDS = new Set([
   "我们",
   "你们",
@@ -99,6 +100,18 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
+function parseBooleanFlag(raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined || raw === "") return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "1" || normalized === "true") return true;
+  if (normalized === "0" || normalized === "false") return false;
+  return fallback;
+}
+
+function episodeLongHorizonRankingEnabled(): boolean {
+  return parseBooleanFlag(process.env.REM_EPISODE_LONG_HORIZON_RANKING_ENABLED, true);
+}
+
 function normalizeText(text: string): string {
   return text
     .toLowerCase()
@@ -139,18 +152,43 @@ function buildRelationshipTexts(slowBrainSnapshot?: SlowBrainSnapshot | null): {
   summaryText: string;
   combinedText: string;
   keywords: string[];
+  recentMoodText: string;
+  preferredTopics: string[];
 } {
   if (!slowBrainSnapshot) {
-    return { summaryText: "", combinedText: "", keywords: [] };
+    return {
+      summaryText: "",
+      combinedText: "",
+      keywords: [],
+      recentMoodText: "",
+      preferredTopics: [],
+    };
   }
+
+  const recentMoodText = slowBrainSnapshot.moodTrajectory
+    .slice(-4)
+    .map((entry) => entry.mood)
+    .join(" ");
 
   const parts = [
     slowBrainSnapshot.conversationSummary,
     ...slowBrainSnapshot.relationship.preferredTopics,
     ...slowBrainSnapshot.proactiveTopics,
+    ...(slowBrainSnapshot.topicThreads ?? [])
+      .slice(0, 4)
+      .map((entry) =>
+        `${entry.topic} ${entry.summary} ${entry.bridgeSummary ?? ""} ${(entry.relatedTopics ?? []).join(" ")} ${(entry.semanticKeywords ?? []).join(" ")} ${entry.topMood}`.trim()
+      ),
+    ...(slowBrainSnapshot.episodes ?? [])
+      .slice(0, 4)
+      .map((entry) =>
+        `${entry.title} ${entry.summary} ${entry.sourceTopics.join(" ")} ${entry.semanticKeywords.join(" ")} ${entry.topMood}`.trim()
+      ),
     ...slowBrainSnapshot.sharedMoments
       .slice(0, 3)
-      .map((entry) => `${entry.topic} ${entry.summary} ${entry.hook}`.trim()),
+      .map((entry) =>
+        `${entry.topic} ${entry.summary} ${entry.hook} ${(entry.semanticKeywords ?? []).join(" ")}`.trim()
+      ),
     ...slowBrainSnapshot.topicHistory
       .slice()
       .sort((a, b) => b.lastTurn - a.lastTurn || b.depth - a.depth)
@@ -164,6 +202,8 @@ function buildRelationshipTexts(slowBrainSnapshot?: SlowBrainSnapshot | null): {
     summaryText: slowBrainSnapshot.conversationSummary,
     combinedText,
     keywords: extractKeywords(combinedText),
+    recentMoodText,
+    preferredTopics: [...slowBrainSnapshot.relationship.preferredTopics],
   };
 }
 
@@ -182,6 +222,148 @@ function keywordOverlapScore(
     }
   }
   return score;
+}
+
+function buildTopicThreadPromptMemory(
+  slowBrainSnapshot: SlowBrainSnapshot | null | undefined,
+  userMessage: string,
+  maxEntries: number,
+): Memory[] {
+  if (!slowBrainSnapshot || maxEntries <= 0) return [];
+  const threads = slowBrainSnapshot.topicThreads ?? [];
+  if (threads.length === 0) return [];
+
+  const userText = normalizeText(userMessage);
+  const userKeywords = extractKeywords(userMessage);
+  const ranked = threads
+    .map((entry) => {
+      const combined = normalizeText(
+        `${entry.topic} ${entry.bridgeSummary || entry.summary} ${(entry.relatedTopics ?? []).join(" ")} ${(entry.semanticKeywords ?? []).join(" ")} ${entry.topMood}`,
+      );
+      const timeSpanTurns = Math.max(0, entry.timeSpanTurns ?? 0);
+      const layerBoost = entry.memoryLayer === "core" ? 5 : 1;
+      return {
+        entry,
+        score:
+          keywordOverlapScore(combined, userKeywords, 4, 16) +
+          (userText && combined.includes(userText) ? 10 : 0) +
+          Math.round(entry.salience * 6) +
+          Math.round((entry.relationshipWeight ?? entry.salience) * 6) +
+          Math.min(4, entry.unresolvedCount * 2) +
+          Math.min(4, entry.recurrenceCount) +
+          Math.min(3, Math.max(0, (entry.episodeCount ?? 1) - 1)) +
+          Math.min(4, Math.floor(timeSpanTurns / 3)) +
+          layerBoost,
+      };
+    })
+    .sort((a, b) => b.score - a.score || b.entry.lastTurn - a.entry.lastTurn);
+
+  const selected: Memory[] = [];
+  const topCore = ranked.find((item) =>
+    (
+      item.entry.memoryLayer === "core" ||
+      (item.entry.episodeCount ?? 1) >= 3 ||
+      item.entry.recurrenceCount >= 3 ||
+      (item.entry.relationshipWeight ?? item.entry.salience) >= 0.82
+    ) &&
+    (item.score >= 5 || userMessage.trim().length <= 12)
+  );
+  if (topCore) {
+    selected.push({
+      key: "长期关系主线",
+      value: `${topCore.entry.topic}：${topCore.entry.bridgeSummary || topCore.entry.summary}`,
+    });
+  }
+
+  if (selected.length < maxEntries) {
+    const topActive = ranked.find((item) =>
+      item.entry.unresolvedCount > 0 &&
+      item.entry.topic !== topCore?.entry.topic &&
+      item.score >= 8
+    );
+    if (topActive) {
+      selected.push({
+        key: "当前未完主线",
+        value: `${topActive.entry.topic}：${topActive.entry.bridgeSummary || topActive.entry.summary}`,
+      });
+    }
+  }
+
+  if (selected.length === 0) {
+    const fallback = ranked.find((item) => item.score >= 5 || userMessage.trim().length <= 12);
+    if (fallback) {
+      selected.push({
+        key: "长期关系主线",
+        value: `${fallback.entry.topic}：${fallback.entry.bridgeSummary || fallback.entry.summary}`,
+      });
+    }
+  }
+
+  return selected.slice(0, maxEntries);
+}
+
+export function recallEpisodes(
+  slowBrainSnapshot: SlowBrainSnapshot | null | undefined,
+  userMessage: string,
+): {
+  core?: NonNullable<SlowBrainSnapshot["episodes"]>[number];
+  active?: NonNullable<SlowBrainSnapshot["episodes"]>[number];
+} {
+  const episodes = slowBrainSnapshot?.episodes ?? [];
+  if (episodes.length === 0) return {};
+
+  const userText = normalizeText(userMessage);
+  const userKeywords = extractKeywords(userMessage);
+  const relationship = buildRelationshipTexts(slowBrainSnapshot);
+  const relationshipText = normalizeText(relationship.combinedText);
+
+  const ranked = episodes
+    .map((entry) => {
+      const combined = normalizeText(
+        `${entry.title} ${entry.summary} ${entry.sourceTopics.join(" ")} ${entry.semanticKeywords.join(" ")} ${entry.topMood}`,
+      );
+      const score =
+        keywordOverlapScore(combined, userKeywords, 4, 16) +
+        (userText && combined.includes(userText) ? 10 : 0) +
+        keywordOverlapScore(combined, relationship.keywords, 2, 10) +
+        Math.round(entry.salience * 6) +
+        Math.round((entry.relationshipWeight ?? entry.salience) * 8) +
+        Math.min(4, entry.recurrenceCount) +
+        (entry.layer === "core" ? 3 : 0) +
+        (entry.status === "active" ? 4 : entry.status === "cooling" ? 2 : 0) +
+        (relationshipText.includes(normalizeText(entry.title)) ? 3 : 0);
+      return { entry, score };
+    })
+    .sort((a, b) => b.score - a.score || b.entry.lastTurn - a.entry.lastTurn);
+
+  const core = ranked.find((item) => item.entry.layer === "core" && item.score >= 5)?.entry;
+  const active = ranked.find((item) =>
+    item.entry.status === "active" &&
+    item.entry.id !== core?.id &&
+    item.score >= 5
+  )?.entry;
+
+  if (!core && !active && ranked[0]?.score >= 4) {
+    return {
+      core: ranked[0]?.entry.layer === "core" ? ranked[0].entry : undefined,
+      active: ranked[0]?.entry.status === "active" ? ranked[0].entry : undefined,
+    };
+  }
+
+  return { core, active };
+}
+
+function shouldPreferThreadMemory(
+  userMessage: string,
+  slowBrainSnapshot: SlowBrainSnapshot | null | undefined,
+): boolean {
+  if (!slowBrainSnapshot) return false;
+  const trimmed = userMessage.trim();
+  const continuationLike = /继续|刚才|上次那个|还是那个|回到刚才|然后呢|后来呢/u.test(trimmed);
+  const lowSignal = trimmed.length <= 12;
+  const topThread = (slowBrainSnapshot.topicThreads ?? [])[0];
+  if (!topThread) return false;
+  return continuationLike || lowSignal || (topThread.episodeCount ?? 1) >= 3;
 }
 
 function scoreMemoryEntry(
@@ -210,21 +392,87 @@ function scoreMemoryEntry(
 }
 
 function scoreSharedMoment(
-  summary: string,
-  topic: string,
-  hook: string,
-  userText: string,
-  userKeywords: string[],
-  relationshipText: string,
-  relationshipKeywords: string[],
+  entry: NonNullable<SlowBrainSnapshot["sharedMoments"]>[number],
+  input: {
+    userText: string;
+    userKeywords: string[];
+    relationshipText: string;
+    relationshipKeywords: string[];
+    preferredTopics: string[];
+    recentMoodText: string;
+    turnCount: number;
+    lastUsedSummary: string;
+  },
 ): number {
-  const combined = normalizeText(`${summary} ${topic} ${hook}`);
+  const combined = normalizeText(
+    `${entry.summary} ${entry.topic} ${entry.hook} ${(entry.semanticKeywords ?? []).join(" ")}`,
+  );
   let score = 0;
+  const emotionalSalience = /委屈|崩溃|难过|焦虑|低落|开心|失眠|睡不着|误解|争吵|冲突/u.test(
+    `${entry.summary} ${entry.mood}`,
+  );
 
-  if (userText && combined.includes(userText)) score += 8;
-  score += keywordOverlapScore(combined, userKeywords, 5, 15);
-  if (relationshipText) {
-    score += keywordOverlapScore(combined, relationshipKeywords, 2, 8);
+  if (input.userText && combined.includes(input.userText)) score += 10;
+  score += keywordOverlapScore(combined, input.userKeywords, 5, 18);
+
+  const topicText = normalizeText(entry.topic);
+  if (topicText) {
+    if (input.userText.includes(topicText)) score += 7;
+    if (input.preferredTopics.some((topic) => normalizeText(topic) === topicText)) score += 4;
+  }
+
+  if (entry.hook) {
+    const hookText = normalizeText(entry.hook);
+    if (hookText && input.userText.includes(hookText)) score += 5;
+  }
+
+  const moodText = normalizeText(entry.mood);
+  if (moodText && input.recentMoodText.includes(moodText)) score += 3;
+  if (entry.unresolved) score += 4;
+  if (entry.kind === "support" || entry.kind === "stress") score += 3;
+  if (entry.kind === "goal" || entry.kind === "joy") score += 2;
+  score += Math.round((entry.salience ?? 0) * 8);
+  score += Math.min(6, Math.max(0, entry.recurrenceCount ?? 1) - 1);
+
+  if (input.relationshipText) {
+    score += keywordOverlapScore(combined, input.relationshipKeywords, 2, 10);
+  }
+
+  if (emotionalSalience) {
+    score += 3;
+  }
+
+  const recencyTurns = Math.max(0, input.turnCount - entry.turn);
+  score += Math.max(0, 6 - recencyTurns);
+
+  const ageHours = Math.max(0, (Date.now() - entry.createdAt) / (1000 * 60 * 60));
+  if (Number.isFinite(ageHours)) {
+    score += Math.max(0, 4 - Math.floor(ageHours / 12));
+  }
+
+  if (
+    episodeLongHorizonRankingEnabled() &&
+    ageHours >= 24 &&
+    (score >= 12 || keywordOverlapScore(combined, input.relationshipKeywords, 2, 10) >= 4)
+  ) {
+    // Give older but still clearly relevant episodes a chance to beat fresher noise.
+    score += 4;
+  }
+
+  if (
+    typeof entry.lastReferencedAt === "number" &&
+    entry.lastReferencedAt > 0 &&
+    Date.now() - entry.lastReferencedAt < 1000 * 60 * 60 * 6
+  ) {
+    score -= 4;
+  }
+
+  if (
+    input.lastUsedSummary &&
+    entry.summary === input.lastUsedSummary &&
+    score < 18
+  ) {
+    score -= 6;
   }
 
   return score;
@@ -250,26 +498,64 @@ function buildEpisodePromptMemory(
   if (!slowBrainSnapshot || maxEntries <= 0) return [];
   if (!slowBrainSnapshot.sharedMoments?.length) return [];
 
+  const enabled = parseBooleanFlag(process.env.REM_EPISODE_RETRIEVAL_V1_ENABLED, true);
   const userText = normalizeText(userMessage);
   const userKeywords = extractKeywords(userMessage);
   const relationship = buildRelationshipTexts(slowBrainSnapshot);
+  const turnCount = slowBrainSnapshot.relationship.turnCount ?? 0;
+  const lastUsedSummary =
+    slowBrainSnapshot.continuityCueState?.lastSharedMomentSummary ?? "";
+  const episodeLimit = enabled
+    ? Math.min(MAX_PROMPT_EPISODES, maxEntries)
+    : Math.min(2, maxEntries);
 
-  return slowBrainSnapshot.sharedMoments
+  const ranked = slowBrainSnapshot.sharedMoments
     .map((entry) => ({
       entry,
-      score: scoreSharedMoment(
-        entry.summary,
-        entry.topic,
-        entry.hook,
-        userText,
-        userKeywords,
-        normalizeText(relationship.combinedText),
-        relationship.keywords,
-      ),
+      score: enabled
+        ? scoreSharedMoment(entry, {
+            userText,
+            userKeywords,
+            relationshipText: normalizeText(relationship.combinedText),
+            relationshipKeywords: relationship.keywords,
+            preferredTopics: relationship.preferredTopics,
+            recentMoodText: normalizeText(relationship.recentMoodText),
+            turnCount,
+            lastUsedSummary,
+          })
+        : scoreSharedMoment(entry, {
+            userText,
+            userKeywords,
+            relationshipText: normalizeText(relationship.combinedText),
+            relationshipKeywords: relationship.keywords,
+            preferredTopics: relationship.preferredTopics,
+            recentMoodText: normalizeText(relationship.recentMoodText),
+            turnCount,
+            lastUsedSummary: "",
+          }),
     }))
-    .sort((a, b) => b.score - a.score || b.entry.turn - a.entry.turn || b.entry.createdAt - a.entry.createdAt)
-    .filter((item) => item.score > 0 || userMessage.trim().length <= 12)
-    .slice(0, Math.min(2, maxEntries))
+    .sort((a, b) => b.score - a.score || b.entry.turn - a.entry.turn || b.entry.createdAt - a.entry.createdAt);
+
+  if (
+    enabled &&
+    lastUsedSummary &&
+    ranked.length > 1 &&
+    ranked[0].entry.summary === lastUsedSummary &&
+    ranked[1].score >= ranked[0].score - 6
+  ) {
+    const [first, second, ...rest] = ranked;
+    ranked.splice(0, ranked.length, second, first, ...rest);
+  }
+
+  return ranked
+    .filter((item, index) => {
+      if (enabled) {
+        if (index === 0) return item.score >= 4 || userMessage.trim().length <= 12;
+        return item.score >= 14;
+      }
+      return item.score > 0 || userMessage.trim().length <= 12;
+    })
+    .slice(0, episodeLimit)
     .map((item, index) => ({
       key: index === 0 ? "最近共同经历" : `共同经历${index + 1}`,
       value: item.entry.summary,
@@ -289,7 +575,8 @@ export async function retrievePromptMemory(
     parsePositiveInt(process.env.MAX_PROMPT_MEMORY_ENTRIES, 6);
   if (maxEntries <= 0) return [];
 
-  const entries = (await repo.getAll())
+  const allEntries = await repo.getAll();
+  const entries = (allEntries || [])
     .filter(({ key }) => !isSystemMemoryKey(key))
     .map((entry) => ({
       entry: { key: entry.key, value: entry.value },
@@ -325,12 +612,48 @@ export async function retrievePromptMemory(
   }
 
   if (selected.length < maxEntries) {
+    const recalledEpisodes = recallEpisodes(
+      options.slowBrainSnapshot,
+      options.userMessage,
+    );
+    let structuredNarrativeAdded = false;
+    if (recalledEpisodes.core) {
+      selected.push({
+        key: "长期关系主线",
+        value: `${recalledEpisodes.core.title}：${recalledEpisodes.core.summary}`,
+      });
+      seenKeys.add("长期关系主线");
+      structuredNarrativeAdded = true;
+    }
+    if (selected.length < maxEntries && recalledEpisodes.active) {
+      selected.push({
+        key: "当前未完主线",
+        value: `${recalledEpisodes.active.title}：${recalledEpisodes.active.summary}`,
+      });
+      seenKeys.add("当前未完主线");
+      structuredNarrativeAdded = true;
+    }
+    if (!structuredNarrativeAdded) {
+      const threadMemories = buildTopicThreadPromptMemory(
+        options.slowBrainSnapshot,
+        options.userMessage,
+        maxEntries - selected.length,
+      );
+      for (const memory of threadMemories) {
+        if (selected.length >= maxEntries) break;
+        if (seenKeys.has(memory.key)) continue;
+        seenKeys.add(memory.key);
+        selected.push(memory);
+      }
+    }
+  }
+
+  if (selected.length < maxEntries) {
     const promptEpisodes = buildEpisodePromptMemory(
       options.slowBrainSnapshot,
       options.userMessage,
       maxEntries - selected.length,
     );
-
     for (const episode of promptEpisodes) {
       if (selected.length >= maxEntries) break;
       if (seenKeys.has(episode.key)) continue;
