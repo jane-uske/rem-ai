@@ -256,18 +256,82 @@ OpenAI 兼容的流式聊天客户端。
 - `SessionMemoryOverlayRepository`（`session_memory_overlay.ts`）：每连接本地优先 overlay，支持启动预加载和异步写回持久层
 - `PostgreSQL 实现`（`storage/repositories/memory_repository.ts`）：持久化 + pgvector 向量语义检索
 
-**Relationship State（当前主线程相关）**
+**Relationship State（关系层持久化）**
 
-- `memory/relationship_state.ts`：定义用户级 relationship state 的持久化契约与开关
-- `brains/slow_brain_store.ts`：聚合 relationship / topic / mood / proactive runtime state，并输出 `synthesizeContext()` 与 `buildConversationStrategyHints()`
-- `brains/slow_brain.ts`：在非中断完成态结束后异步写回 relationship state
-- `brains/rem_session_context.ts`：提供 `hydratePersistentRelationshipState(...)` 作为恢复入口
+- `memory/relationship_state.ts`：定义用户级 `PersistentRelationshipStateV1` 持久化契约、序列化/反序列化、功能开关
+- `brains/slow_brain_store.ts`：聚合 `relationship` / `topic` / `mood` / `proactive` 运行时状态，并输出 `synthesizeContext()` 与 `buildConversationStrategyHints()`
+- `brains/slow_brain.ts`：在**非中断完成态**结束后异步写回 relationship state 到持久层
+- `brains/rem_session_context.ts`：提供 `hydratePersistentRelationshipState(...)` 作为恢复入口，将持久化状态注入 `SlowBrainStore` 和 `persona.liveState`
+- `server/session/index.ts`：session 初始化时异步加载并恢复（见下文恢复链路）
 
-当前已确认现状：
-- relationship state 的持久化写回已存在
-- live path 仍主要通过 `SessionMemoryOverlayRepository` + `retrieveMemory()->getAll()` 读取 prompt memory
-- relationship restore 入口已存在，但 session 初始化主链路尚未完整接上
-- 现在的主要缺口是恢复链路与相关召回，而不是底层完全没有能力
+### 关系状态恢复链路 (R-002)
+
+**恢复入口与执行时机：**
+- 链路位置：`ConnectionSession.initializeAsync()` → 数据库就绪后 → `loadPersistentRelationshipState()` → `brain.hydratePersistentRelationshipState()`
+- 执行时机：新 WebSocket 连接建立、session 创建之后，等待 first user input 之前
+- 调用方：服务端 session 初始化异步流程，不阻塞连接建立
+
+**降级行为（恢复失败时）：**
+- 数据库不可用 → 跳过恢复，使用空初始状态
+- 加载抛出异常 → 打 warn 日志，跳过恢复，使用空初始状态
+- 加载返回 null（无持久化状态）→ 跳过，使用空初始状态
+- 反序列化验证失败 → 打 warn 日志，跳过恢复，不影响新建连接使用
+- 无论加载成功与否，后续正常交互时仍会在每轮结束后写回新状态
+
+**谁持有状态：**
+- 持久化：存在 `MemoryRepository` 中，key 为 `__rem_relationship_state_v1`（系统键，用户可见记忆不混存）
+- 运行时：每个 connection 的 `brain.slowBrain: SlowBrainStore` 持有反序列化后的运行时状态
+- 写回：仅在**非中断完成态**（interrupted = false）结束后异步调用 `savePersistentRelationshipState()`
+
+### Prompt 消费链路 (R-003)
+
+关系状态通过两个步骤进入 prompt：
+
+1. **`slow_brain_store.synthesizeContext()` → 长期关系上下文**
+   - 输出完整字符串，包含：
+     - 关系阶段总结（familiarity / emotional bond / turn count）
+     - 最近话题连续性（last topic summary / mood trajectory）
+     - 共享重要时刻（shared moments 按 salience 排序，取 top 2）
+     - 活跃话题线程（active episodes / core episodes）
+   - 放在 system prompt 的**高优先级位置**（personality 之后，记忆之前）
+   - 由 `fast_brain.ts` 消费，拼接到 prompt 中作为 `slowBrainContext`
+
+2. **`slow_brain_store.buildConversationStrategyHints()` → 本轮说话策略**
+   - 输出针对当前交互的策略提示：
+     - 是否应该追问用户
+     - 关系熟悉度对应的说话语气建议
+     - 情绪轨迹提示（最近用户情绪变化）
+     - 主动开口的线索提示
+   - 由 `prompt_builder.ts` 消费，放在 system prompt 最前段，LLM 能第一时间读到
+
+**分层原则：**
+- 长期上下文 → `synthesizeContext()` → 一次性注入整段文字
+- 本轮策略 → `buildConversationStrategyHints()` → 针对当前交互的动态建议
+
+### 中断污染保护规则 (R-005)
+
+**哪些状态绝对不能被 interrupted partial 修改：**
+
+| 状态 / 数据 | 是否允许 interrupted partial 写入 | 原因 |
+|-----------|----------------------------------|------|
+| `formal history` | ❌ 不允许 | 被打断的半句不完整，不能作为正式历史 |
+| `slow_brain` 分析 | ❌ 不允许 | slow brain 需要完整对话才能分析，partial 会产出垃圾分析 |
+| `relationship_state` 持久化 | ❌ 不允许 | 关系状态是累积的正式状态，只在完整一轮结束后写入 |
+| 持久层 `MemoryRepository` | ❌ 不允许 | 只有完整 user + 完整 assistant 才能提取记忆 |
+| `lastInterruptedReply` | ✅ 允许 | 用于 carry-forward 上下文，这是预期用途 |
+| `currentAssistantDraft` | ✅ 允许 | 正在生成中的草稿，用于打断瞬间承接 |
+
+**保护机制已经在代码中实现：**
+- `runPipeline` 仅在 `!isInterrupted` 时才会调用 `persistRelationshipContinuityState()`
+- `slow_brain.ts` 的分析仅在 `!interrupted` 时才会写回 `relationshipState`
+- 这一规则不改变现有 interrupt 语义，只是明确持久化边界
+
+当前已确认现状（Memory V1 完成后）：
+- relationship state 的持久化写回 ✅ 已完成
+- relationship 恢复链路 ✅ 已完成（session init → load → hydrate）
+- 记忆召回 ✅ 已升级为 relationship-aware 分层召回（`core facts → core episode → active episode → recent shared moment → fallback facts`）
+- prompt 消费 ✅ 已完成（`synthesizeContext` + `buildConversationStrategyHints` 双层注入）
+- 中断污染保护 ✅ 已完成（仅非中断完整轮次才写回正式状态）
 
 **Memory Decay (`memory_decay.ts`)**
 

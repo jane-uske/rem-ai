@@ -194,8 +194,14 @@ describe("persistent memory overlay session wiring", () => {
                 topic: "睡眠",
                 mood: "疲惫/烦躁",
                 hook: "昨晚睡得怎么样",
+                kind: "support",
+                salience: 0.82,
+                recurrenceCount: 2,
+                unresolved: true,
                 turn: 4,
                 createdAt: 110,
+                firstSeenAt: 100,
+                lastReferencedAt: 0,
               },
             ],
           }),
@@ -221,6 +227,8 @@ describe("persistent memory overlay session wiring", () => {
         slowBrainSnapshot.sharedMoments[0].summary,
         "上次你提到晚上睡不好，我们聊到睡前散步会不会有帮助。",
       );
+      assert.equal(slowBrainSnapshot.sharedMoments[0].kind, "support");
+      assert.equal(slowBrainSnapshot.sharedMoments[0].unresolved, true);
     } finally {
       restore();
     }

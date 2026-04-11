@@ -258,7 +258,95 @@ describe("routeMessage with session memory overlay", () => {
       );
       assert.ok(captured[0].strategyHints.includes("【主动提起候选】"));
       assert.ok(captured[0].strategyHints.includes("【关系表达风格】"));
-      assert.ok(captured[0].strategyHints.includes("【共同经历提醒】"));
+      assert.ok(captured[0].strategyHints.includes("【实时连续性】"));
+    } finally {
+      restore();
+      restoreEnv();
+    }
+  });
+
+  it("does not repeat the same proactive or shared-moment cue on back-to-back turns", async () => {
+    const restoreEnv = applyEnv({
+      REM_SLOW_BRAIN_ENABLED: "0",
+      REM_PROACTIVE_PROMPT_ENABLED: "1",
+      REM_RELATIONSHIP_STYLE_GUIDANCE_ENABLED: "1",
+      REM_PROACTIVE_COOLDOWN_TURNS: "10",
+      REM_SHARED_MOMENT_COOLDOWN_TURNS: "10",
+    });
+    const ctx = new RemSessionContext("memory-overlay-no-repeat");
+    ctx.slowBrain.recordTurn();
+    ctx.slowBrain.recordTurn();
+    ctx.slowBrain.bumpRelationship({ familiarityDelta: 0.5, emotionalBondDelta: 0.45 });
+    ctx.slowBrain.setProactiveTopics(["昨晚睡得怎么样"]);
+    ctx.slowBrain.recordSharedMoment({
+      summary: "上次你提到失眠反复醒来，我们还聊到睡前散步会不会好一点。",
+      topic: "睡眠",
+      mood: "疲惫/烦躁",
+      hook: "昨晚睡得怎么样",
+      createdAt: 500,
+    });
+
+    const captured = [];
+    const { routeMessage, restore } = loadMockedRouteMessage(async function* (input) {
+      captured.push(input.strategyHints);
+      yield "接住了";
+    });
+
+    try {
+      for await (const _ of routeMessage(ctx, "嗯", "neutral")) {
+        // consume
+      }
+      for await (const _ of routeMessage(ctx, "还没缓过来", "sad")) {
+        // consume
+      }
+
+      assert.equal(captured.length, 2);
+      assert.ok(captured[0].includes("【主动提起候选】"));
+      assert.equal(captured[1].includes("【主动提起候选】"), false);
+      assert.equal(captured[1].includes("【共同经历提醒】"), false);
+      assert.equal(captured[1].includes("【实时连续性】"), false);
+    } finally {
+      restore();
+      restoreEnv();
+    }
+  });
+
+  it("suppresses proactive callbacks when the user is asking a direct new question", async () => {
+    const restoreEnv = applyEnv({
+      REM_SLOW_BRAIN_ENABLED: "0",
+      REM_PROACTIVE_PROMPT_ENABLED: "1",
+      REM_RELATIONSHIP_STYLE_GUIDANCE_ENABLED: "1",
+    });
+    const ctx = new RemSessionContext("memory-overlay-direct-question");
+    ctx.slowBrain.recordTurn();
+    ctx.slowBrain.recordTurn();
+    ctx.slowBrain.recordTurn();
+    ctx.slowBrain.bumpRelationship({ familiarityDelta: 0.6, emotionalBondDelta: 0.5 });
+    ctx.slowBrain.setConversationSummary("最近主要在聊睡眠状态和工作压力。");
+    ctx.slowBrain.setProactiveTopics(["昨晚睡得怎么样", "工作那件事后来缓一点了吗"]);
+    ctx.slowBrain.recordSharedMoment({
+      summary: "上次你提到工作上被误解后很委屈，我们还聊到你其实最难受的是没人理解。",
+      topic: "工作",
+      mood: "委屈",
+      hook: "工作那件事后来缓一点了吗",
+      createdAt: 600,
+    });
+
+    const captured = [];
+    const { routeMessage, restore } = loadMockedRouteMessage(async function* (input) {
+      captured.push(input.strategyHints);
+      yield "先回答你";
+    });
+
+    try {
+      for await (const _ of routeMessage(ctx, "你觉得我现在应该直接辞职，还是先把这周撑过去？", "neutral")) {
+        // consume
+      }
+
+      assert.equal(captured.length, 1);
+      assert.equal(captured[0].includes("【主动提起候选】"), false);
+      assert.equal(captured[0].includes("【共同经历提醒】"), false);
+      assert.equal(captured[0].includes("【关系表达风格】"), true);
     } finally {
       restore();
       restoreEnv();

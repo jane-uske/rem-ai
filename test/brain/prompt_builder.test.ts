@@ -88,6 +88,45 @@ describe("prompt builder emotion speech style", () => {
     assert.ok(system.includes("【对话摘要】我们刚聊到最近失眠和晚上的散步习惯。"));
   });
 
+  it("renders stable relationship slots from priority context blocks", () => {
+    const persona = createDefaultPersona();
+
+    const messages = buildPrompt({
+      memory: [],
+      emotion: "neutral",
+      history: [],
+      userMessage: "我们继续",
+      priorityContext:
+        "【关系阶段】熟悉加深期\n\n【回复结构】开头先接情绪。中段一问一接。收尾留温柔台阶。\n\n【对话摘要】我们刚聊到最近失眠和晚上的散步习惯。",
+      persona,
+    });
+
+    const system = messages[0].content;
+    assert.ok(system.includes("【关系阶段】"));
+    assert.ok(system.includes("熟悉加深期"));
+    assert.ok(system.includes("【本轮回复合同】"));
+    assert.ok(system.includes("开头先接情绪"));
+    assert.ok(system.includes("【优先参考"));
+  });
+
+  it("keeps backward compatibility when priority context has no structured relationship blocks", () => {
+    const persona = createDefaultPersona();
+
+    const messages = buildPrompt({
+      memory: [],
+      emotion: "neutral",
+      history: [],
+      userMessage: "我们继续",
+      priorityContext: "【对话摘要】我们刚聊到最近失眠和晚上的散步习惯。",
+      persona,
+    });
+
+    const system = messages[0].content;
+    assert.ok(!system.includes("【关系阶段】"));
+    assert.ok(!system.includes("【本轮回复合同】"));
+    assert.ok(system.includes("【优先参考"));
+  });
+
   it("includes interruption recovery guidance when persona was interrupted", () => {
     const persona = createDefaultPersona();
     persona.liveState.wasInterrupted = true;

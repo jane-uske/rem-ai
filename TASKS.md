@@ -4,13 +4,9 @@
 
 当前主线程以 [CURRENT_FOCUS.md](CURRENT_FOCUS.md) 为准。
 
-当前最高优先级：关系层第一阶段。
+**记忆 V1 / 关系层第一阶段：已完成验收。所有 10 项验收标准全部通过。
 
-当前成功标准：
-- per-user relationship state
-- 跨重连恢复
-- prompt 消费 relationship summary / topic continuity / mood trajectory / proactive hooks
-- interrupted partial 不污染正式状态
+当前最高优先级：记忆 V2 / 关系层第二阶段 —— 语义 Episode 聚类与主动对话触发。
 
 说明：
 - 下面的 `T-*` 列表主要是历史建设清单
@@ -20,41 +16,55 @@
 
 ## Current Main Thread Tasks
 
-- [ ] **R-001** 文档入口统一
+- [x] **R-001** 文档入口统一
   - 目标：让 agent 一进仓库就知道当前主线程是“关系层第一阶段”
   - 输入/输出：更新 `AGENTS.md`、新增 `CURRENT_FOCUS.md`、在 `TASKS.md` 增加当前主线程入口
   - 不做什么：不修改运行时代码
   - 验收标准：只看 `AGENTS.md` 就知道现在先做什么；只看 `TASKS.md` 就能找到当前任务入口
+  - **状态：已完成** — `AGENTS.md` 和 `CURRENT_FOCUS.md` 已存在且内容正确
 
-- [ ] **R-002** 关系状态恢复链路文档化
+- [x] **R-002** 关系状态恢复链路文档化
   - 目标：明确 relationship state 的持久化恢复链路
   - 输入/输出：说明 session init 应加载 relationship state、`hydratePersistentRelationshipState(...)` 的职责、恢复失败时的降级行为
-  - 不做什么：不在本任务里实现 restore wiring
+  - 不做什么：不在本任务里实现 restore wiring（wiring 已在代码中完成）
   - 验收标准：文档能让实现者清楚 restore 接在哪里、失败后如何退回 session 级行为
 
-- [ ] **R-003** prompt 消费链路文档化
+- [x] **R-003** prompt 消费链路文档化
   - 目标：明确 relationship state 如何进入 prompt
   - 输入/输出：说明 `synthesizeContext()` 的用途、`buildConversationStrategyHints()` 的用途、哪些字段属于 priority context
   - 不做什么：不重写 prompt builder
   - 验收标准：实现者能分清“长期关系上下文”和“本轮说话策略”的来源与职责
 
-- [ ] **R-004** 记忆召回升级任务定义
-  - 目标：把 retrieval 从 `getAll()` 升级为相关召回
-  - 输入/输出：定义 topic / mood / relationship 优先级，分离 system memory key 与普通用户事实，并保留无向量回退
-  - 不做什么：不在本任务里推进大规模 embedding/索引改造
-  - 验收标准：后续实现者能按文档推进 relevant retrieval，而不是继续全量平铺
+- [x] **R-004** 记忆召回升级任务定义
+  - 已落地：prompt retrieval 已从 `getAll()` 升级为 relationship-aware relevant retrieval
+  - 当前实现：`core facts -> core episode -> active episode -> recent shared moment/fallback facts`
+  - 保留边界：未引入 embedding/索引改造，仍保留无向量回退
+  - 当前状态：memory v1 可用；后续若继续推进，应做更强的 semantic episode recall，而不是回退到全量平铺
 
-- [ ] **R-005** 中断污染保护任务定义
+- [x] **R-005** 中断污染保护任务定义
   - 目标：明确 interrupted partial 的污染保护边界
   - 输入/输出：说明 interrupted partial 不进 formal history、不进 slow brain、不写 relationship state
   - 不做什么：不改变现有 interrupt 语义
   - 验收标准：后续任务不会把 carry-forward 草稿误写进正式状态
 
-- [ ] **R-006** fast brain 行为层准备任务定义
-  - 目标：为 acknowledgement、backchannel、interruption carry-forward、关系状态驱动的短句节奏做准备
-  - 输入/输出：定义 fast brain 行为层边界和预期能力
-  - 不做什么：不把深检索、慢脑分析或大阻塞任务塞进 fast path
-  - 验收标准：实现者能在不破坏快慢脑边界的前提下扩展 fast brain 行为
+- [x] **R-006** fast brain 行为层准备任务定义
+  - 已落地：turn-taking 已接入 partial-growth / interruption class / prediction gate 联动
+  - 当前实现：`correction / emotional_interrupt / topic_switch` 走不同 live policy；prediction 继续只读
+  - 保留边界：未把慢脑分析或持久化写入塞进 fast path
+  - 当前状态：voice continuity 已进入 memory v1 可验收范围；后续可继续做更深的 latency 自适应
+
+## Memory V1 Status
+
+- [x] per-user relationship state
+- [x] reconnect continuity
+- [x] prompt consumption of relationship summary / topic continuity / mood trajectory / proactive hooks
+- [x] interrupted / partial assistant turn pollution guard
+- [x] relationship-driven fact retrieval
+- [x] explicit `episodes` layer persisted inside relationship state
+- [x] `core episode` + `active episode` recall for prompt building
+- [x] proactive ledger keyed by cue / episode / thread
+- [x] stable relationship style slots in persona prompt
+- [x] realtime continuity policy v2 with read-only prediction gating
 
 ---
 

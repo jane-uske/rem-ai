@@ -2,89 +2,47 @@
 
 ## 一句话
 
-Rem 现在已经接近一个可展示的实时语音角色 demo，但离“真正会被感到有关系感的虚拟伴侣”还远。
+Memory V1 / 关系层第一阶段 **已完成** —— Rem 现在具备了完整的跨会话关系记忆连续性。
 
-## 当前唯一最高优先级
+## 当前最高优先级
 
-关系层第一阶段。
+关系层第二阶段：主动记忆巩固与语义分层（记忆 V2）
 
-当前目标不是继续把语音链路磨得更丝滑一点，而是先把“她记得我们”做成。
+## 为什么现在做这个
 
-## 为什么现在先做这个
+- 关系骨架已经闭环：per-user 关系状态持久化 + episode 分层召回 + proactive 分线索冷却 + 关系风格槽位绑定全部完成
+- 当前最大缺口： episodic记忆还只停留在关键词匹配，没有做语义嵌入聚类；主动开口还只有规则，没有做基于关系状态的主动决策
+- 如果现在先做前端展示优化，容易得到一个好看但“记不住你”的产品，无法达成“记得我们的关系”这个核心差异化
 
-- 当前骨架已经有了：实时语音、快慢脑、memory、avatar、interrupt 语义
-- 当前最大缺口不是“不能聊”，而是“关系连续性还没形成闭环”
-- 如果继续只做 VAD / TTS / playback 局部优化，很容易得到一个更顺滑的语音 bot，而不是更像 Rem 的陪伴系统
+## 当前阶段交付目标
 
-## 当前已确认现状
-
-- relationship state 写回已存在
-- `hydratePersistentRelationshipState(...)` 入口已存在，但还没接到 session init 主链路
-- retrieval 仍然主要是 `getAll()`
-- pgvector 相似召回目前只在存储层
-
-## 当前阶段交付
-
-- 用户级 relationship state 恢复
-- 跨重连恢复
-- prompt 注入 relationship summary / topic continuity / mood trajectory / proactive hooks
-- slow brain 非阻塞写回持久层
-- interrupted partial 不污染正式状态
+- 语义 Episode 聚类：用 embedding 将 shared moments 自动聚合成更自然的长周期话题线
+- 主动对话触发：基于关系状态和未完结 episode 主动开口的决策策略
+- 增量更新优化：只对新增/修改的 episode 做语义计算，不重复全量计算
+- 保留无向量回退：所有新功能在没有 pgvector/pg 环境下仍能优雅降级到关键词模式
 
 ## 当前非目标
 
-- 不做大重写
-- 不先做完整主动 agent
-- 不先扩 avatar 表现层
-- 不把慢脑重逻辑塞进 fast path
+- 不重做已有的关系状态持久化层
+- 不把全量语义计算塞进每轮请求路径（保持离线增量）
+- 不先做端到端情绪大改造（T-040 仍在等待列表）
+- 不先做前端口型同步（T-032 仍在等待列表）
+
+## 当前已确认现状（记忆 V1 已完成）
+
+- ✅ per-user relationship state 持久化与恢复链路已接通并文档化
+- ✅ 跨重连关系连续性完整恢复
+- ✅ prompt 注入：relationship summary / topic continuity / mood trajectory / proactive hooks 全部到位
+- ✅ slow brain 非阻塞写回持久层已实现
+- ✅ interrupted partial 污染保护规则已明确并强制执行
+- ✅ Episode recall layer 已分离 `core`/`active` 两层
+- ✅ Proactive 已按线索分 ledger 独立冷却周期
+- ✅ Persona prompt 已有稳定的关系阶段/回复合同槽位
+- ✅ Realtime continuity policy v2 已与 prediction gate 联动
 
 ## 执行规则
 
 - 当前主线程内的代码任务做完后，必须回写对应任务文档状态
-- 至少更新 `TASKS.md` 中对应的 `R-*` 或相关任务状态
+- 至少更新 `TASKS.md` 中对应的任务状态
 - 如果本次改动改变了当前主线程判断或交付边界，也要同步更新本文件
 - 不要只改代码不改任务文档，否则下一个 agent 很容易误判当前进度
-
-## 接下来的子任务
-
-### R-001 文档入口统一
-
-- 目标：让 agent 一进仓库就知道当前主线程
-- 输入/输出：更新 `AGENTS.md`、新增本文件、更新 `TASKS.md`
-- 不做什么：不改实现逻辑
-- 验收标准：只看 `AGENTS.md` 就能知道当前优先级，只看 `TASKS.md` 就能选一个任务开工
-
-### R-002 关系状态恢复链路文档化
-
-- 目标：把 relationship state 的 restore 链路说清楚
-- 输入/输出：明确 session init、hydrate 入口、失败降级
-- 不做什么：不在本任务里实现恢复代码
-- 验收标准：读文档的人能说清 restore 在哪里接、失败后怎么退化
-
-### R-003 prompt 消费链路文档化
-
-- 目标：说清 relationship state 如何进入 prompt
-- 输入/输出：定义 `synthesizeContext()`、`buildConversationStrategyHints()`、priority context 的职责
-- 不做什么：不重写 prompt builder
-- 验收标准：agent 能区分“关系摘要”和“本轮说话策略”分别从哪里来
-
-### R-004 记忆召回升级任务定义
-
-- 目标：把 retrieval 从 `getAll()` 升级为相关召回
-- 输入/输出：定义 topic / mood / relationship 优先级，分离 system memory key
-- 不做什么：不在本任务里落 embedding 流水线大改造
-- 验收标准：任务描述能指导后续实现相关召回且保留无向量回退
-
-### R-005 中断污染保护任务定义
-
-- 目标：继续守住 formal state 不被 interrupted partial 污染
-- 输入/输出：明确 history / slow brain / relationship state 的保护规则
-- 不做什么：不改现有 interrupt 语义
-- 验收标准：文档能明确哪些状态允许 carry-forward，哪些不能写正式持久层
-
-### R-006 fast brain 行为层准备任务定义
-
-- 目标：为 acknowledgement / backchannel / interruption carry-forward / 短句节奏 做准备
-- 输入/输出：明确 fast brain 未来行为层边界
-- 不做什么：不把深检索和慢脑分析挪进 fast path
-- 验收标准：后续实现者能基于任务描述扩展 fast brain，而不破坏快慢脑边界

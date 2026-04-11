@@ -64,6 +64,96 @@ describe("turn taking strategy", () => {
     assert.equal(decision.gapMs, 120);
   });
 
+  it("lets short carry-forward utterances respond quickly once stable", () => {
+    const decision = decideTurnTaking(
+      makeInput({
+        previewText: "回到刚才那个",
+        lastPartialUpdateAt: 1200,
+        lastGrowthAt: 1100,
+      }),
+    );
+
+    assert.equal(decision.state, "LIKELY_END");
+    assert.equal(decision.gapMs, 80);
+    assert.equal(decision.reasons.includes("carry_forward_cue"), true);
+  });
+
+  it("lets short correction utterances respond quickly once stable after interruption", () => {
+    const decision = decideTurnTaking(
+      makeInput({
+        previewText: "我的意思是昨晚其实没睡着",
+        lastPartialUpdateAt: 1200,
+        lastGrowthAt: 1100,
+        growthPlateauMs: 900,
+        interruptionType: "correction",
+      }),
+    );
+
+    assert.equal(decision.state, "LIKELY_END");
+    assert.equal(decision.gapMs, 80);
+    assert.equal(decision.reasons.includes("correction_cue"), true);
+  });
+
+  it("releases faster for a topic-switching sentence once it is semantically complete", () => {
+    const decision = decideTurnTaking(
+      makeInput({
+        previewText: "先不说这个，我们换个话题吧",
+        lastPartialUpdateAt: 1200,
+        lastGrowthAt: 1100,
+        interruptionType: "topic_switch",
+      }),
+    );
+
+    assert.equal(decision.state, "LIKELY_END");
+    assert.equal(decision.reasons.includes("interruption:topic_switch"), true);
+  });
+
+  it("can release topic_switch with semantic completion streak even without explicit ending", () => {
+    const decision = decideTurnTaking(
+      makeInput({
+        previewText: "先不说这个我们换个方向聊",
+        lastPartialUpdateAt: 1200,
+        lastGrowthAt: 1100,
+        interruptionType: "topic_switch",
+        semanticCompletionStreak: 2,
+      }),
+    );
+
+    assert.equal(decision.state, "LIKELY_END");
+    assert.equal(decision.reasons.includes("semantic_completion_streak:2"), true);
+  });
+
+  it("still holds a semantic ending that is clearly expanding quickly", () => {
+    const decision = decideTurnTaking(
+      makeInput({
+        previewText: "这样说也可以吗",
+        lastPartialUpdateAt: 1500,
+        lastGrowthAt: 1500,
+        recentGrowthChars: 5,
+        growthPlateauCount: 0,
+      }),
+    );
+
+    assert.equal(decision.state, "HOLD");
+    assert.equal(decision.reasons.includes("recent_growth"), true);
+  });
+
+  it("lets a correction release once partial growth has plateaued over small increments", () => {
+    const decision = decideTurnTaking(
+      makeInput({
+        previewText: "不是那个意思，我是想说昨晚还是没睡着",
+        lastPartialUpdateAt: 1400,
+        lastGrowthAt: 1500,
+        recentGrowthChars: 1,
+        growthPlateauCount: 3,
+        interruptionType: "correction",
+      }),
+    );
+
+    assert.equal(decision.state, "LIKELY_END");
+    assert.equal(decision.reasons.includes("partial_growth_plateau"), true);
+  });
+
   it("documents the no-preview fallback path", () => {
     const decision = decideTurnTaking(
       makeInput({

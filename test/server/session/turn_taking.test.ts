@@ -62,7 +62,7 @@ describe("turn taking stage2", () => {
 
     assert.equal(decision.state, "LIKELY_END");
     assert.equal(decision.semanticallyComplete, true);
-    assert.equal(decision.gapMs, 190);
+    assert.equal(decision.gapMs, 160);
   });
 
   it("falls back when preview is only recording placeholder", () => {
@@ -131,6 +131,64 @@ describe("turn taking stage2", () => {
     assert.ok(decision.reasons.includes("open_clause_tail"));
   });
 
+  it("releases faster for a stable carry-forward cue like 继续刚才那个", () => {
+    const decision = decideTurnTaking({
+      ...baseInput,
+      previewText: "继续刚才那个",
+      lastPartialUpdateAt: 9_100,
+      lastGrowthAt: 8_900,
+    });
+
+    assert.equal(decision.state, "LIKELY_END");
+    assert.equal(decision.gapMs, 80);
+    assert.ok(decision.reasons.includes("carry_forward_cue"));
+  });
+
+  it("releases quickly for a stable correction cue after an interruption", () => {
+    const decision = decideTurnTaking({
+      ...baseInput,
+      previewText: "不是那个意思，我想说的是昨晚又没睡好",
+      lastPartialUpdateAt: 9_120,
+      lastGrowthAt: 8_900,
+      growthPlateauMs: 900,
+      interruptionType: "correction",
+    });
+
+    assert.equal(decision.state, "LIKELY_END");
+    assert.equal(decision.gapMs, 80);
+    assert.ok(decision.reasons.includes("correction_cue"));
+    assert.ok(decision.reasons.includes("interruption:correction"));
+  });
+
+  it("releases quickly for a short emotional interruption once the partial plateaus", () => {
+    const decision = decideTurnTaking({
+      ...baseInput,
+      previewText: "等一下你先别说",
+      lastPartialUpdateAt: 9_240,
+      lastGrowthAt: 9_080,
+      growthPlateauMs: 500,
+      interruptionType: "emotional_interrupt",
+    });
+
+    assert.equal(decision.state, "LIKELY_END");
+    assert.ok(decision.reasons.includes("interruption:emotional_interrupt"));
+  });
+
+  it("uses partial growth trend aggregates to keep expanding semantic partials on hold", () => {
+    const decision = decideTurnTaking({
+      ...baseInput,
+      previewText: "这样可以吗",
+      lastPartialUpdateAt: 9_780,
+      lastGrowthAt: 9_780,
+      recentGrowthChars: 5,
+      partialGrowthTrend: "expanding",
+      semanticCompletionStreak: 0,
+    });
+
+    assert.equal(decision.state, "HOLD");
+    assert.ok(decision.reasons.includes("partial_trend:expanding"));
+  });
+
   it("offers a light backchannel on a stable thinking pause", () => {
     assert.equal(
       shouldOfferThinkingPauseBackchannel({
@@ -188,6 +246,38 @@ describe("turn taking stage2", () => {
     assert.equal(decision.allowed, true);
     assert.equal(decision.reason, "thinking_pause");
     assert.equal(decision.text, "然后呢");
+  });
+
+  it("suppresses thinking-pause backchannel for explicit carry-forward cues", () => {
+    const decision = evaluateBackchannelDecision({
+      emotion: "neutral",
+      state: "HOLD",
+      previewText: "不是那个意思",
+      stableMs: 1500,
+      recentGrowth: false,
+      semanticallyComplete: false,
+      incompleteTail: false,
+      cooldownStableMs: 1100,
+      minPreviewChars: 4,
+    });
+    assert.equal(decision.allowed, false);
+    assert.equal(decision.reason, "turn_state");
+  });
+
+  it("suppresses thinking-pause backchannel for explicit correction cues", () => {
+    const decision = evaluateBackchannelDecision({
+      emotion: "neutral",
+      state: "HOLD",
+      previewText: "我的意思是",
+      stableMs: 1500,
+      recentGrowth: false,
+      semanticallyComplete: false,
+      incompleteTail: false,
+      cooldownStableMs: 1100,
+      minPreviewChars: 4,
+    });
+    assert.equal(decision.allowed, false);
+    assert.equal(decision.reason, "turn_state");
   });
 
   it("suppresses backchannel decisions while cooldown is active", () => {

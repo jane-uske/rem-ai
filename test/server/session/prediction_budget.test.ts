@@ -165,4 +165,72 @@ describe("prediction budget gates", () => {
       restore();
     }
   });
+
+  it("lets prediction read persistent continuity hints without writing relationship state", async () => {
+    const { session, predictionCalls, restore } = loadPredictionSession({
+      predictionEnabled: "1",
+      predictionPushEnabled: "0",
+      predictedReply: "我记得",
+    });
+
+    try {
+      session.brain.slowBrain.recordTurn();
+      session.brain.slowBrain.recordTurn();
+      session.brain.slowBrain.bumpRelationship({ familiarityDelta: 0.55, emotionalBondDelta: 0.46 });
+      session.brain.slowBrain.setConversationSummary("最近一直在聊失眠和白天精力被拖垮的感觉。");
+      session.brain.slowBrain.recordSharedMoment({
+        summary: "上次你提到昨晚又断断续续醒了几次，我们还聊到白天整个人都空掉了。",
+        topic: "睡眠",
+        mood: "疲惫/烦躁",
+        hook: "昨晚睡得怎么样",
+        createdAt: 700,
+      });
+
+      session.emitSttPartial("继续刚才那个");
+      await waitFor(() => predictionCalls.length === 1);
+
+      const input = predictionCalls[0][0];
+      assert.ok(input.strategyHints.includes("【实时连续性】"));
+      assert.ok(input.strategyHints.includes("昨晚又断断续续醒了几次"));
+      assert.equal(session.brain.slowBrain.getSnapshot().relationship.turnCount, 2);
+      assert.equal(session.brain.slowBrain.getSnapshot().continuityCueState.lastSharedMomentSummary, "");
+    } finally {
+      restore();
+    }
+  });
+
+  it("skips prediction while HOLD partial is still oscillating without semantic completion", async () => {
+    const { session, predictionCalls, restore } = loadPredictionSession({
+      predictionEnabled: "1",
+      predictionPushEnabled: "0",
+    });
+
+    try {
+      session.turnTakingState = "HOLD";
+      session.emitSttPartial("我想先说");
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.equal(predictionCalls.length, 0);
+    } finally {
+      restore();
+    }
+  });
+
+  it("does not force carry-forward hints on topic switches", async () => {
+    const { session, predictionCalls, restore } = loadPredictionSession({
+      predictionEnabled: "1",
+      predictionPushEnabled: "0",
+      predictedReply: "我们换个方向继续",
+    });
+
+    try {
+      session.brain.lastInterruptedReply = "你刚刚提到昨晚没睡好。";
+      session.emitSttPartial("先不说这个，我们换个话题吧");
+      await waitFor(() => predictionCalls.length === 1);
+
+      const input = predictionCalls[0][0];
+      assert.equal(input.strategyHints.includes("你刚刚提到昨晚没睡好"), false);
+    } finally {
+      restore();
+    }
+  });
 });

@@ -83,7 +83,18 @@ describe("relationship state persistence", () => {
       topic: "睡眠",
       mood: "难过",
       hook: "昨晚睡得怎么样",
+      kind: "support",
+      salience: 0.82,
+      unresolved: true,
       createdAt: 120,
+    });
+    store.recordUserTurnActivity();
+    store.recordProactiveOutreach("care", "episode:sleep-line");
+    store.recordProactiveOutreach("care", "episode:sleep-line");
+    store.markContinuityCueUsed({
+      proactiveCandidate: "昨晚睡得怎么样",
+      sharedMomentCandidate: "上次你提到最近睡不太好，我们顺着这个聊了很久。",
+      turnOffset: 0,
     });
 
     await savePersistentRelationshipState(repo, store.exportPersistentState(123));
@@ -96,6 +107,28 @@ describe("relationship state persistence", () => {
     assert.equal(loaded.conversationSummary, "最近在聊失眠和晚上散步。");
     assert.equal(loaded.sharedMoments.length, 1);
     assert.equal(loaded.sharedMoments[0].topic, "睡眠");
+    assert.equal(loaded.sharedMoments[0].kind, "support");
+    assert.equal(loaded.sharedMoments[0].unresolved, true);
+    assert.equal(loaded.sharedMoments[0].recurrenceCount, 1);
+    assert.ok(Array.isArray(loaded.sharedMoments[0].semanticKeywords));
+    assert.equal(loaded.episodes.length, 1);
+    assert.equal(loaded.episodes[0].layer, "active");
+    assert.equal(loaded.episodes[0].title, "睡眠");
+    assert.equal(loaded.topicThreads.length, 1);
+    assert.equal(loaded.topicThreads[0].topic, "睡眠");
+    assert.equal(loaded.topicThreads[0].memoryLayer, "active");
+    assert.equal(loaded.proactiveLedger.length, 1);
+    assert.equal(loaded.proactiveLedger[0].key, "episode:sleep-line");
+    assert.equal(loaded.proactiveLedger[0].ignoredCount >= 1, true);
+    assert.equal(loaded.proactiveStrategyState.totalProactiveCount, 2);
+    assert.equal(loaded.proactiveStrategyState.lastProactiveMode, "care");
+    assert.equal(loaded.proactiveStrategyState.ignoredProactiveStreak >= 1, true);
+    assert.equal(loaded.proactiveStrategyState.cooldownUntilAt > 0, true);
+    assert.equal(loaded.continuityCueState.lastProactiveHook, "昨晚睡得怎么样");
+    assert.equal(
+      loaded.continuityCueState.lastSharedMomentSummary,
+      "上次你提到最近睡不太好，我们顺着这个聊了很久。",
+    );
   });
 
   it("filters system relationship entries out of prompt memory retrieval", async () => {
@@ -170,10 +203,264 @@ describe("relationship state persistence", () => {
       { turn: 5, mood: "难过" },
     ]);
     assert.equal(snapshot.relationship.turnCount, 5);
+    assert.equal(snapshot.continuityCueState.lastProactiveHook, "");
     assert.equal(
       ctx.persona.liveState.lastTopicSummary,
       "最近一直在聊她晚上睡不好，还有散步能不能让人放松一点。",
     );
+  });
+
+  it("suppresses recently used silence-nudge continuity cues", () => {
+    const store = new SlowBrainStore();
+    store.recordTurn();
+    store.recordTurn();
+    store.recordTurn();
+    store.recordTurn();
+    store.recordTurn();
+    store.recordTurn();
+    store.bumpRelationship({ familiarityDelta: 0.45, emotionalBondDelta: 0.3 });
+    store.setProactiveTopics(["昨晚睡得怎么样"]);
+    store.recordSharedMoment({
+      summary: "上次你提到失眠反复醒来，我们还聊到睡前散步会不会好一点。",
+      topic: "睡眠",
+      mood: "疲惫/烦躁",
+      hook: "昨晚睡得怎么样",
+      createdAt: 500,
+    });
+
+    const firstPlan = store.buildSilenceNudgePlan();
+    assert.ok(firstPlan);
+    assert.equal(firstPlan.sharedMomentCandidate, "上次你提到失眠反复醒来，我们还聊到睡前散步会不会好一点。");
+
+    store.markContinuityCueUsed(firstPlan);
+    const secondPlan = store.buildSilenceNudgePlan();
+    assert.ok(secondPlan);
+    assert.equal(secondPlan.sharedMomentCandidate, undefined);
+    assert.equal(secondPlan.proactiveCandidate, undefined);
+  });
+
+  it("prefers unresolved supportive episodes for silence nudges", () => {
+    const store = new SlowBrainStore();
+    store.recordTurn();
+    store.recordTurn();
+    store.recordTurn();
+    store.bumpRelationship({ familiarityDelta: 0.58, emotionalBondDelta: 0.52 });
+    store.setProactiveTopics(["今天有没有出去走走"]);
+    store.recordSharedMoment({
+      summary: "上次你提到工作里被误解之后一直很委屈，我们还聊到那股堵着的感觉。",
+      topic: "工作",
+      mood: "委屈",
+      hook: "上次那件工作上的事，后来有缓一点吗？",
+      kind: "stress",
+      salience: 0.92,
+      unresolved: true,
+      createdAt: 300,
+    });
+
+    const plan = store.buildSilenceNudgePlan();
+    assert.ok(plan);
+    assert.equal(plan.proactiveCandidate, "上次那件工作上的事，后来有缓一点吗？");
+  });
+
+  it("suppresses repeated silence nudges until the user returns", () => {
+    const store = new SlowBrainStore();
+    store.recordTurn();
+    store.recordTurn();
+    store.recordTurn();
+    store.bumpRelationship({ familiarityDelta: 0.75, emotionalBondDelta: 0.7 });
+    store.recordSharedMoment({
+      summary: "上次你提到最近压力一直没下去，我们聊到你像是一直在绷着。",
+      topic: "工作",
+      mood: "焦虑",
+      hook: "上次那阵压力，后来有缓一点吗？",
+      kind: "stress",
+      salience: 0.9,
+      unresolved: true,
+      createdAt: 500,
+    });
+
+    const first = store.buildSilenceNudgePlan();
+    assert.ok(first);
+    store.recordProactiveOutreach();
+    const second = store.buildSilenceNudgePlan();
+    assert.equal(second, null);
+
+    store.recordUserTurnActivity();
+    const snapshot = store.getSnapshot();
+    assert.equal(snapshot.proactiveStrategyState?.consecutiveProactiveCount, 0);
+    assert.equal(snapshot.proactiveStrategyState?.nudgesSinceLastUserTurn, 0);
+  });
+
+  it("keeps relationship style guidance stable for early but warm connections", () => {
+    const store = new SlowBrainStore();
+    store.recordTurn();
+    store.recordTurn();
+    store.recordTurn();
+    store.bumpRelationship({ familiarityDelta: 0.75, emotionalBondDelta: 0.68 });
+    store.setConversationSummary("最近在聊工作里被误解后的委屈。");
+
+    const guidance = store.buildConversationGuidance("我还是有点委屈");
+    const context = store.synthesizeContext();
+    assert.ok(guidance.hints?.includes("【关系表达风格】"));
+    assert.ok(guidance.hints?.includes("【主动策略】"));
+    assert.ok(guidance.hints?.includes("建立关系期"));
+    assert.equal(guidance.hints?.includes("亲密稳定期"), false);
+    assert.ok(guidance.hints?.includes("起句先回应事实或感受本身"));
+    assert.ok(context?.includes("【关系风格合同】"));
+  });
+
+  it("uses a stronger care-mode silence nudge only for close unresolved threads", () => {
+    const earlyStore = new SlowBrainStore();
+    earlyStore.recordTurn();
+    earlyStore.recordTurn();
+    earlyStore.bumpRelationship({ familiarityDelta: 0.28, emotionalBondDelta: 0.2 });
+    earlyStore.recordSharedMoment({
+      summary: "上次你提到最近有点累，我们只是轻轻聊了两句。",
+      topic: "状态",
+      mood: "疲惫/烦躁",
+      hook: "最近还好吗",
+      kind: "routine",
+      salience: 0.4,
+      unresolved: false,
+      createdAt: 200,
+    });
+    const earlyPlan = earlyStore.buildSilenceNudgePlan();
+    assert.ok(earlyPlan);
+    assert.equal(earlyPlan.strategyMode, "presence");
+
+    const closeStore = new SlowBrainStore();
+    closeStore.recordTurn();
+    closeStore.recordTurn();
+    closeStore.recordTurn();
+    closeStore.recordTurn();
+    closeStore.bumpRelationship({ familiarityDelta: 0.72, emotionalBondDelta: 0.68 });
+    closeStore.recordSharedMoment({
+      summary: "上次你提到工作里那件事一直没过去，我们聊到你最难受的是被误解。",
+      topic: "工作",
+      mood: "委屈",
+      hook: "那件工作上的事后来有缓一点吗？",
+      kind: "stress",
+      salience: 0.94,
+      unresolved: true,
+      createdAt: 300,
+    });
+    const closePlan = closeStore.buildSilenceNudgePlan();
+    assert.ok(closePlan);
+    assert.equal(closePlan.strategyMode, "care");
+  });
+
+  it("backs off proactive intensity after repeated unanswered nudges", () => {
+    const store = new SlowBrainStore();
+    store.recordTurn();
+    store.recordTurn();
+    store.recordTurn();
+    store.bumpRelationship({ familiarityDelta: 0.68, emotionalBondDelta: 0.62 });
+    store.recordSharedMoment({
+      summary: "上次你提到工作里的委屈还挂着，我们聊到你很怕再次被误解。",
+      topic: "工作",
+      mood: "委屈",
+      hook: "那件工作上的事后来有缓一点吗？",
+      kind: "stress",
+      salience: 0.9,
+      unresolved: true,
+      createdAt: 400,
+    });
+
+    store.recordProactiveOutreach("care");
+    store.recordProactiveOutreach("care");
+    const guidance = store.buildConversationGuidance("嗯");
+
+    assert.ok(guidance.hints?.includes("低打扰的在场感"));
+    assert.equal(store.buildSilenceNudgePlan(), null);
+  });
+
+  it("can cluster semantically related episodes into one longer-running relationship thread", () => {
+    const store = new SlowBrainStore();
+    store.recordTurn();
+    store.recordTurn();
+    store.recordTurn();
+    store.recordSharedMoment({
+      summary: "上次你提到被同事误解后一直很委屈，我们聊到你最难受的是努力被看偏了。",
+      topic: "工作",
+      mood: "委屈",
+      hook: "那次被误解的事后来有缓一点吗？",
+      kind: "stress",
+      salience: 0.92,
+      unresolved: true,
+      createdAt: 100,
+    });
+    store.recordTurn();
+    store.recordSharedMoment({
+      summary: "后来你又说最近睡不好，其实还是因为那股被误解的委屈一直没下去。",
+      topic: "睡眠",
+      mood: "疲惫/烦躁",
+      hook: "最近睡得怎么样",
+      kind: "support",
+      salience: 0.82,
+      unresolved: true,
+      createdAt: 200,
+    });
+
+    const snapshot = store.getSnapshot();
+    assert.equal(snapshot.topicThreads.length >= 1, true);
+    assert.equal(snapshot.topicThreads[0].relatedTopics?.includes("工作"), true);
+    assert.equal(snapshot.topicThreads[0].relatedTopics?.includes("睡眠"), true);
+    assert.equal(snapshot.topicThreads[0].episodeCount, 2);
+  });
+
+  it("marks deeper multi-topic threads as core memory and surfaces an unfinished line separately", () => {
+    const store = new SlowBrainStore();
+    for (let index = 0; index < 7; index += 1) {
+      store.recordTurn();
+    }
+    store.recordSharedMoment({
+      summary: "最早你提到工作里被误解之后一直很委屈，我们聊到那股堵着的感觉。",
+      topic: "工作",
+      mood: "委屈",
+      hook: "那次被误解的事后来有缓一点吗？",
+      kind: "stress",
+      salience: 0.94,
+      unresolved: true,
+      createdAt: 100,
+    });
+    store.recordTurn();
+    store.recordTurn();
+    store.recordTurn();
+    store.recordSharedMoment({
+      summary: "后来你又说最近睡不好，其实还是因为那股委屈一直没下去。",
+      topic: "睡眠",
+      mood: "疲惫/烦躁",
+      hook: "最近睡得怎么样",
+      kind: "support",
+      salience: 0.82,
+      unresolved: true,
+      createdAt: 200,
+    });
+    store.recordTurn();
+    store.recordTurn();
+    store.recordTurn();
+    store.recordSharedMoment({
+      summary: "再后来你提到和家里说起这件事时还是会鼻子一酸。",
+      topic: "家人",
+      mood: "低落",
+      hook: "后来和家里聊完有轻一点吗？",
+      kind: "bond",
+      salience: 0.78,
+      unresolved: false,
+      createdAt: 300,
+    });
+
+    const snapshot = store.getSnapshot();
+    assert.equal(snapshot.topicThreads.length >= 1, true);
+    assert.equal(
+      snapshot.topicThreads.some(
+        (entry) => entry.memoryLayer === "core" && (entry.timeSpanTurns ?? 0) >= 5,
+      ),
+      true,
+    );
+    const context = store.synthesizeContext();
+    assert.ok(context?.includes("【长期关系主线】"));
+    assert.ok(context?.includes("【当前未完主线】"));
   });
 
   it("keeps prediction-only generation read-only for relationship persistence", async () => {
