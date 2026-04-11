@@ -16,6 +16,10 @@ import type { SlowBrainStore } from "./slow_brain_store";
 
 const logger = createLogger("slow_brain");
 
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
 export interface SlowBrainInput {
   userMessage: string;
   assistantReply: string;
@@ -303,6 +307,8 @@ function maybeRecordSharedMoment(
 
   const topic = detectSharedMomentTopic(trimmedUser, store);
   const mood = detectSharedMomentMood(trimmedUser, store);
+  const kind = detectSharedMomentKind(trimmedUser, topic, mood);
+  const unresolved = detectSharedMomentUnresolved(trimmedUser, assistantReply, kind);
   const looksMeaningful =
     Boolean(topic) ||
     /今天|昨天|昨晚|最近|刚刚|第一次|一直|因为|结果|开心|难过|焦虑|累|失眠|散步|跑步|工作|朋友|家人/.test(trimmedUser);
@@ -313,6 +319,9 @@ function maybeRecordSharedMoment(
     topic,
     mood,
     hook: buildSharedMomentHook(topic, store, trimmedUser),
+    kind,
+    salience: estimateSharedMomentSalience(trimmedUser, mood, kind),
+    unresolved,
   });
 }
 
@@ -342,6 +351,63 @@ function detectSharedMomentMood(
     }
   }
   return store.getSnapshot().moodTrajectory.slice(-1)[0]?.mood ?? "平静";
+}
+
+function detectSharedMomentKind(
+  userMessage: string,
+  topic: string,
+  mood: string,
+): "support" | "stress" | "joy" | "goal" | "routine" | "bond" {
+  if (/一起|陪你|你跟我说|我们聊到|你愿意和我说/u.test(userMessage)) {
+    return "bond";
+  }
+  if (/计划|打算|准备|想要|目标|决定|试试看/u.test(userMessage)) {
+    return "goal";
+  }
+  if (/开心|高兴|兴奋|松一口气|终于|好起来/u.test(userMessage) || mood === "开心") {
+    return "joy";
+  }
+  if (
+    /委屈|焦虑|崩溃|烦|难过|失眠|睡不着|误解|冲突|吵架|压力/u.test(userMessage) ||
+    mood === "焦虑" ||
+    mood === "难过" ||
+    mood === "疲惫/烦躁"
+  ) {
+    return topic === "工作" || topic === "感情" ? "stress" : "support";
+  }
+  return "routine";
+}
+
+function detectSharedMomentUnresolved(
+  userMessage: string,
+  assistantReply: string,
+  kind: "support" | "stress" | "joy" | "goal" | "routine" | "bond",
+): boolean {
+  if (kind === "joy" || kind === "routine" || kind === "bond") return false;
+  if (/已经好了|解决了|没事了|缓过来了|结束了|过去了/u.test(userMessage)) {
+    return false;
+  }
+  if (/慢慢来|先别急|之后再看看|我们继续看看/u.test(assistantReply)) {
+    return true;
+  }
+  return true;
+}
+
+function estimateSharedMomentSalience(
+  userMessage: string,
+  mood: string,
+  kind: "support" | "stress" | "joy" | "goal" | "routine" | "bond",
+): number {
+  let score = 0.38;
+  if (kind === "support" || kind === "stress") score += 0.22;
+  if (kind === "goal" || kind === "joy") score += 0.12;
+  if (kind === "bond") score += 0.15;
+  if (/第一次|一直|总是|反复|真的|特别|很|太/u.test(userMessage)) score += 0.08;
+  if (/委屈|焦虑|崩溃|开心|失眠|睡不着|误解|冲突/u.test(`${userMessage}${mood}`)) {
+    score += 0.1;
+  }
+  if (userMessage.length >= 18) score += 0.06;
+  return clamp01(score);
 }
 
 function buildSharedMomentSummary(userMessage: string, topic: string): string {
