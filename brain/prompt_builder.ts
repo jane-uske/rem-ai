@@ -25,6 +25,11 @@ interface BuildPromptInput {
   persona?: PersonaState;
 }
 
+type PrioritySlots = {
+  relationshipStageLabel?: string;
+  replyShapeContract?: string;
+};
+
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
   if (raw === undefined || raw === "") return fallback;
   const n = Number(raw);
@@ -56,6 +61,33 @@ function buildEmotionSpeechGuidance(emotion: Emotion): string {
   return `当前情绪：${emotion}\n情绪表达风格：${EMOTION_STYLE[emotion]}\n说话节奏提示：${EMOTION_SPEECH_STYLE[emotion]}`;
 }
 
+function readPriorityBlock(priorityContext: string, heading: string): string | undefined {
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`【${escaped}】\\s*([\\s\\S]*?)(?=\\n\\s*【|$)`, "m");
+  const match = priorityContext.match(pattern);
+  return match?.[1]?.trim() || undefined;
+}
+
+function extractPrioritySlots(priorityContext?: string): PrioritySlots {
+  if (!priorityContext?.trim()) return {};
+  const raw = priorityContext.trim();
+  const stageFromStage = readPriorityBlock(raw, "关系阶段");
+  const stageFromCompanion = readPriorityBlock(raw, "陪伴阶段提示");
+  const stageCandidate = stageFromStage || stageFromCompanion;
+  let relationshipStageLabel: string | undefined;
+  if (stageCandidate) {
+    const explicit = stageCandidate.match(/当前阶段[:：]\s*([^\n。]+)/);
+    relationshipStageLabel = (explicit?.[1] || stageCandidate.split(/\n/)[0] || "").trim() || undefined;
+  }
+
+  const replyShapeContract =
+    readPriorityBlock(raw, "本轮回复合同") ||
+    readPriorityBlock(raw, "回复结构") ||
+    readPriorityBlock(raw, "关系风格合同");
+
+  return { relationshipStageLabel, replyShapeContract };
+}
+
 function buildSystemPrompt(
   memory: MemoryEntry[],
   emotion: Emotion,
@@ -68,6 +100,7 @@ function buildSystemPrompt(
 
   // Use new persona system if provided
   if (persona) {
+    const slots = extractPrioritySlots(priorityContext);
     const memoryStr = memory.length > 0
       ? memory
           .slice(0, maxMemoryEntries)
@@ -77,6 +110,12 @@ function buildSystemPrompt(
     return buildPersonaPrompt(persona, {
       priorityContext: priorityContext?.trim()
         ? trimTextByChars(priorityContext.trim(), maxPriorityChars)
+        : undefined,
+      relationshipStageLabel: slots.relationshipStageLabel
+        ? trimTextByChars(slots.relationshipStageLabel, 120)
+        : undefined,
+      replyShapeContract: slots.replyShapeContract
+        ? trimTextByChars(slots.replyShapeContract, 260)
         : undefined,
       memoryStr,
       emotionSpeechGuidance: buildEmotionSpeechGuidance(emotion),

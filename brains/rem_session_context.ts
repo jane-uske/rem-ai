@@ -124,7 +124,19 @@ export class RemSessionContext {
       return false;
     }
 
-    const continuationPhrases = ["继续说", "刚才说到哪", "接着说", "然后呢", "还有吗", "之前说的", "刚才的话题", "继续刚才的"];
+    const continuationPhrases = [
+      "继续说",
+      "刚才说到哪",
+      "接着说",
+      "然后呢",
+      "还有吗",
+      "之前说的",
+      "刚才的话题",
+      "继续刚才的",
+      "还是那个",
+      "上次那个",
+      "回到刚才",
+    ];
     const inputLower = currentUserInput.toLowerCase();
     if (continuationPhrases.some(phrase => inputLower.includes(phrase))) {
       return true;
@@ -136,7 +148,15 @@ export class RemSessionContext {
     const recentContent = this.persona.liveState.recentInteractions.slice(-3)
       .map(line => line.replace(/^(用户|你)：/, ""))
       .join(" ");
-    const fallbackSummary = this.persona.liveState.lastTopicSummary;
+    const slowBrainSnapshot = this.slowBrain.getSnapshot();
+    const fallbackSummary = [
+      this.persona.liveState.lastTopicSummary,
+      slowBrainSnapshot.conversationSummary,
+      ...slowBrainSnapshot.sharedMoments.slice(0, 2).map((entry) => entry.summary),
+      ...slowBrainSnapshot.relationship.preferredTopics,
+    ]
+      .filter(Boolean)
+      .join(" ");
     const sourceText = recentContent || fallbackSummary;
     if (!sourceText || sourceText === "无最近话题") {
       return false;

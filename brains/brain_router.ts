@@ -6,6 +6,10 @@ import type { PromptMessage } from "../brain/prompt_builder";
 import type { Emotion } from "../emotion/emotion_state";
 import type { RemSessionContext } from "./rem_session_context";
 import { createLogger } from "../infra/logger";
+import {
+  relationshipStateEnabled,
+  savePersistentRelationshipState,
+} from "../memory/relationship_state";
 
 const MAX_HISTORY = 10;
 const logger = createLogger("brain_router");
@@ -22,6 +26,27 @@ export interface RouteMessageOptions {
   pregeneratedReply?: string;
   /** 打断承接提示，帮助快脑把新一轮回复接在正确的会话分支上。 */
   carryForwardHint?: string;
+}
+
+async function persistContinuityCueState(ctx: RemSessionContext): Promise<void> {
+  if (!relationshipStateEnabled()) return;
+  const relationshipRepo =
+    ctx.persistentRelationshipRepo ??
+    ctx.memory.getPersistentBackend() ??
+    ctx.memory;
+  if (!relationshipRepo) return;
+
+  try {
+    await savePersistentRelationshipState(
+      relationshipRepo,
+      ctx.slowBrain.exportPersistentState(),
+    );
+  } catch (err) {
+    logger.warn("连续性提示持久化失败", {
+      connId: ctx.connId,
+      error: (err as Error).message,
+    });
+  }
 }
 
 /**
@@ -65,6 +90,7 @@ export async function* routeMessage(
   const historyForPrompt = trimHistoryToTokenBudget([...ctx.history]);
   const pregeneratedReply = opts?.pregeneratedReply?.trim();
   const carryForwardHint = opts?.carryForwardHint?.trim();
+  const guidance = ctx.slowBrain.buildConversationGuidance(userMessage);
 
   let fullReply = "";
   if (pregeneratedReply) {
@@ -82,7 +108,7 @@ export async function* routeMessage(
       history: historyForPrompt,
       slowBrainContext,
       strategyHints: [
-        ctx.slowBrain.buildConversationStrategyHints(userMessage),
+        guidance.hints,
         carryForwardHint,
       ]
         .filter((part): part is string => Boolean(part?.trim()))
@@ -122,6 +148,12 @@ export async function* routeMessage(
     userMessage,
     fullReply
   );
+  ctx.slowBrain.recordUserTurnActivity(userMessage);
+
+  ctx.slowBrain.markContinuityCueUsed({
+    proactiveCandidate: guidance.proactiveCandidate,
+    sharedMomentCandidate: guidance.sharedMomentCandidate,
+  });
 
   if (!opts?.systemTriggered && slowBrainEnabled()) {
     const slowBrainSignal = ctx.beginSlowBrain();
@@ -145,5 +177,6 @@ export async function* routeMessage(
     logger.debug("slow brain skipped by budget gate", {
       connId: ctx.connId,
     });
+    await persistContinuityCueState(ctx);
   }
 }

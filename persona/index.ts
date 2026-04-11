@@ -1,3 +1,6 @@
+import { buildCharacterRulesPrompt } from "../brain/character_rules";
+import { buildPersonalityPrompt } from "../brain/personality";
+
 export type PersonaLiveState = {
   currentMood: string;
   emotionalState: string;
@@ -13,6 +16,8 @@ export type PersonaState = {
 
 type BuildPersonaPromptOptions = {
   priorityContext?: string;
+  relationshipStageLabel?: string;
+  replyShapeContract?: string;
   memoryStr?: string;
   emotionSpeechGuidance?: string;
 };
@@ -36,12 +41,24 @@ export function buildPersonaPrompt(
 ): string {
   const sections: string[] = [];
 
+  if (options.relationshipStageLabel?.trim()) {
+    sections.push("【关系阶段】");
+    sections.push(options.relationshipStageLabel.trim());
+  }
+
+  if (options.replyShapeContract?.trim()) {
+    sections.push("【本轮回复合同】");
+    sections.push(options.replyShapeContract.trim());
+  }
+
   if (options.priorityContext?.trim()) {
     sections.push("【优先参考（请自然融入对话，不要逐条复述）】");
     sections.push(options.priorityContext.trim());
   }
 
-  sections.push("你是 Rem，一个温暖的陪伴型 AI。");
+  sections.push(buildPersonalityPrompt());
+  sections.push(buildCharacterRulesPrompt());
+
   sections.push(`当前情绪：${persona.liveState.currentMood}，情感状态：${persona.liveState.emotionalState}`);
   if (options.emotionSpeechGuidance?.trim()) {
     sections.push(options.emotionSpeechGuidance.trim());

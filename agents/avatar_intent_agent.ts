@@ -1,4 +1,4 @@
-import { createLogger } from "../infra/logger";
+const { loadModule } = require("../utils/module_loader.ts") as typeof import("../utils/module_loader");
 import type {
   AvatarIntent,
   AvatarIntentBeat,
@@ -6,8 +6,23 @@ import type {
   AvatarIntentGesture,
   Emotion,
 } from "../avatar/types";
-import { asEmotion, asGesture, asFacialAccent, clampBand, clampMs } from "../avatar/utils";
 
+const { createLogger } = loadModule<{
+  createLogger: (module: string) => {
+    info: (...args: unknown[]) => void;
+    warn: (...args: unknown[]) => void;
+  };
+}>("../infra/logger");
+const { asEmotion, asGesture, asFacialAccent, clampBand, clampMs } = loadModule<{
+  asEmotion: (value: unknown, fallback: AvatarIntent["emotion"]) => AvatarIntent["emotion"];
+  asGesture: (value: unknown, fallback: AvatarIntent["gesture"]) => AvatarIntent["gesture"];
+  asFacialAccent: (
+    value: unknown,
+    fallback: AvatarIntent["facialAccent"],
+  ) => AvatarIntent["facialAccent"];
+  clampBand: (value: unknown, fallback: 0 | 1 | 2 | 3) => 0 | 1 | 2 | 3;
+  clampMs: (value: unknown, fallback: number, min: number, max: number) => number;
+}>("../avatar/utils");
 const logger = createLogger("avatar-intent-agent");
 
 const SYSTEM_PROMPT = [
@@ -220,12 +235,11 @@ function loadQwenClient(): {
     signal?: AbortSignal,
   ) => Promise<string>;
 } {
-  try {
-    return require("../llm/qwen_client");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "MODULE_NOT_FOUND") {
-      throw err;
-    }
-    return require("../llm/qwen_client.ts");
-  }
+  return loadModule<{
+    complete: (
+      messages: Array<{ role: string; content: string }>,
+      maxTokens?: number,
+      signal?: AbortSignal,
+    ) => Promise<string>;
+  }>("../llm/qwen_client");
 }

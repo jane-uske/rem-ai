@@ -37,12 +37,15 @@ export async function complete(
         messages,
         temperature: 0.3,
         max_tokens: maxTokens,
-      }, signal ? { signal } : undefined),
+        ...(signal ? { signal } : {}),
+      }),
     { retries: 1, label: "complete" },
   );
 
   const raw = res.choices?.[0]?.message?.content ?? "";
-  return raw.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+  const stripped = raw.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+  // If all content was inside think tags and stripping leaves empty, return original
+  return stripped || raw.trim();
 }
 
 /**
@@ -65,7 +68,8 @@ export async function* streamTokens(
         temperature: 0.7,
         max_tokens: 1024,
         stream: true,
-      }, signal ? { signal } : undefined),
+        ...(signal ? { signal } : {}),
+      }),
     { retries: 1, label: "streamTokens" },
   )) as AsyncIterable<{ choices?: { delta?: { content?: string } }[] }>;
 
@@ -85,7 +89,8 @@ export async function* streamTokens(
       if (inThink) {
         const end = buf.indexOf("</think>");
         if (end === -1) {
-          buf = buf.length > 8 ? buf.slice(-8) : buf;
+          // No closing tag found yet - keep the full buffer
+          // don't truncate to last 8 bytes because we might need all of it next chunk
           break;
         }
         buf = buf.slice(end + 8);
@@ -114,5 +119,10 @@ export async function* streamTokens(
     if (out) yield out;
   }
 
-  if (!inThink && buf && !signal?.aborted) yield buf;
+  // If we're still in think mode after stream ends, it means the entire response is think content
+  // output whatever is left (don't drop it)
+  if (buf && !signal?.aborted) {
+    // if still in think mode, output all remaining content since closing tag was never found
+    yield buf;
+  }
 }
