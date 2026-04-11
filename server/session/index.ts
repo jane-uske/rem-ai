@@ -27,6 +27,7 @@ import {
 import {
   loadPersistentRelationshipState,
   relationshipStateEnabled,
+  savePersistentRelationshipState,
 } from "../../memory/relationship_state";
 import {
   decideTurnTaking,
@@ -38,6 +39,7 @@ import {
   shouldSuppressFallbackNoiseUtterance,
   shouldSuppressStrictNoPreviewUtterance,
   strongFrameRatio,
+  type PartialGrowthTrend,
   type TurnTakingState,
 } from "./turn_taking";
 import { buildTurnTimingSnapshot } from "./turn_timing";
@@ -87,11 +89,42 @@ function parseBooleanFlag(raw: string | undefined, fallback: boolean): boolean {
   return fallback;
 }
 
+function isSemanticallyCompletePreview(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  return endsWithSentencePunctuation(trimmed) || SEMANTIC_END_RE.test(trimmed);
+}
+
 type PredictionBudgetConfig = {
   enabled: boolean;
   pushEnabled: boolean;
   debounceMs: number;
 };
+
+type PartialShapeSample = {
+  at: number;
+  normalizedLength: number;
+  deltaChars: number;
+  semanticallyComplete: boolean;
+};
+
+type PartialShapeAggregates = {
+  partialGrowthTrend: PartialGrowthTrend;
+  semanticCompletionStreak: number;
+  smallDeltaStreak: number;
+};
+
+type PredictionGate = {
+  allow: boolean;
+  mode: "full" | "short";
+  debounceMs: number;
+  includeCarryForwardHint: boolean;
+  reason: string;
+};
+
+const SEMANTIC_END_RE = /(吗|呢|吧|了|啦|呀|啊|嘛|么|对吧|是吧|行吗|好吗|可以吗|是不是)\s*[。！？.!?]*$/u;
+const CARRY_FORWARD_CUE_RE =
+  /(继续刚才|继续那个|刚才那个|上次那个|回到刚才|还是那个|接着说|不是那个意思|我想说的是|我其实是想说)/u;
 
 function predictionBudgetConfig(): PredictionBudgetConfig {
   const enabled = parseBooleanFlag(process.env.STT_PARTIAL_PREDICTION_ENABLED, false);
@@ -354,6 +387,12 @@ export class ConnectionSession {
   private lastMeaningfulPartialText = "";
   private lastMeaningfulPartialAt = 0;
   private lastMeaningfulGrowthAt = 0;
+  private lastMeaningfulGrowthChars = 0;
+  private recentPartialPlateauCount = 0;
+  private partialShapeSamples: PartialShapeSample[] = [];
+  private readonly PARTIAL_SHAPE_MAX_SAMPLES = 6;
+  private lastPredictionIssuedAt = 0;
+  private lastPredictionIssuedText = "";
   private turnState: RemTurnState = "confirmed_end";
   private lastPublishedTurnState: RemTurnState | null = null;
   private lastPublishedTurnReason: RemTurnStateReason | null = null;
@@ -498,6 +537,11 @@ export class ConnectionSession {
     this.lastMeaningfulPartialText = "";
     this.lastMeaningfulPartialAt = 0;
     this.lastMeaningfulGrowthAt = 0;
+    this.lastMeaningfulGrowthChars = 0;
+    this.recentPartialPlateauCount = 0;
+    this.partialShapeSamples = [];
+    this.lastPredictionIssuedAt = 0;
+    this.lastPredictionIssuedText = "";
     // 同时取消正在进行的预判
     this.cancelPrediction();
     this.backchannelSentThisTurn = false;
@@ -693,8 +737,17 @@ export class ConnectionSession {
     recentGrowth: boolean;
     semanticallyComplete: boolean;
     incompleteTail: boolean;
+    interruptionType: InterruptionType | null;
   }, generationId?: number): void {
     if (!voiceBackchannelEnabled()) return;
+    if (input.interruptionType === "correction" || input.interruptionType === "emotional_interrupt") {
+      logger.debug("[Backchannel] suppressed", {
+        connId: this.connId,
+        reason: "interruption_policy",
+        interruptionType: input.interruptionType,
+      });
+      return;
+    }
     const now = Date.now();
     const decision = evaluateBackchannelDecision({
       emotion: this.brain.emotion.getEmotion() as any,
@@ -775,14 +828,152 @@ export class ConnectionSession {
 
     const now = Date.now();
     const prevNormalized = normalizeSpeechText(this.lastMeaningfulPartialText);
+    let deltaChars = normalized.length;
     if (!this.lastMeaningfulPartialText || normalized !== prevNormalized) {
       this.lastMeaningfulGrowthAt = now;
+      if (prevNormalized && normalized.startsWith(prevNormalized)) {
+        deltaChars = Math.max(0, normalized.length - prevNormalized.length);
+        this.lastMeaningfulGrowthChars = deltaChars;
+        this.recentPartialPlateauCount =
+          deltaChars > 0 && deltaChars <= 2 ? this.recentPartialPlateauCount + 1 : 0;
+      } else {
+        this.lastMeaningfulGrowthChars = normalized.length;
+        deltaChars = normalized.length;
+        this.recentPartialPlateauCount = 0;
+      }
     }
     this.lastMeaningfulPartialText = preview;
     this.lastMeaningfulPartialAt = now;
+    this.partialShapeSamples.push({
+      at: now,
+      normalizedLength: normalized.length,
+      deltaChars,
+      semanticallyComplete: isSemanticallyCompletePreview(preview),
+    });
+    if (this.partialShapeSamples.length > this.PARTIAL_SHAPE_MAX_SAMPLES) {
+      this.partialShapeSamples.splice(0, this.partialShapeSamples.length - this.PARTIAL_SHAPE_MAX_SAMPLES);
+    }
   }
 
-  private async runPrediction(text: string): Promise<void> {
+  private getPartialShapeAggregates(): PartialShapeAggregates {
+    const samples = this.partialShapeSamples;
+    if (samples.length === 0) {
+      return {
+        partialGrowthTrend: "oscillating",
+        semanticCompletionStreak: 0,
+        smallDeltaStreak: 0,
+      };
+    }
+
+    let smallDeltaStreak = 0;
+    for (let i = samples.length - 1; i >= 0; i -= 1) {
+      if (samples[i].deltaChars > 0 && samples[i].deltaChars <= 2) {
+        smallDeltaStreak += 1;
+      } else {
+        break;
+      }
+    }
+
+    let semanticCompletionStreak = 0;
+    for (let i = samples.length - 1; i >= 0; i -= 1) {
+      if (samples[i].semanticallyComplete) {
+        semanticCompletionStreak += 1;
+      } else {
+        break;
+      }
+    }
+
+    let positiveSteps = 0;
+    let negativeSteps = 0;
+    for (let i = 1; i < samples.length; i += 1) {
+      const delta = samples[i].normalizedLength - samples[i - 1].normalizedLength;
+      if (delta > 0) positiveSteps += 1;
+      if (delta < 0) negativeSteps += 1;
+    }
+
+    const trailing = samples.slice(-3);
+    const trailingTinyDelta = trailing.every((entry) => entry.deltaChars <= 2);
+    let partialGrowthTrend: PartialGrowthTrend = "oscillating";
+    if (smallDeltaStreak >= 2 || trailingTinyDelta) {
+      partialGrowthTrend = "plateau";
+    } else if (positiveSteps > 0 && negativeSteps === 0) {
+      partialGrowthTrend = "expanding";
+    }
+
+    return { partialGrowthTrend, semanticCompletionStreak, smallDeltaStreak };
+  }
+
+  private classifyPredictionInterruptionType(text: string): InterruptionType | null {
+    const interruptedReply =
+      this.brain.lastInterruptedReply?.trim() ||
+      this.brain.currentAssistantDraft?.trim() ||
+      null;
+    if (text.trim()) {
+      return classifyInterruption(text, interruptedReply);
+    }
+    return this.lastInterruptionType;
+  }
+
+  private resolvePredictionGate(text: string): PredictionGate {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return { allow: false, mode: "full", debounceMs: this.predictionDebounceMs, includeCarryForwardHint: true, reason: "empty_partial" };
+    }
+    const aggregates = this.getPartialShapeAggregates();
+    const interruptionType = this.classifyPredictionInterruptionType(trimmed);
+    const explicitCarryForward = CARRY_FORWARD_CUE_RE.test(trimmed);
+    const isHold = this.turnTakingState === "HOLD";
+
+    if (
+      isHold &&
+      !explicitCarryForward &&
+      aggregates.partialGrowthTrend === "expanding" &&
+      aggregates.semanticCompletionStreak === 0
+    ) {
+      return { allow: false, mode: "full", debounceMs: this.predictionDebounceMs, includeCarryForwardHint: true, reason: "hold_expanding_partial" };
+    }
+    if (
+      isHold &&
+      aggregates.partialGrowthTrend === "oscillating" &&
+      aggregates.semanticCompletionStreak === 0 &&
+      aggregates.smallDeltaStreak < 2
+    ) {
+      return { allow: false, mode: "full", debounceMs: this.predictionDebounceMs, includeCarryForwardHint: true, reason: "hold_oscillating_partial" };
+    }
+
+    if (interruptionType === "topic_switch") {
+      if (isHold && aggregates.semanticCompletionStreak === 0) {
+        return { allow: false, mode: "short", debounceMs: Math.max(120, Math.floor(this.predictionDebounceMs * 0.8)), includeCarryForwardHint: false, reason: "topic_switch_not_stable" };
+      }
+      return { allow: true, mode: "short", debounceMs: Math.max(120, Math.floor(this.predictionDebounceMs * 0.8)), includeCarryForwardHint: false, reason: "topic_switch" };
+    }
+    if (interruptionType === "correction" || interruptionType === "emotional_interrupt") {
+      return {
+        allow: true,
+        mode: "short",
+        debounceMs: Math.max(100, Math.floor(this.predictionDebounceMs * 0.65)),
+        includeCarryForwardHint: interruptionType === "correction",
+        reason: interruptionType,
+      };
+    }
+
+    if (isHold && aggregates.partialGrowthTrend !== "plateau" && this.turnTakingState !== "LIKELY_END") {
+      return { allow: false, mode: "full", debounceMs: this.predictionDebounceMs, includeCarryForwardHint: true, reason: "hold_without_plateau" };
+    }
+
+    return {
+      allow: true,
+      mode: "full",
+      debounceMs: this.predictionDebounceMs,
+      includeCarryForwardHint: true,
+      reason: "stable_enough",
+    };
+  }
+
+  private async runPrediction(
+    text: string,
+    options?: { mode?: "full" | "short"; includeCarryForwardHint?: boolean },
+  ): Promise<void> {
     if (!this.predictionEnabled || !text.trim()) return;
     // 文本和当前partial不一致，已经过时了，跳过
     if (text !== this.currentPartialText) return;
@@ -797,24 +988,30 @@ export class ConnectionSession {
       const memory = await retrievePromptMemory(this.brain.memory, {
         userMessage: text,
         slowBrainSnapshot: this.brain.slowBrain.getSnapshot(),
+        maxEntries: options?.mode === "short" ? 4 : undefined,
       });
       const slowBrainContext = this.brain.slowBrain.synthesizeContext();
       const historyForPrompt = trimHistoryToTokenBudget([...this.brain.history]);
+      const predictionHistory =
+        options?.mode === "short" ? historyForPrompt.slice(-4) : historyForPrompt;
       const interruptedReply =
         this.brain.lastInterruptedReply?.trim() ||
         this.brain.currentAssistantDraft?.trim() ||
         null;
-      const carryForwardHint = interruptedReply
+      const carryForwardHint =
+        options?.includeCarryForwardHint !== false && interruptedReply
         ? buildCarryForwardHint(classifyInterruption(text, interruptedReply), interruptedReply)
         : undefined;
+      const guidance = this.brain.slowBrain.buildConversationGuidance(text);
       const reply = await fastBrainPredictOnly({
         userMessage: text,
         emotion: this.brain.emotion.getEmotion(),
         memory,
-        history: historyForPrompt,
+        history: predictionHistory,
         strategyHints: [
-          this.brain.slowBrain.buildConversationStrategyHints(text),
+          guidance.hints,
           carryForwardHint,
+          options?.mode === "short" ? "【实时策略】当前是打断/修正语境，请优先用一句短承接。" : "",
         ]
           .filter((part): part is string => Boolean(part?.trim()))
           .join("\n\n"),
@@ -858,15 +1055,38 @@ export class ConnectionSession {
 
     // 开启预判功能的话，防抖触发预判
     if (this.predictionEnabled && content.trim() && content !== this.currentPartialText) {
+      const gate = this.resolvePredictionGate(content);
+      logger.debug("[Prediction] gate", {
+        connId: this.connId,
+        allow: gate.allow,
+        mode: gate.mode,
+        reason: gate.reason,
+      });
+      if (!gate.allow) {
+        this.currentPartialText = content;
+        return;
+      }
       // 取消之前的防抖定时器
       if (this.predictionTimer) {
         clearTimeout(this.predictionTimer);
       }
       this.currentPartialText = content;
+      const debounceMs = gate.debounceMs;
+      const mode = gate.mode;
+      const includeCarryForwardHint = gate.includeCarryForwardHint;
       this.predictionTimer = setTimeout(() => {
         this.predictionTimer = null;
-        void this.runPrediction(content);
-      }, this.predictionDebounceMs);
+        const now = Date.now();
+        if (
+          this.lastPredictionIssuedText === content &&
+          now - this.lastPredictionIssuedAt < Math.max(120, Math.floor(debounceMs * 0.7))
+        ) {
+          return;
+        }
+        this.lastPredictionIssuedText = content;
+        this.lastPredictionIssuedAt = now;
+        void this.runPrediction(content, { mode, includeCarryForwardHint });
+      }, debounceMs);
     }
   }
 
@@ -961,10 +1181,45 @@ export class ConnectionSession {
     recentGrowth: boolean;
     semanticallyComplete: boolean;
     incompleteTail: boolean;
+    interruptionType: InterruptionType | null;
   } {
-    const baseGap = this.resolveUtteranceGapMs(speechDurationMs);
+    const previewText = this.lastMeaningfulPartialText || this.lastPreviewText;
+    const carryForwardPreview =
+      /继续刚才|回到刚才|上次那个|还是那个|不是那个意思|我想说的是|我其实是想说/u.test(
+        previewText,
+      );
+    const correctionPreview =
+      /不是那个意思|不对|我的意思是|我想说的是|我其实是想说/u.test(previewText);
+    const interruptedReply =
+      this.brain.lastInterruptedReply?.trim() ||
+      this.brain.currentAssistantDraft?.trim() ||
+      null;
+    const interruptionPreviewType =
+      previewText
+        ? classifyInterruption(previewText, interruptedReply)
+        : this.lastInterruptionType;
+    const interruptionContinuity =
+      (carryForwardPreview ||
+        correctionPreview ||
+        interruptionPreviewType === "continuation" ||
+        interruptionPreviewType === "correction") &&
+      Boolean(interruptedReply || this.lastInterruptionType);
+    const continuityBias =
+      (carryForwardPreview || interruptionPreviewType === "continuation") &&
+      (interruptionContinuity || this.isContinuousConversation());
+    const correctionBias =
+      correctionPreview || interruptionPreviewType === "correction";
+    const emotionalInterruptBias = interruptionPreviewType === "emotional_interrupt";
+    const topicSwitchBias = interruptionPreviewType === "topic_switch";
+    const now = Date.now();
+    const partialShape = this.getPartialShapeAggregates();
+    const growthPlateauMs =
+      this.lastMeaningfulGrowthAt > 0 ? Math.max(0, now - this.lastMeaningfulGrowthAt) : null;
+    const baseGap = continuityBias
+      ? Math.max(60, this.resolveUtteranceGapMs(speechDurationMs) - 50)
+      : this.resolveUtteranceGapMs(speechDurationMs);
     if (!turnTakingEnabled()) {
-      const preview = getMeaningfulTurnPreview(this.lastMeaningfulPartialText || this.lastPreviewText);
+      const preview = getMeaningfulTurnPreview(previewText);
       this.publishTurnState("confirmed_end", "confirmed_end", {
         preview,
       });
@@ -976,6 +1231,7 @@ export class ConnectionSession {
         recentGrowth: false,
         semanticallyComplete: false,
         incompleteTail: false,
+        interruptionType: interruptionPreviewType,
       };
     }
 
@@ -983,16 +1239,42 @@ export class ConnectionSession {
     const minGapMs = parseNonNegativeMs(process.env.VAD_UTTERANCE_GAP_PREVIEW_MIN_MS, 80);
     const decision = decideTurnTaking({
       baseGapMs: baseGap,
-      previewText: this.lastMeaningfulPartialText || this.lastPreviewText,
-      nowMs: Date.now(),
+      previewText,
+      nowMs: now,
       lastPartialUpdateAt: this.lastMeaningfulPartialAt,
       lastGrowthAt: this.lastMeaningfulGrowthAt,
+      growthPlateauMs,
+      recentGrowthChars: this.lastMeaningfulGrowthChars,
+      growthPlateauCount: this.recentPartialPlateauCount,
+      partialGrowthTrend: partialShape.partialGrowthTrend,
+      semanticCompletionStreak: partialShape.semanticCompletionStreak,
+      smallDeltaStreak: partialShape.smallDeltaStreak,
       hesitationHoldMs: hesitationHoldMs(),
       growthHoldMs: turnTakingGrowthHoldMs(),
-      likelyStableMs: turnTakingLikelyStableMs(),
-      confirmedStableMs: turnTakingConfirmedStableMs(),
+      likelyStableMs: correctionBias
+        ? Math.max(240, turnTakingLikelyStableMs() - 260)
+        : emotionalInterruptBias
+          ? Math.max(220, turnTakingLikelyStableMs() - 280)
+          : topicSwitchBias
+            ? Math.max(260, turnTakingLikelyStableMs() - 160)
+        : continuityBias
+          ? Math.max(320, turnTakingLikelyStableMs() - 180)
+          : turnTakingLikelyStableMs(),
+      confirmedStableMs: correctionBias
+        ? Math.max(420, turnTakingConfirmedStableMs() - 360)
+        : emotionalInterruptBias
+          ? Math.max(360, turnTakingConfirmedStableMs() - 420)
+          : topicSwitchBias
+            ? Math.max(480, turnTakingConfirmedStableMs() - 260)
+        : continuityBias
+          ? Math.max(620, turnTakingConfirmedStableMs() - 220)
+          : turnTakingConfirmedStableMs(),
       releaseMs,
-      minGapMs,
+      minGapMs:
+        correctionBias || emotionalInterruptBias
+          ? Math.max(60, minGapMs - 20)
+          : minGapMs,
+      interruptionType: interruptionPreviewType,
     });
 
     this.turnTakingState = decision.state;
@@ -1012,8 +1294,22 @@ export class ConnectionSession {
       lastPartialUpdateAt: this.lastMeaningfulPartialAt || undefined,
       lastGrowthAt: this.lastMeaningfulGrowthAt || undefined,
       recentGrowth: decision.recentGrowth,
+      recentGrowthChars: this.lastMeaningfulGrowthChars || undefined,
+      growthPlateauCount: this.recentPartialPlateauCount || undefined,
+      partialGrowthTrend: partialShape.partialGrowthTrend,
+      semanticCompletionStreak: partialShape.semanticCompletionStreak || undefined,
+      smallDeltaStreak: partialShape.smallDeltaStreak || undefined,
       semanticallyComplete: decision.semanticallyComplete,
       sentenceClosed: decision.sentenceClosed,
+      continuityBias,
+      correctionBias,
+      emotionalInterruptBias,
+      topicSwitchBias,
+      carryForwardPreview,
+      correctionPreview,
+      interruptionContinuity,
+      interruptionPreviewType,
+      growthPlateauMs: growthPlateauMs ?? undefined,
     });
 
     this.publishTurnState(
@@ -1040,6 +1336,7 @@ export class ConnectionSession {
       recentGrowth: decision.recentGrowth,
       semanticallyComplete: decision.semanticallyComplete,
       incompleteTail: decision.incompleteTail,
+      interruptionType: interruptionPreviewType,
     };
   }
 
@@ -1115,9 +1412,10 @@ export class ConnectionSession {
   }
 
   /** 用户每次发文字或语音被识别后调用，重新计时沉默搭话和连续对话状态 */
-  private touchUserActivity(): void {
+  private touchUserActivity(userMessage?: string): void {
     this.clearSilenceNudgeTimer();
     const ms = silenceNudgeMs();
+    this.brain.slowBrain.recordUserTurnActivity(userMessage);
     if (ms <= 0) return;
     this.silenceNudgeTimer = setTimeout(() => this.fireSilenceNudge(), ms);
 
@@ -1140,8 +1438,8 @@ export class ConnectionSession {
       return;
     }
 
-    const nudgeText = this.brain.slowBrain.buildSilenceNudgeUserMessage();
-    if (!nudgeText) {
+    const nudgePlan = this.brain.slowBrain.buildSilenceNudgePlan();
+    if (!nudgePlan) {
       this.silenceNudgeTimer = setTimeout(() => this.fireSilenceNudge(), ms);
       return;
     }
@@ -1154,7 +1452,7 @@ export class ConnectionSession {
         this.bindActiveGeneration(generationId, traceId, "silence_nudge");
         await runPipeline(
           this.ws,
-          nudgeText,
+          nudgePlan.userMessage,
           this.interrupt,
           this.avatar,
           this.sessionId,
@@ -1163,6 +1461,21 @@ export class ConnectionSession {
           traceId,
           { silenceNudge: true },
         );
+
+        const completedWithoutInterrupt =
+          !this.interrupt.active &&
+          this.brain.lastInterruptedReply === null;
+        if (completedWithoutInterrupt) {
+          this.brain.slowBrain.recordProactiveOutreach(
+            nudgePlan.strategyMode,
+            nudgePlan.proactiveCandidateKey,
+          );
+          this.brain.slowBrain.markContinuityCueUsed({
+            proactiveCandidate: nudgePlan.proactiveCandidate,
+            sharedMomentCandidate: nudgePlan.sharedMomentCandidate,
+          });
+          await this.persistRelationshipContinuityState();
+        }
       })
       .catch((err) => {
         logger.warn("[陪伴] 沉默搭话失败", {
@@ -1175,6 +1488,26 @@ export class ConnectionSession {
           this.silenceNudgeTimer = setTimeout(() => this.fireSilenceNudge(), ms);
         }
       });
+  }
+
+  private async persistRelationshipContinuityState(): Promise<void> {
+    if (!relationshipStateEnabled()) return;
+    const relationshipRepo =
+      this.brain.persistentRelationshipRepo ??
+      this.brain.memory.getPersistentBackend() ??
+      this.brain.memory;
+
+    try {
+      await savePersistentRelationshipState(
+        relationshipRepo,
+        this.brain.slowBrain.exportPersistentState(),
+      );
+    } catch (err) {
+      logger.warn("[陪伴] 连续性状态持久化失败", {
+        error: (err as Error).message,
+        connId: this.connId,
+      });
+    }
   }
 
   /** Feed accumulated speechBuffer into STT and run pipeline (buffer cleared after feed). */
@@ -1248,7 +1581,7 @@ export class ConnectionSession {
           getLatencyTracer(this.connId).mark("stt_final", traceId);
           send(this.ws, { type: "stt_final", content: text });
           logger.info(`[用户·语音] ${text}`, { connId: this.connId });
-          this.touchUserActivity();
+          this.touchUserActivity(text);
           const { interruptionType, carryForwardHint } = this.classifyCarryForward(text);
           this.publishTurnState("assistant_entering", "tts_prepare", {
             generationId,
@@ -1673,7 +2006,7 @@ export class ConnectionSession {
             getLatencyTracer(this.connId).mark("stt_final", traceId);
             send(this.ws, { type: "stt_final", content: text });
             logger.info(`[用户·语音] ${text}`, { connId: this.connId });
-            this.touchUserActivity();
+            this.touchUserActivity(text);
             const { interruptionType, carryForwardHint } = this.classifyCarryForward(text);
             this.publishTurnState("assistant_entering", "tts_prepare", {
               generationId,
@@ -1860,7 +2193,7 @@ export class ConnectionSession {
           getLatencyTracer(this.connId).mark("stt_final", traceId);
           send(this.ws, { type: "stt_final", content: text });
           logger.info(`[用户·语音] ${text}`, { connId: this.connId });
-          this.touchUserActivity();
+          this.touchUserActivity(text);
           const { interruptionType, carryForwardHint } = this.classifyCarryForward(text);
           this.publishTurnState("assistant_entering", "tts_prepare", {
             generationId,
@@ -1927,7 +2260,7 @@ export class ConnectionSession {
       return;
     }
     logger.info(`[用户] ${content}`, { connId: this.connId });
-    this.touchUserActivity();
+    this.touchUserActivity(content);
     if (this.interrupt.active && this.brain.currentAssistantDraft?.trim()) {
       this.brain.lastInterruptedReply = this.brain.currentAssistantDraft.trim();
     }

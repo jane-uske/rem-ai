@@ -1,7 +1,8 @@
-import type { Emotion } from "../../avatar/types";
+import type { Emotion, InterruptionType } from "../../avatar/types";
 import { SENTENCE_END } from "../../utils/sentence_chunker";
 
 export type TurnTakingState = "HOLD" | "LIKELY_END" | "CONFIRMED_END";
+export type PartialGrowthTrend = "expanding" | "plateau" | "oscillating";
 
 export interface TurnTakingDecisionInput {
   baseGapMs: number;
@@ -9,12 +10,19 @@ export interface TurnTakingDecisionInput {
   nowMs: number;
   lastPartialUpdateAt: number;
   lastGrowthAt: number;
+  growthPlateauMs?: number | null;
+  recentGrowthChars?: number | null;
+  growthPlateauCount?: number | null;
   hesitationHoldMs: number;
   growthHoldMs: number;
   likelyStableMs: number;
   confirmedStableMs: number;
   releaseMs: number;
   minGapMs: number;
+  interruptionType?: InterruptionType | null;
+  partialGrowthTrend?: PartialGrowthTrend | null;
+  semanticCompletionStreak?: number | null;
+  smallDeltaStreak?: number | null;
 }
 
 export interface TurnTakingDecision {
@@ -107,6 +115,10 @@ const CONTINUATION_CUES = [
   "不确定",
   "我不确定",
 ] as const;
+const CARRY_FORWARD_CUE_RE =
+  /(继续刚才|继续那个|刚才那个|上次那个|回到刚才|还是那个|接着说|不是那个意思|我想说的是|我其实是想说)/u;
+const CORRECTION_CUE_RE =
+  /(不是那个意思|不对|我的意思是|我想说的是|我其实是想说|更准确地说|我不是问这个|我想问的是)/u;
 
 export function endsWithSentencePunctuation(text: string): boolean {
   return new RegExp(`${SENTENCE_END.source}\\s*$`).test(text);
@@ -217,6 +229,8 @@ export function shouldOfferThinkingPauseBackchannel(
 
   if (!preview || preview.length < minPreviewChars) return false;
   if (isTentativeSpeechText(preview)) return false;
+  if (isCarryForwardCue(preview)) return false;
+  if (isCorrectionCue(preview)) return false;
   if (input.recentGrowth) return false;
   if (stableMs < minStableMs) return false;
   if (input.semanticallyComplete && !input.incompleteTail) return false;
@@ -320,6 +334,14 @@ function hasContinuationCue(text: string): boolean {
   );
 }
 
+function isCarryForwardCue(text: string): boolean {
+  return CARRY_FORWARD_CUE_RE.test(text.trim());
+}
+
+function isCorrectionCue(text: string): boolean {
+  return CORRECTION_CUE_RE.test(text.trim());
+}
+
 function isSemanticallyComplete(text: string): boolean {
   const trimmed = text.trim();
   return endsWithSentencePunctuation(trimmed) || SEMANTIC_END_RE.test(trimmed);
@@ -367,23 +389,141 @@ export function decideTurnTaking(input: TurnTakingDecisionInput): TurnTakingDeci
   const clauseBreakTail = hasClauseBreakTail(previewText);
   const semanticallyComplete = isSemanticallyComplete(previewText);
   const continuationCue = hasContinuationCue(previewText);
+  const carryForwardCue = isCarryForwardCue(previewText);
+  const correctionCue = isCorrectionCue(previewText);
+  const interruptionType = input.interruptionType ?? null;
+  const growthPlateauMs = input.growthPlateauMs ?? (
+    input.lastGrowthAt > 0 ? Math.max(0, input.nowMs - input.lastGrowthAt) : null
+  );
+  const recentGrowthChars = Math.max(0, input.recentGrowthChars ?? 99);
+  const growthPlateauCount = Math.max(0, input.growthPlateauCount ?? 0);
+  const partialGrowthTrend: PartialGrowthTrend =
+    input.partialGrowthTrend === "expanding" ||
+    input.partialGrowthTrend === "plateau" ||
+    input.partialGrowthTrend === "oscillating"
+      ? input.partialGrowthTrend
+      : growthPlateauCount >= 2
+        ? "plateau"
+        : recentGrowth
+          ? "expanding"
+          : "oscillating";
+  const semanticCompletionStreak = Math.max(0, input.semanticCompletionStreak ?? 0);
+  const smallDeltaStreak = Math.max(0, input.smallDeltaStreak ?? 0);
+  const interruptionContinuation =
+    interruptionType === "continuation" || interruptionType === "correction";
+  const emotionalInterrupt = interruptionType === "emotional_interrupt";
+  const topicSwitch = interruptionType === "topic_switch";
+  const plateauResolvedQuickTurn =
+    (growthPlateauCount >= 2 || partialGrowthTrend === "plateau" || smallDeltaStreak >= 2) &&
+    recentGrowthChars <= 2 &&
+    stableMs !== null &&
+    stableMs >= Math.max(180, input.likelyStableMs - 260);
 
   if (recentGrowth) reasons.push("recent_growth");
+  if (growthPlateauCount >= 2) reasons.push("partial_growth_plateau");
   if (incompleteTail) reasons.push("open_clause_tail");
   if (clauseBreakTail) reasons.push("clause_break_tail");
   if (continuationCue) reasons.push("continuation_cue");
+  if (carryForwardCue) reasons.push("carry_forward_cue");
+  if (correctionCue) reasons.push("correction_cue");
+  if (interruptionType) reasons.push(`interruption:${interruptionType}`);
+  if (input.partialGrowthTrend) reasons.push(`partial_trend:${partialGrowthTrend}`);
+  if (semanticCompletionStreak > 0) reasons.push(`semantic_completion_streak:${semanticCompletionStreak}`);
+  if (smallDeltaStreak > 0) reasons.push(`small_delta_streak:${smallDeltaStreak}`);
   if (sentenceClosed) reasons.push("sentence_punctuation");
   else if (semanticallyComplete) reasons.push("semantic_end_cue");
 
   if (
-    incompleteTail ||
+    (incompleteTail && !carryForwardCue && !correctionCue) ||
     clauseBreakTail ||
-    recentGrowth ||
-    (continuationCue && !semanticallyComplete)
+    (recentGrowth && !emotionalInterrupt && partialGrowthTrend === "expanding" && !plateauResolvedQuickTurn) ||
+    (continuationCue && !semanticallyComplete && !correctionCue)
   ) {
     return {
       state: "HOLD",
       gapMs: Math.max(input.baseGapMs, input.growthHoldMs),
+      previewText,
+      reasons,
+      usedFallback: false,
+      sentenceClosed,
+      semanticallyComplete,
+      incompleteTail,
+      recentGrowth,
+      stableMs,
+    };
+  }
+
+  if (
+    (correctionCue || (carryForwardCue && interruptionContinuation)) &&
+    stableMs !== null &&
+    stableMs >= Math.max(180, input.likelyStableMs - 160) &&
+    (plateauResolvedQuickTurn || growthPlateauMs === null || growthPlateauMs >= 220) &&
+    previewText.trim().length <= 28
+  ) {
+    return {
+      state: "LIKELY_END",
+      gapMs: input.minGapMs,
+      previewText,
+      reasons,
+      usedFallback: false,
+      sentenceClosed,
+      semanticallyComplete,
+      incompleteTail,
+      recentGrowth,
+      stableMs,
+    };
+  }
+
+  if (
+    emotionalInterrupt &&
+    stableMs !== null &&
+    stableMs >= Math.max(180, input.likelyStableMs - 220) &&
+    (plateauResolvedQuickTurn || growthPlateauMs === null || growthPlateauMs >= 120) &&
+    previewText.trim().length <= 20
+  ) {
+    return {
+      state: "LIKELY_END",
+      gapMs: input.minGapMs,
+      previewText,
+      reasons,
+      usedFallback: false,
+      sentenceClosed,
+      semanticallyComplete,
+      incompleteTail,
+      recentGrowth,
+      stableMs,
+    };
+  }
+
+  if (
+    topicSwitch &&
+    (semanticallyComplete || semanticCompletionStreak >= 2) &&
+    stableMs !== null &&
+    stableMs >= Math.max(220, input.likelyStableMs - 220)
+  ) {
+    return {
+      state: "LIKELY_END",
+      gapMs: Math.max(input.minGapMs, input.baseGapMs - input.releaseMs),
+      previewText,
+      reasons,
+      usedFallback: false,
+      sentenceClosed,
+      semanticallyComplete,
+      incompleteTail,
+      recentGrowth,
+      stableMs,
+    };
+  }
+
+  if (
+    carryForwardCue &&
+    stableMs !== null &&
+    stableMs >= input.likelyStableMs &&
+    previewText.trim().length <= 14
+  ) {
+    return {
+      state: "LIKELY_END",
+      gapMs: input.minGapMs,
       previewText,
       reasons,
       usedFallback: false,
@@ -411,6 +551,25 @@ export function decideTurnTaking(input: TurnTakingDecisionInput): TurnTakingDeci
   }
 
   if (semanticallyComplete) {
+    if (
+      recentGrowth &&
+      partialGrowthTrend === "expanding" &&
+      !plateauResolvedQuickTurn &&
+      recentGrowthChars >= 4
+    ) {
+      return {
+        state: "HOLD",
+        gapMs: Math.max(input.baseGapMs, input.growthHoldMs),
+        previewText,
+        reasons: reasons.length ? reasons : ["semantic_end_still_expanding"],
+        usedFallback: false,
+        sentenceClosed,
+        semanticallyComplete,
+        incompleteTail,
+        recentGrowth,
+        stableMs,
+      };
+    }
     if (stableMs === null || stableMs < input.likelyStableMs) {
       return {
         state: "HOLD",
