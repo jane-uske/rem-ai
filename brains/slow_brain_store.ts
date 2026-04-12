@@ -182,6 +182,14 @@ export class SlowBrainStore {
     cooldownUntilAt: 0,
     lastProactiveMode: "",
   };
+  private derivedCache: {
+    episodes: Episode[];
+    topicThreads: TopicThread[];
+    relationshipStageLabel: string;
+    replyShapeContract: string;
+    memoryCarryRule: string;
+    proactivePosture: string | undefined;
+  } | null = null;
 
   private lastEmotionValue: string = "neutral";
 
@@ -192,40 +200,55 @@ export class SlowBrainStore {
 
   addFact(key: string, value: string): void {
     this.profile.facts.set(key, value);
+    this.invalidateDerivedCache();
   }
 
   addInterest(interest: string): void {
     if (!this.profile.interests.includes(interest)) {
       this.profile.interests.push(interest);
+      this.invalidateDerivedCache();
     }
   }
 
   addPersonalityNote(note: string): void {
+    let changed = false;
     if (this.profile.personalityNotes.length >= 5) {
       this.profile.personalityNotes.shift();
+      changed = true;
     }
     if (!this.profile.personalityNotes.includes(note)) {
       this.profile.personalityNotes.push(note);
+      changed = true;
+    }
+    if (changed) {
+      this.invalidateDerivedCache();
     }
   }
 
   recordTurn(): void {
     this.relationship.turnCount++;
+    this.invalidateDerivedCache();
   }
 
   bumpRelationship(opts: {
     familiarityDelta?: number;
     emotionalBondDelta?: number;
   }): void {
+    let changed = false;
     if (opts.familiarityDelta) {
       this.relationship.familiarity = clamp01(
         this.relationship.familiarity + opts.familiarityDelta,
       );
+      changed = true;
     }
     if (opts.emotionalBondDelta) {
       this.relationship.emotionalBond = clamp01(
         this.relationship.emotionalBond + opts.emotionalBondDelta,
       );
+      changed = true;
+    }
+    if (changed) {
+      this.invalidateDerivedCache();
     }
   }
 
@@ -253,19 +276,23 @@ export class SlowBrainStore {
     ) {
       this.relationship.preferredTopics.push(topic);
     }
+    this.invalidateDerivedCache();
   }
 
   recordMood(mood: string): void {
     this.moodTrajectory.push({ turn: this.relationship.turnCount, mood });
     if (this.moodTrajectory.length > 20) this.moodTrajectory.shift();
+    this.invalidateDerivedCache();
   }
 
   setConversationSummary(summary: string): void {
     this.conversationSummary = summary;
+    this.invalidateDerivedCache();
   }
 
   setProactiveTopics(topics: string[]): void {
     this.proactiveTopics = topics.slice(0, 5);
+    this.invalidateDerivedCache();
   }
 
   recordSharedMoment(input: {
@@ -322,6 +349,7 @@ export class SlowBrainStore {
     if (this.sharedMoments.length > 8) {
       this.sharedMoments.length = 8;
     }
+    this.invalidateDerivedCache();
   }
 
   exportPersistentState(updatedAt: number = Date.now()): PersistentRelationshipStateV1 {
@@ -453,77 +481,11 @@ export class SlowBrainStore {
       state.proactiveStrategyState.cooldownUntilAt;
     this.proactiveStrategyState.lastProactiveMode =
       state.proactiveStrategyState.lastProactiveMode ?? "";
+    this.invalidateDerivedCache();
   }
 
   getSnapshot(): SlowBrainSnapshot {
-    const episodes = buildEpisodes(
-      this.sharedMoments,
-      this.topicHistory,
-      this.conversationSummary,
-      this.relationship.turnCount,
-    );
-    const topicThreads = buildTopicThreads(
-      episodes,
-      this.conversationSummary,
-    );
-    const relationshipStageLabel = resolveRelationshipStage(this.relationship);
-    const replyShapeContract = buildRelationshipResponseShapeContract({
-      userProfile: {
-        facts: new Map(this.profile.facts),
-        interests: [...this.profile.interests],
-        personalityNotes: [...this.profile.personalityNotes],
-      },
-      relationship: { ...this.relationship },
-      topicHistory: this.topicHistory.map((t) => ({ ...t })),
-      moodTrajectory: [...this.moodTrajectory],
-      conversationSummary: this.conversationSummary,
-      proactiveTopics: [...this.proactiveTopics],
-      sharedMoments: this.sharedMoments.map((entry) => ({ ...entry })),
-      episodes,
-      topicThreads,
-      continuityCueState: { ...this.continuityCueState },
-      proactiveLedger: [...this.proactiveLedger.values()].map((entry) => ({ ...entry })),
-      proactiveStrategyState: { ...this.proactiveStrategyState },
-    });
-    const memoryCarryRule = resolveRelationshipStyleProfile(
-      {
-        userProfile: {
-          facts: new Map(this.profile.facts),
-          interests: [...this.profile.interests],
-          personalityNotes: [...this.profile.personalityNotes],
-        },
-        relationship: { ...this.relationship },
-        topicHistory: this.topicHistory.map((t) => ({ ...t })),
-        moodTrajectory: [...this.moodTrajectory],
-        conversationSummary: this.conversationSummary,
-        proactiveTopics: [...this.proactiveTopics],
-        sharedMoments: this.sharedMoments.map((entry) => ({ ...entry })),
-        episodes,
-        topicThreads,
-        continuityCueState: { ...this.continuityCueState },
-        proactiveLedger: [...this.proactiveLedger.values()].map((entry) => ({ ...entry })),
-        proactiveStrategyState: { ...this.proactiveStrategyState },
-      },
-      "",
-    ).memoryIntegrationStyle;
-    const proactivePosture = buildProactivePostureGuidance({
-      userProfile: {
-        facts: new Map(this.profile.facts),
-        interests: [...this.profile.interests],
-        personalityNotes: [...this.profile.personalityNotes],
-      },
-      relationship: { ...this.relationship },
-      topicHistory: this.topicHistory.map((t) => ({ ...t })),
-      moodTrajectory: [...this.moodTrajectory],
-      conversationSummary: this.conversationSummary,
-      proactiveTopics: [...this.proactiveTopics],
-      sharedMoments: this.sharedMoments.map((entry) => ({ ...entry })),
-      episodes,
-      topicThreads,
-      continuityCueState: { ...this.continuityCueState },
-      proactiveLedger: [...this.proactiveLedger.values()].map((entry) => ({ ...entry })),
-      proactiveStrategyState: { ...this.proactiveStrategyState },
-    }) ?? undefined;
+    const derived = this.getDerivedCache();
     return {
       userProfile: {
         facts: new Map(this.profile.facts),
@@ -536,15 +498,15 @@ export class SlowBrainStore {
       conversationSummary: this.conversationSummary,
       proactiveTopics: [...this.proactiveTopics],
       sharedMoments: this.sharedMoments.map((entry) => ({ ...entry })),
-      episodes,
-      topicThreads,
+      episodes: this.cloneEpisodesForSnapshot(derived.episodes),
+      topicThreads: this.cloneTopicThreadsForSnapshot(derived.topicThreads),
       continuityCueState: { ...this.continuityCueState },
       proactiveLedger: [...this.proactiveLedger.values()].map((entry) => ({ ...entry })),
       proactiveStrategyState: { ...this.proactiveStrategyState },
-      relationshipStageLabel,
-      replyShapeContract,
-      memoryCarryRule,
-      proactivePosture,
+      relationshipStageLabel: derived.relationshipStageLabel,
+      replyShapeContract: derived.replyShapeContract,
+      memoryCarryRule: derived.memoryCarryRule,
+      proactivePosture: derived.proactivePosture,
     };
   }
 
@@ -559,6 +521,7 @@ export class SlowBrainStore {
     this.proactiveStrategyState.lastUserTurnAt = Date.now();
     this.proactiveStrategyState.consecutiveProactiveCount = 0;
     this.proactiveStrategyState.nudgesSinceLastUserTurn = 0;
+    this.invalidateDerivedCache();
   }
 
   recordProactiveOutreach(mode?: ProactiveMode, key?: string): void {
@@ -593,10 +556,14 @@ export class SlowBrainStore {
     if (key) {
       this.recordProactiveLedgerOffer(key, mode, now);
     }
+    this.invalidateDerivedCache();
   }
 
   private updateProactiveLedgerOnUserTurn(userMessage?: string): void {
-    if (!proactiveLedgerEnabled() || this.proactiveLedger.size === 0) return;
+    if (!proactiveLedgerEnabled() || this.proactiveLedger.size === 0) {
+      this.invalidateDerivedCache();
+      return;
+    }
     const now = Date.now();
     const text = userMessage?.trim() ?? "";
     const keywords = text ? extractKeywords(text) : [];
@@ -621,6 +588,7 @@ export class SlowBrainStore {
       this.proactiveStrategyState.ignoredProactiveStreak = 0;
       this.proactiveStrategyState.cooldownUntilAt = 0;
     }
+    this.invalidateDerivedCache();
   }
 
   private recordProactiveLedgerOffer(
@@ -646,6 +614,7 @@ export class SlowBrainStore {
     }
     entry.nextEligibleAt = now + proactiveLedgerCooldownMs(key, mode, entry.ignoredCount);
     this.proactiveLedger.set(key, entry);
+    this.invalidateDerivedCache();
   }
 
   synthesizeContext(): string | undefined {
@@ -866,6 +835,89 @@ export class SlowBrainStore {
         matched.lastReferencedAt = Date.now();
       }
     }
+    this.invalidateDerivedCache();
+  }
+
+  private invalidateDerivedCache(): void {
+    this.derivedCache = null;
+  }
+
+  private buildDerivedInputs(
+    episodes: Episode[],
+    topicThreads: TopicThread[],
+  ): SlowBrainSnapshot {
+    return {
+      userProfile: {
+        facts: new Map(this.profile.facts),
+        interests: [...this.profile.interests],
+        personalityNotes: [...this.profile.personalityNotes],
+      },
+      relationship: { ...this.relationship },
+      topicHistory: this.topicHistory.map((t) => ({ ...t })),
+      moodTrajectory: [...this.moodTrajectory],
+      conversationSummary: this.conversationSummary,
+      proactiveTopics: [...this.proactiveTopics],
+      sharedMoments: this.sharedMoments.map((entry) => ({ ...entry })),
+      episodes,
+      topicThreads,
+      continuityCueState: { ...this.continuityCueState },
+      proactiveLedger: [...this.proactiveLedger.values()].map((entry) => ({ ...entry })),
+      proactiveStrategyState: { ...this.proactiveStrategyState },
+      relationshipStageLabel: undefined,
+      replyShapeContract: undefined,
+      memoryCarryRule: undefined,
+      proactivePosture: undefined,
+    };
+  }
+
+  private getDerivedCache(): NonNullable<SlowBrainStore["derivedCache"]> {
+    if (this.derivedCache) return this.derivedCache;
+
+    const episodes = buildEpisodes(
+      this.sharedMoments,
+      this.topicHistory,
+      this.conversationSummary,
+      this.relationship.turnCount,
+    );
+    const topicThreads = buildTopicThreads(
+      episodes,
+      this.conversationSummary,
+    );
+    const relationshipStageLabel = resolveRelationshipStage(this.relationship);
+    const derivedInputs = this.buildDerivedInputs(episodes, topicThreads);
+    const replyShapeContract = buildRelationshipResponseShapeContract(derivedInputs);
+    const memoryCarryRule = resolveRelationshipStyleProfile(
+      derivedInputs,
+      "",
+    ).memoryIntegrationStyle;
+    const proactivePosture = buildProactivePostureGuidance(derivedInputs) ?? undefined;
+
+    this.derivedCache = {
+      episodes,
+      topicThreads,
+      relationshipStageLabel,
+      replyShapeContract,
+      memoryCarryRule,
+      proactivePosture,
+    };
+    return this.derivedCache;
+  }
+
+  private cloneEpisodesForSnapshot(episodes: Episode[]): Episode[] {
+    return episodes.map((entry) => ({
+      ...entry,
+      sourceTopics: [...entry.sourceTopics],
+      semanticKeywords: [...entry.semanticKeywords],
+      originMomentSummaries: [...entry.originMomentSummaries],
+    }));
+  }
+
+  private cloneTopicThreadsForSnapshot(topicThreads: TopicThread[]): TopicThread[] {
+    return topicThreads.map((entry) => ({
+      ...entry,
+      relatedTopics: entry.relatedTopics ? [...entry.relatedTopics] : undefined,
+      semanticKeywords: entry.semanticKeywords ? [...entry.semanticKeywords] : undefined,
+    }));
   }
 
   buildSilenceNudgeUserMessage(): string | null {
