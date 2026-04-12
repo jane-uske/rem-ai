@@ -12,6 +12,7 @@ import { getLatencyTracer, removeLatencyTracer } from "../../infra/latency_trace
 import { ensureDevUser } from "../../storage/repositories/dev_identity";
 import { getPgMemoryRepository } from "../../storage/repositories/pg_memory_repository";
 import { createSession as createDbSession, endSession } from "../../storage/repositories/session_repository";
+import { getRecentUserMessages } from "../../storage/repositories/message_repository";
 import { RemSessionContext } from "../../brains/rem_session_context";
 import { runPipeline } from "../pipeline";
 import { send, getWsRateLimiter } from "../gateway";
@@ -472,6 +473,19 @@ export class ConnectionSession {
                 sessionId: this.sessionId,
               });
             });
+        }
+
+        try {
+          const recentMessages = await getRecentUserMessages(devUserId, 10);
+          if (recentMessages.length > 0) {
+            this.brain.hydrateHistoryFromDb(recentMessages);
+            logger.debug("[Memory] conversation history restored", {
+              connId: this.connId,
+              messageCount: recentMessages.length,
+            });
+          }
+        } catch (err) {
+          logger.warn("[Storage] Failed to restore conversation history", { error: err });
         }
       } catch (err) {
         logger.warn("[Storage] Failed to create session", { error: err });

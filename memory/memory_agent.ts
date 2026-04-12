@@ -687,6 +687,49 @@ export async function retrievePromptMemory(
     }
   }
 
+  // Semantic supplement: if there are still open slots and the repo has a pg
+  // backend with vector search, ask pgvector for nearest neighbours to fill gaps.
+  // Only activates when EMBEDDING_MODEL is set; degrades gracefully on any error.
+  if (selected.length < maxEntries) {
+    const persistentBackend =
+      typeof (repo as any).getPersistentBackend === "function"
+        ? (repo as any).getPersistentBackend()
+        : null;
+    if (persistentBackend && typeof persistentBackend.findSimilar === "function") {
+      const timeoutMs = parsePositiveInt(
+        process.env.REM_SEMANTIC_RECALL_TIMEOUT_MS,
+        300,
+      );
+      try {
+        const semanticHits = await Promise.race([
+          persistentBackend.findSimilar(
+            options.userMessage,
+            maxEntries * 2,
+          ) as Promise<Array<{ key: string; value: string }>>,
+          new Promise<Array<{ key: string; value: string }>>((resolve) =>
+            setTimeout(() => resolve([]), timeoutMs),
+          ),
+        ]);
+        let semanticAdded = 0;
+        for (const hit of semanticHits) {
+          if (selected.length >= maxEntries) break;
+          if (seenKeys.has(hit.key) || isSystemMemoryKey(hit.key)) continue;
+          seenKeys.add(hit.key);
+          selected.push({ key: hit.key, value: hit.value });
+          semanticAdded++;
+        }
+        if (semanticAdded > 0) {
+          logger.debug("semantic recall supplemented", {
+            added: semanticAdded,
+            total: selected.length,
+          });
+        }
+      } catch {
+        // Semantic search is best-effort; keyword recall already covered the slots.
+      }
+    }
+  }
+
   logger.debug("prompt memory retrieved", {
     selected: selected.map((entry) => entry.key),
     totalEntries: entries.length,
