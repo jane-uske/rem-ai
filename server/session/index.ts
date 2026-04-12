@@ -456,6 +456,7 @@ export class ConnectionSession {
     if (isDbReady()) {
       try {
         const devUserId = await ensureDevUser();
+        this.brain.setUserId(devUserId);
         const sess = await createDbSession(devUserId);
         this.sessionId = sess.id;
         logger.info("[Storage] Session created", { sessionId: this.sessionId });

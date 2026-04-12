@@ -14,7 +14,6 @@ import {
   type AttentionState,
   type ProactiveIntent,
 } from "../persona";
-import { createDefaultPersona, type PersonaState } from "../persona";
 import {
   applyPersonaPreset,
   resetPersonaLiveState,
@@ -122,6 +121,7 @@ function deriveProactiveIntent(
  * 单条 WebSocket 连接上的 Rem 状态：情绪、慢脑、对话历史、会话内记忆（C1）。
  */
 export class RemSessionContext {
+  userId = "dev-user";
   readonly emotion: EmotionRuntime;
   readonly slowBrain: SlowBrainStore;
   readonly memory: SessionMemoryOverlayRepository;
@@ -174,6 +174,10 @@ export class RemSessionContext {
 
   attachPersistentRelationshipRepo(repo: MemoryRepository): void {
     this.persistentRelationshipRepo = repo;
+  }
+
+  setUserId(userId: string): void {
+    this.userId = userId;
   }
 
   hydrateHistoryFromDb(messages: DbMessage[]): void {

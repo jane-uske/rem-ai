@@ -39,7 +39,7 @@
   - 已落地：prompt retrieval 已从 `getAll()` 升级为 relationship-aware relevant retrieval
   - 当前实现：`core facts -> core episode -> active episode -> recent shared moment/fallback facts`
   - 保留边界：未引入 embedding/索引改造，仍保留无向量回退
-  - 当前状态：memory v1 可用；Memory V2 PR1 foundation 已落地 `episodes` schema / `embedding_client` / `episode_repository` / memory embedding 写入，后续进入 semantic episode recall 接线
+  - 当前状态：memory v1 可用；Memory V2 PR1 foundation 已落地 `episodes` schema / `embedding_client` / `episode_repository` / memory embedding 写入；PR2 `episode_store` 编排层已落地；PR3a 已把 `slow_brain.ts::maybeRecordSharedMoment()` 双写接入 `episodeStore.ingest()`；episode 读路径迁移仍待 PR3b+
 
 - [x] **R-005** 中断污染保护任务定义
   - 目标：明确 interrupted partial 的污染保护边界

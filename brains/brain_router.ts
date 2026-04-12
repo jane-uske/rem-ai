@@ -159,6 +159,7 @@ export async function* routeMessage(
   if (!opts?.systemTriggered && slowBrainEnabled()) {
     const slowBrainSignal = ctx.beginSlowBrain();
     runSlowBrain({
+      userId: ctx.userId,
       userMessage,
       assistantReply: fullReply,
       history: [...ctx.history],

@@ -5,6 +5,7 @@
 
 import { complete, type ChatMessage } from "../llm/qwen_client";
 import { extractMemory } from "../memory/memory_agent";
+import { ingest } from "../memory/episode_store";
 import type { MemoryRepository } from "../memory/memory_repository";
 import {
   relationshipStateEnabled,
@@ -21,6 +22,7 @@ function clamp01(value: number): number {
 }
 
 export interface SlowBrainInput {
+  userId: string;
   userMessage: string;
   assistantReply: string;
   history: PromptMessage[];
@@ -34,7 +36,7 @@ export interface SlowBrainInput {
 
 export async function runSlowBrain(input: SlowBrainInput): Promise<void> {
   const t0 = Date.now();
-  const { userMessage, assistantReply, history, slowBrain, memoryRepo } =
+  const { userId, userMessage, assistantReply, history, slowBrain, memoryRepo } =
     input;
   const relationshipRepo = input.relationshipRepo ?? memoryRepo;
 
@@ -67,7 +69,7 @@ export async function runSlowBrain(input: SlowBrainInput): Promise<void> {
   }
 
   updateRelationship(slowBrain, userMessage);
-  maybeRecordSharedMoment(slowBrain, userMessage, assistantReply);
+  await maybeRecordSharedMoment(slowBrain, userMessage, assistantReply, userId);
 
   if (relationshipStateEnabled() && relationshipRepo) {
     try {
@@ -290,11 +292,12 @@ function episodeMemoryEnabled(): boolean {
   return raw !== "0" && raw !== "false";
 }
 
-function maybeRecordSharedMoment(
+async function maybeRecordSharedMoment(
   store: SlowBrainStore,
   userMessage: string,
   assistantReply: string,
-): void {
+  userId: string,
+): Promise<void> {
   if (!episodeMemoryEnabled()) return;
 
   const trimmedUser = userMessage.trim();
@@ -314,15 +317,32 @@ function maybeRecordSharedMoment(
     /今天|昨天|昨晚|最近|刚刚|第一次|一直|因为|结果|开心|难过|焦虑|累|失眠|散步|跑步|工作|朋友|家人/.test(trimmedUser);
   if (!looksMeaningful) return;
 
+  const summary = buildSharedMomentSummary(trimmedUser, topic);
+  const salience = estimateSharedMomentSalience(trimmedUser, mood, kind);
+
   store.recordSharedMoment({
-    summary: buildSharedMomentSummary(trimmedUser, topic),
+    summary,
     topic,
     mood,
     hook: buildSharedMomentHook(topic, store, trimmedUser),
     kind,
-    salience: estimateSharedMomentSalience(trimmedUser, mood, kind),
+    salience,
     unresolved,
   });
+
+  try {
+    await ingest({
+      userId,
+      summary,
+      topic,
+      mood,
+      kind,
+      salience,
+      unresolved,
+    });
+  } catch (err) {
+    console.log("[SlowBrain] episodeStore.ingest failed:", err);
+  }
 }
 
 function detectSharedMomentTopic(
