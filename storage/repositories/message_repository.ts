@@ -35,6 +35,25 @@ export async function saveMessage(
   }
 }
 
+export async function getRecentUserMessages(
+  userId: string,
+  limit: number = 10
+): Promise<DbMessage[]> {
+  const res = await query(
+    `SELECT m.id, m.session_id, m.role, m.content, m.created_at
+     FROM messages m
+     JOIN sessions s ON s.id = m.session_id
+     WHERE s.user_id = $1
+     ORDER BY m.created_at DESC
+     LIMIT $2`,
+    [userId, limit]
+  );
+  // DESC → reverse to chronological order for ctx.history
+  return res.rows
+    .map((r) => mapRow(r as Record<string, unknown>))
+    .reverse();
+}
+
 export async function getSessionMessages(
   sessionId: string,
   limit?: number

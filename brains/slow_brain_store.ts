@@ -183,6 +183,13 @@ export class SlowBrainStore {
     lastProactiveMode: "",
   };
 
+  private lastEmotionValue: string = "neutral";
+
+  setLastEmotion(emotion: string): void {
+    const valid = ["neutral", "happy", "curious", "shy", "sad"];
+    if (valid.includes(emotion)) this.lastEmotionValue = emotion;
+  }
+
   addFact(key: string, value: string): void {
     this.profile.facts.set(key, value);
   }
@@ -340,7 +347,9 @@ export class SlowBrainStore {
       userProfile: {
         interests: [...snap.userProfile.interests],
         personalityNotes: [...snap.userProfile.personalityNotes],
+        facts: Object.fromEntries(snap.userProfile.facts),
       },
+      lastEmotion: this.lastEmotionValue,
       relationship: {
         ...snap.relationship,
         preferredTopics: [...snap.relationship.preferredTopics],
@@ -374,6 +383,14 @@ export class SlowBrainStore {
       this.profile.personalityNotes.length,
       ...state.userProfile.personalityNotes,
     );
+    this.profile.facts.clear();
+    for (const [k, v] of Object.entries(state.userProfile.facts ?? {})) {
+      this.profile.facts.set(k, v);
+    }
+
+    if (state.lastEmotion) {
+      this.setLastEmotion(state.lastEmotion);
+    }
 
     this.relationship.familiarity = clamp01(state.relationship.familiarity);
     this.relationship.emotionalBond = clamp01(state.relationship.emotionalBond);

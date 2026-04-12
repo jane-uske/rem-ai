@@ -107,7 +107,10 @@ export interface PersistentRelationshipStateV1 {
   userProfile: {
     interests: string[];
     personalityNotes: string[];
+    facts?: Record<string, string>;
   };
+  /** 上次会话结束时的情绪状态（neutral/happy/curious/shy/sad），重连时恢复用 */
+  lastEmotion?: string;
   relationship: {
     familiarity: number;
     emotionalBond: number;
@@ -140,6 +143,20 @@ function clamp01(value: number): number {
 
 function toFiniteNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+const VALID_EMOTIONS = ["neutral", "happy", "curious", "shy", "sad"] as const;
+
+function toFactsRecord(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const result: Record<string, string> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof k === "string" && typeof v === "string") {
+      result[k] = v;
+    }
+    if (Object.keys(result).length >= 50) break;
+  }
+  return result;
 }
 
 function toStringList(value: unknown, limit: number): string[] {
@@ -448,7 +465,11 @@ export function normalizePersistentRelationshipState(
     userProfile: {
       interests: toStringList(userProfile.interests, 12),
       personalityNotes: toStringList(userProfile.personalityNotes, 6),
+      facts: toFactsRecord(userProfile.facts),
     },
+    lastEmotion: (VALID_EMOTIONS as readonly string[]).includes(record.lastEmotion as string)
+      ? (record.lastEmotion as string)
+      : undefined,
     relationship: {
       familiarity: clamp01(toFiniteNumber(relationship.familiarity, 0)),
       emotionalBond: clamp01(toFiniteNumber(relationship.emotionalBond, 0)),

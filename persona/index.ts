@@ -114,7 +114,7 @@ function attentionGuidance(attention: AttentionState, topicPull: string): string
 
 function interruptedGuidance(interrupted: boolean): string {
   if (!interrupted) return "";
-  return "刚被打断过。重新开口时先用一句很短的话接住上下文或接住对方，再继续展开，不要机械重复上一句。";
+  return "你刚刚被打断过。重新开口时先用一句很短的话接住上下文或接住对方，再继续展开，不要机械重复上一句。";
 }
 
 function continuationGuidance(isContinuing: boolean): string {
@@ -181,7 +181,7 @@ export function buildPersonaPrompt(
     energyGuidance(liveState.energy),
     closenessGuidance(liveState.closeness),
     attentionGuidance(liveState.attention, liveState.topicPull),
-    interruptedGuidance(liveState.lastInterrupted),
+    interruptedGuidance(liveState.lastInterrupted || liveState.wasInterrupted),
     continuationGuidance(liveState.isContinuingTopic),
   ].filter(Boolean);
   sections.push(stateLines.join("\n"));

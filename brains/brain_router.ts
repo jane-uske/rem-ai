@@ -149,6 +149,7 @@ export async function* routeMessage(
     fullReply
   );
   ctx.slowBrain.recordUserTurnActivity(userMessage);
+  ctx.slowBrain.setLastEmotion(emotion);
 
   ctx.slowBrain.markContinuityCueUsed({
     proactiveCandidate: guidance.proactiveCandidate,

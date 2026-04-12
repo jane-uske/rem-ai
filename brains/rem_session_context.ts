@@ -4,6 +4,8 @@ import type { MemoryRepository } from "../memory/memory_repository";
 import type { PersistentRelationshipStateV1 } from "../memory/relationship_state";
 import { SessionMemoryOverlayRepository } from "../memory/session_memory_overlay";
 import { SlowBrainStore } from "./slow_brain_store";
+import { trimHistoryToTokenBudget } from "./history_budget";
+import type { DbMessage } from "../storage/types";
 import {
   createDefaultPersona,
   type PersonaState,
@@ -157,10 +159,34 @@ export class RemSessionContext {
     this.persona.liveState.energy = deriveEnergy(this.slowBrain);
     this.persona.liveState.closeness = deriveCloseness(this.slowBrain);
     this.persona.liveState.attention = deriveAttention(this.slowBrain, topicPull);
+
+    // Gap 3：恢复上次情绪（仅恢复类型，不恢复 intensity）
+    if (state.lastEmotion) {
+      this.emotion.setEmotion(state.lastEmotion as import("../emotion/emotion_state").Emotion);
+    }
   }
 
   attachPersistentRelationshipRepo(repo: MemoryRepository): void {
     this.persistentRelationshipRepo = repo;
+  }
+
+  hydrateHistoryFromDb(messages: DbMessage[]): void {
+    const rawHistory: PromptMessage[] = messages
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }));
+
+    const trimmed = trimHistoryToTokenBudget(rawHistory);
+    this.history.splice(0, this.history.length, ...trimmed);
+
+    // 同步 recentInteractions 供 buildPersonaPrompt() 使用
+    const tail = trimmed.slice(-6);
+    this.persona.liveState.recentInteractions.splice(
+      0,
+      this.persona.liveState.recentInteractions.length,
+      ...tail.map((m) =>
+        m.role === "user" ? `用户：${m.content}` : `你：${m.content}`,
+      ),
+    );
   }
 
   cancelSlowBrain(): void {
