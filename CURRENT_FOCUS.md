@@ -2,46 +2,47 @@
 
 ## 一句话
 
-Memory V1 / 关系层第一阶段 **已完成** —— Rem 现在具备了完整的跨会话关系记忆连续性。
+Memory V2 基础设施已全部就绪 —— 写路径双写（V1 sharedMoments + V2 episode store），proactive planner 已建好，等真实数据验证后切读路径。
 
 ## 当前最高优先级
 
-关系层第二阶段：主动记忆巩固与语义分层（记忆 V2）
+Memory V2 验证 + 读路径迁移（V2.1）
 
-## 为什么现在做这个
+## 当前进度
 
-- 关系骨架已经闭环：per-user 关系状态持久化 + episode 分层召回 + proactive 分线索冷却 + 关系风格槽位绑定全部完成
-- 当前最大缺口： episodic记忆还只停留在关键词匹配，没有做语义嵌入聚类；主动开口还只有规则，没有做基于关系状态的主动决策
-- 如果现在先做前端展示优化，容易得到一个好看但“记不住你”的产品，无法达成“记得我们的关系”这个核心差异化
+### Memory V2 基础设施（已完成）
+- ✅ `llm/embedding_client.ts`：OpenAI 兼容 embedding 客户端（nomic-embed-text, 768 维）
+- ✅ `storage/schema.sql`：新增 `episodes` 表 + 向量索引；`memories.embedding` 改为 768 维
+- ✅ `storage/repositories/episode_repository.ts`：insert / update / findSimilar / getByUser / getUnresolved / delete
+- ✅ `storage/repositories/vector_utils.ts`：共享向量工具函数
+- ✅ `memory/episode_store.ts`：ingest（语义合并 / 新建） / findRelevant（综合分排序） / listUnresolved / markReferenced
+- ✅ `brains/proactive_planner.ts`：关系阶段门控 + 退避门控 + 冷却门控 → care / follow_up / presence
+- ✅ `brains/slow_brain.ts`：写路径双写 — V1 recordSharedMoment + V2 episodeStore.ingest
+- ✅ `brains/slow_brain_store.ts`：getSnapshot() 派生缓存 memoize
+- ✅ 22+ 单测全部通过
 
-## 当前阶段交付目标
+### 待做：V2.1 读路径迁移（需要先有真实 episode 数据验证）
+- ⏳ `memory/memory_agent.ts::recallEpisodes()` 改为调 `episodeStore.findRelevant()`
+- ⏳ `brain/prompt_builder.ts` episode 注入段改为 episode store 结果
+- ⏳ `server/session/index.ts::fireSilenceNudge()` 改调 `proactive_planner.planProactiveNudge()`
+- ⏳ 清理 V1 episode 路径（删除 `buildEpisodes` / `buildTopicThreads` / `PersistentEpisode`）
 
-- 语义 Episode 聚类：用 embedding 将 shared moments 自动聚合成更自然的长周期话题线
-- 主动对话触发：基于关系状态和未完结 episode 主动开口的决策策略
-- 增量更新优化：只对新增/修改的 episode 做语义计算，不重复全量计算
-- 保留无向量回退：所有新功能在没有 pgvector/pg 环境下仍能优雅降级到关键词模式
+### 下一步
+1. **验证写路径**：配置 embedding 服务，跑真实对话，检查 episodes 表有数据写入
+2. **V2.1 读路径迁移**：确认 episode 数据质量后切读路径
+3. **T-040**：情绪推断 + 多维表情协议（可并行）
 
 ## 当前非目标
+- 不先做前端口型同步（T-032）
+- 不先做前端 emoji 展示（T-035.5）
+- 不做 V1 episode 路径的强制删除（等读路径切完后自然清理）
 
-- 不重做已有的关系状态持久化层
-- 不把全量语义计算塞进每轮请求路径（保持离线增量）
-- 不先做端到端情绪大改造（T-040 仍在等待列表）
-- 不先做前端口型同步（T-032 仍在等待列表）
-
-## 当前已确认现状（记忆 V1 已完成）
-
-- ✅ per-user relationship state 持久化与恢复链路已接通并文档化
-- ✅ 跨重连关系连续性完整恢复
-- ✅ prompt 注入：relationship summary / topic continuity / mood trajectory / proactive hooks 全部到位
-- ✅ slow brain 非阻塞写回持久层已实现
-- ✅ interrupted partial 污染保护规则已明确并强制执行
-- ✅ Episode recall layer 已分离 `core`/`active` 两层
-- ✅ Proactive 已按线索分 ledger 独立冷却周期
-- ✅ Persona prompt 已有稳定的关系阶段/回复合同槽位
-- ✅ Realtime continuity policy v2 已与 prediction gate 联动
+## 环境变量新增（Memory V2）
+- `REM_EMBEDDING_BASE_URL` — embedding 服务地址（如 `http://localhost:11434/v1`）
+- `REM_EMBEDDING_API_KEY` — API key（Ollama 可填任意值）
+- `REM_EMBEDDING_MODEL` — 模型名（默认 `nomic-embed-text`）
 
 ## 执行规则
-
 - 当前主线程内的代码任务做完后，必须回写对应任务文档状态
 - 至少更新 `TASKS.md` 中对应的任务状态
 - 如果本次改动改变了当前主线程判断或交付边界，也要同步更新本文件
