@@ -14,6 +14,12 @@ import {
   type AttentionState,
   type ProactiveIntent,
 } from "../persona";
+import { createDefaultPersona, type PersonaState } from "../persona";
+import {
+  applyPersonaPreset,
+  resetPersonaLiveState,
+  type PersonaPresetId,
+} from "./dev_presets";
 
 // ── Layer 2 派生逻辑 ─────────────────────────────────────────────
 // 从 SlowBrainStore 已有数据推导 6 个角色状态字段，不引入额外计算。
@@ -187,6 +193,20 @@ export class RemSessionContext {
         m.role === "user" ? `用户：${m.content}` : `你：${m.content}`,
       ),
     );
+  }
+
+  applyPersonaPreset(presetId: PersonaPresetId): void {
+    applyPersonaPreset(this.persona, presetId);
+    resetPersonaLiveState(this.persona);
+  }
+
+  resetSessionArtifacts(): void {
+    this.history.splice(0, this.history.length);
+    this.lastInterruptedReply = null;
+    this.currentAssistantDraft = null;
+    this.emotion.setEmotion("neutral");
+    resetPersonaLiveState(this.persona);
+    this.cancelSlowBrain();
   }
 
   cancelSlowBrain(): void {

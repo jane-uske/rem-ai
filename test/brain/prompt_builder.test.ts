@@ -161,4 +161,22 @@ describe("prompt builder emotion speech style", () => {
     assert.ok(!system.includes("你刚刚被打断过"));
     assert.ok(!system.includes("先用一句很短的话接住上下文"));
   });
+
+  it("adds explicit anti-fabrication guidance for relationship meta questions", () => {
+    const persona = createDefaultPersona();
+
+    const messages = buildPrompt({
+      memory: [],
+      emotion: "neutral",
+      history: [],
+      userMessage: "我们聊了多久",
+      persona,
+    });
+
+    const system = messages[0].content;
+    assert.ok(system.includes("我们是什么关系"));
+    assert.ok(system.includes("我们聊了多久"));
+    assert.ok(system.includes("不能脑补成已经认识很久"));
+    assert.ok(system.includes("不能编造具体聊天时长或轮数"));
+  });
 });

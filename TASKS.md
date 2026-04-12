@@ -65,6 +65,7 @@
 - [x] proactive ledger keyed by cue / episode / thread
 - [x] stable relationship style slots in persona prompt
 - [x] realtime continuity policy v2 with read-only prediction gating
+- [x] developer preset bootstrap/reset hooks for persona + relationship testing
 
 ---
 

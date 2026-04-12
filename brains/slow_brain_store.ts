@@ -699,6 +699,12 @@ export class SlowBrainStore {
       }
     }
 
+    if (relationship.turnCount <= 1) {
+      sections.push(
+        "【关系校准】你们现在还处在刚开始接触的阶段。只有在上面明确提供了关系轮数、长期摘要或长期主线时，才能据此回答“我们是什么关系”“我们聊了多久”这类问题；否则要按“刚开始聊/还在建立了解”来答，不能说成老朋友、聊了很久，也不能编造具体时长和轮数。",
+      );
+    }
+
     const recentTopics = this.topicHistory
       .filter((t) => t.lastTurn >= relationship.turnCount - 3)
       .sort((a, b) => b.depth - a.depth);

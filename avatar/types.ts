@@ -218,6 +218,16 @@ export type RemServerMessage =
       beats?: AvatarIntentBeat[];
     }
   | {
+      type: "dev_preset_applied";
+      personaPreset: string | null;
+      relationshipPreset: string | null;
+      resetScope: "session" | "relationship" | "all";
+    }
+  | {
+      type: "dev_state_reset";
+      scope: "session" | "relationship" | "all";
+    }
+  | {
       type: "error";
       content: string;
     };

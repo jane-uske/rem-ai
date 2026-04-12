@@ -111,4 +111,21 @@ export class SessionMemoryOverlayRepository implements MemoryRepository {
   async getStale(maxAge: number, minImportance: number): Promise<MemoryEntry[]> {
     return this.local.getStale(maxAge, minImportance);
   }
+
+  async clearLocal(): Promise<void> {
+    const entries = await this.local.getAll();
+    await Promise.all(entries.map((entry) => this.local.delete(entry.key)));
+  }
+
+  async clearAll(includePersistent: boolean = false): Promise<void> {
+    const localEntries = await this.local.getAll();
+    await Promise.all(localEntries.map((entry) => this.local.delete(entry.key)));
+    if (!includePersistent || !this.persistent) return;
+    const persistentEntries = await this.persistent.getAll();
+    await Promise.all(
+      persistentEntries
+        .filter((entry) => isSystemMemoryKey(entry.key))
+        .map((entry) => this.persistent!.delete(entry.key)),
+    );
+  }
 }

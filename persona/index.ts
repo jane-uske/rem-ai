@@ -41,7 +41,16 @@ export type PersonaLiveState = {
   lastTopicSummary: string;
 };
 
+export type PersonaProfile = {
+  presetId: string;
+  label: string;
+  coreIdentity: string;
+  toneGuide: string;
+  proactiveGuide: string;
+};
+
 export type PersonaState = {
+  profile: PersonaProfile;
   liveState: PersonaLiveState;
 };
 
@@ -55,6 +64,13 @@ type BuildPersonaPromptOptions = {
 
 export function createDefaultPersona(): PersonaState {
   return {
+    profile: {
+      presetId: "warm_companion",
+      label: "温柔陪伴型",
+      coreIdentity: "更像温柔、稳定、愿意陪人慢慢把话说完的陪伴者。",
+      toneGuide: "语气柔和、自然，优先给人被接住的感觉，不要像通用助手。",
+      proactiveGuide: "主动时以轻陪伴和自然 follow-up 为主，不催、不压迫。",
+    },
     liveState: {
       mood: "neutral",
       energy: "medium",
@@ -174,6 +190,13 @@ export function buildPersonaPrompt(
   // 3. 人格核心
   sections.push(buildPersonalityPrompt());
   sections.push(buildCharacterRulesPrompt());
+  sections.push(
+    "【关系与记忆回答规则】如果用户问“我们是什么关系”“我们聊了多久”“你还记得多少”这类问题，只能依据当前提供的关系阶段、轮数、对话摘要和记忆来回答。没有明确长期关系依据时，要按“刚开始接触/还在建立了解”来答，不能脑补成已经认识很久、是老朋友，也不能编造具体聊天时长或轮数。",
+  );
+  sections.push(`【人格预设】${persona.profile.label}`);
+  sections.push(persona.profile.coreIdentity);
+  sections.push(`【人格语气】${persona.profile.toneGuide}`);
+  sections.push(`【人格主动性】${persona.profile.proactiveGuide}`);
 
   // 4. Layer 2: 角色状态（6 个字段翻译为 prompt 指导）
   const stateLines: string[] = [

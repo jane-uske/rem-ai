@@ -27,9 +27,16 @@ import {
 } from "../../memory/session_memory_overlay";
 import {
   loadPersistentRelationshipState,
+  RELATIONSHIP_STATE_KEY,
   relationshipStateEnabled,
   savePersistentRelationshipState,
 } from "../../memory/relationship_state";
+import {
+  buildEmptyRelationshipState,
+  buildRelationshipPresetState,
+  isPersonaPresetId,
+  isRelationshipPresetId,
+} from "../../brains/dev_presets";
 import {
   decideTurnTaking,
   endsWithSentencePunctuation,
@@ -88,6 +95,10 @@ function parseBooleanFlag(raw: string | undefined, fallback: boolean): boolean {
   if (normalized === "1" || normalized === "true") return true;
   if (normalized === "0" || normalized === "false") return false;
   return fallback;
+}
+
+function devPresetCommandsEnabled(): boolean {
+  return parseBooleanFlag(process.env.REM_DEV_PRESETS_ENABLED, process.env.NODE_ENV !== "production");
 }
 
 function isSemanticallyCompletePreview(text: string): boolean {
@@ -1857,6 +1868,20 @@ export class ConnectionSession {
       }
 
       switch (data.type) {
+        case "dev_apply_preset":
+          if (!devPresetCommandsEnabled()) {
+            send(this.ws, { type: "error", content: "开发预设命令已禁用" });
+            break;
+          }
+          this.runDevCommand(this.handleDevApplyPreset(data));
+          break;
+        case "dev_reset_state":
+          if (!devPresetCommandsEnabled()) {
+            send(this.ws, { type: "error", content: "开发预设命令已禁用" });
+            break;
+          }
+          this.runDevCommand(this.handleDevResetState(data));
+          break;
         case "duplex_start":
           this.handleDuplexStart(data);
           break;
@@ -1880,6 +1905,117 @@ export class ConnectionSession {
           break;
       }
     });
+  }
+
+  private runDevCommand(task: Promise<void>): void {
+    void task.catch((err) => {
+      logger.warn("[DevPreset] command failed", {
+        error: (err as Error).message,
+        connId: this.connId,
+      });
+      send(this.ws, { type: "error", content: "开发预设操作失败，请稍后重试" });
+    });
+  }
+
+  private resetDeveloperLiveState(): void {
+    this.cancelPrediction();
+    this.clearPendingUtteranceTimer();
+    this.clearSilenceNudgeTimer();
+    this.resetPreviewState();
+    this.clearSpeechBuffer();
+    this.preRollChunks = [];
+    this.preRollBytes = 0;
+    this.turnTakingState = "CONFIRMED_END";
+    this.predictedReply = "";
+    this.currentPartialText = "";
+    this.interrupt.interrupt();
+    this.brain.resetSessionArtifacts();
+    this.activeGenerationId = null;
+    this.activeTraceId = null;
+    this.publishTurnState("confirmed_end", "confirmed_end", { force: true });
+  }
+
+  private async clearPersistentRelationshipState(): Promise<void> {
+    const repo =
+      this.brain.persistentRelationshipRepo ??
+      this.brain.memory.getPersistentBackend();
+    if (!repo) return;
+    await repo.delete(RELATIONSHIP_STATE_KEY);
+  }
+
+  private async handleDevApplyPreset(data: any): Promise<void> {
+    const personaPreset =
+      typeof data.personaPreset === "string" ? data.personaPreset.trim() : "";
+    const relationshipPreset =
+      typeof data.relationshipPreset === "string" ? data.relationshipPreset.trim() : "";
+    const resetScope =
+      data.resetScope === "all" || data.resetScope === "relationship" || data.resetScope === "session"
+        ? data.resetScope
+        : "session";
+
+    if (personaPreset) {
+      if (!isPersonaPresetId(personaPreset)) {
+        send(this.ws, { type: "error", content: `未知 personaPreset：${personaPreset}` });
+        return;
+      }
+    }
+
+    if (relationshipPreset) {
+      if (!isRelationshipPresetId(relationshipPreset)) {
+        send(this.ws, { type: "error", content: `未知 relationshipPreset：${relationshipPreset}` });
+        return;
+      }
+    }
+
+    this.resetDeveloperLiveState();
+
+    if (resetScope === "all") {
+      await this.brain.memory.clearLocal();
+      await this.clearPersistentRelationshipState();
+      this.brain.slowBrain.hydratePersistentState(buildEmptyRelationshipState());
+    } else if (resetScope === "relationship") {
+      await this.clearPersistentRelationshipState();
+      this.brain.slowBrain.hydratePersistentState(buildEmptyRelationshipState());
+    }
+
+    if (personaPreset) {
+      this.brain.applyPersonaPreset(personaPreset);
+    }
+
+    if (relationshipPreset) {
+      const state = buildRelationshipPresetState(relationshipPreset);
+      this.brain.hydratePersistentRelationshipState(state);
+      if (relationshipStateEnabled()) {
+        await this.persistRelationshipContinuityState();
+      }
+    }
+
+    send(this.ws, {
+      type: "dev_preset_applied",
+      personaPreset: personaPreset || null,
+      relationshipPreset: relationshipPreset || null,
+      resetScope,
+    });
+  }
+
+  private async handleDevResetState(data: any): Promise<void> {
+    const scope =
+      data.scope === "all" || data.scope === "relationship" || data.scope === "session"
+        ? data.scope
+        : "session";
+
+    this.resetDeveloperLiveState();
+
+    if (scope === "all") {
+      await this.brain.memory.clearLocal();
+      await this.clearPersistentRelationshipState();
+      this.brain.slowBrain.hydratePersistentState(buildEmptyRelationshipState());
+    } else if (scope === "relationship") {
+      await this.clearPersistentRelationshipState();
+      this.brain.slowBrain.hydratePersistentState(buildEmptyRelationshipState());
+    }
+
+    send(this.ws, { type: "dev_state_reset", scope });
   }
 
   private handleDuplexStart(data: any): void {
@@ -2280,33 +2416,38 @@ export class ConnectionSession {
     }
     const { interruptionType, carryForwardHint } = this.classifyCarryForward(content);
 
+    const interruptedGenerationId = this.activeGenerationId;
     const interruptReactionEnabled = process.env.interrupt_reaction !== "0" && isTtsEnabled();
     if (this.interrupt.active && interruptReactionEnabled) {
       // 先播放打断反应音，再停止当前播放
       void synthesize(randomInterruptReaction(), undefined, this.brain.emotion.getEmotion() as any)
         .then((buf) => {
-          send(this.ws, { type: "voice", audio: buf.toString("base64"), generationId: this.activeGenerationId ?? 0 });
+          send(this.ws, {
+            type: "voice",
+            audio: buf.toString("base64"),
+            generationId: interruptedGenerationId ?? 0,
+          });
           // 发送反应音后再通知客户端停止之前的播放
-          this.sendInterrupt();
+          this.sendInterrupt(interruptedGenerationId ?? null);
         })
         .catch(() => {
           // 合成失败直接发中断
-          this.sendInterrupt();
+          this.sendInterrupt(interruptedGenerationId ?? null);
         });
       this.interrupt.interrupt();
       logger.info("[Chat] → interrupted pipeline with reaction", { connId: this.connId });
       this.publishTurnState("interrupted_by_user", "user_interrupt", {
-        generationId: this.activeGenerationId ?? undefined,
+        generationId: interruptedGenerationId ?? undefined,
         interruptionType: interruptionType ?? "unknown",
         force: true,
       });
     } else {
       if (this.interrupt.active) {
         // 仅在确有在途 generation 时发送 interrupt，避免把正常 text send 伪装成真实打断。
-        this.sendInterrupt();
+        this.sendInterrupt(interruptedGenerationId ?? null);
         this.interrupt.interrupt();
         this.publishTurnState("interrupted_by_user", "user_interrupt", {
-          generationId: this.activeGenerationId ?? undefined,
+          generationId: interruptedGenerationId ?? undefined,
           interruptionType: interruptionType ?? "unknown",
           force: true,
         });

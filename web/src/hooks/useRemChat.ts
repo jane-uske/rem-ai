@@ -1192,6 +1192,33 @@ export function useRemChat() {
           break;
         }
 
+        case "dev_preset_applied":
+        case "dev_state_reset": {
+          clearPendingChatEnd();
+          clearUserSpeakingEndTimer();
+          setUserSpeaking(false);
+          setTyping(false);
+          setSttPartialText("");
+          resetStreaming();
+          waitingRef.current = false;
+          setWaiting(false);
+          clearQueue();
+          clearAvatarIntentSchedule();
+          setAvatarIntentOverride(null);
+          sttPredictionPreviewRef.current = null;
+          setSttPredictionPreview(null);
+          interruptionTypeRef.current = null;
+          setInterruptionType(null);
+          commitTurnState("confirmed_end", "confirmed_end", { kind: "system" });
+          setMessages([]);
+          try {
+            localStorage.removeItem(MESSAGE_STORAGE_KEY);
+          } catch {
+            /* noop */
+          }
+          break;
+        }
+
         default:
           break;
       }
@@ -1324,6 +1351,35 @@ export function useRemChat() {
     [blockGeneration, clearAvatarIntentSchedule, clearPendingChatEnd, clearQueue, commitTurnState, resetStreaming, unlockPlayback],
   );
 
+  const applyDevPreset = useCallback(
+    (options: {
+      personaPreset?: string;
+      relationshipPreset?: string;
+      resetScope?: "session" | "relationship" | "all";
+    }) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(
+        JSON.stringify({
+          type: "dev_apply_preset",
+          personaPreset: options.personaPreset,
+          relationshipPreset: options.relationshipPreset,
+          resetScope: options.resetScope ?? "session",
+        }),
+      );
+    },
+    [],
+  );
+
+  const resetDevState = useCallback(
+    (scope: "session" | "relationship" | "all" = "session") => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({ type: "dev_reset_state", scope }));
+    },
+    [],
+  );
+
   return {
     emotion,
     turnState,
@@ -1354,6 +1410,8 @@ export function useRemChat() {
     lipSignalRef,
     hasMic,
     sendText,
+    applyDevPreset,
+    resetDevState,
     toggleMic,
     /** 显式结束语音会话（与再点麦克风等效） */
     stopVoice: stopVoiceSession,

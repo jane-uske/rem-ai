@@ -1,5 +1,7 @@
-// Direct static import (avoids cascading MODULE_NOT_FOUND in dynamic require)
-import { routeMessage } from "../brains/brain_router";
+const { loadModule } = require("../utils/module_loader.ts") as typeof import("../utils/module_loader");
+const { routeMessage } = loadModule<{
+  routeMessage: typeof import("../brains/brain_router").routeMessage;
+}>("../brains/brain_router");
 import type { RouteMessageOptions } from "../brains/brain_router";
 import type { RemSessionContext } from "../brains/rem_session_context";
 import type { Emotion } from "../emotion/emotion_state";

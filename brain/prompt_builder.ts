@@ -135,6 +135,7 @@ function buildSystemPrompt(
   sections.push(
     buildPersonalityPrompt(),
     buildCharacterRulesPrompt(),
+    "【关系与记忆回答规则】如果用户问“我们是什么关系”“我们聊了多久”“你还记得多少”这类问题，只能依据当前提供的关系阶段、轮数、对话摘要和记忆来回答。没有明确长期关系依据时，要按“刚开始接触/还在建立了解”来答，不能脑补成已经认识很久、是老朋友，也不能编造具体聊天时长或轮数。",
     buildEmotionSpeechGuidance(emotion),
     "用中文回复。",
   );

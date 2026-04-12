@@ -5,6 +5,7 @@ import dynamic from "next/dynamic";
 import { AvatarDevtoolsPanel } from "@/components/AvatarDevtoolsPanel";
 import { ChatWindow } from "@/components/ChatWindow";
 import { InputBar } from "@/components/InputBar";
+import { PresetControlPanel } from "@/components/PresetControlPanel";
 import { VoiceIndicator } from "@/components/VoiceIndicator";
 import {
   useRemChat,
@@ -112,6 +113,8 @@ export function RemChatApp() {
     lipSignalRef,
     hasMic,
     sendText,
+    applyDevPreset,
+    resetDevState,
     toggleMic,
   } = useRemChat();
   const [showDevtools, setShowDevtools] = useState(false);
@@ -162,14 +165,19 @@ export function RemChatApp() {
         </section>
 
         <aside className="rem-chat-panel rem-glass-edge flex min-h-0 w-full min-w-0 flex-1 flex-col border-t lg:w-[min(100%,clamp(320px,42vw,440px))] lg:max-w-[min(100%,440px)] lg:flex-none lg:border-l lg:border-t-0 lg:pt-14">
-            <ChatWindow
-              messages={messages}
-              sttPartialText={sttPartialText}
-              streamingText={streamingText}
-              listeningHint={listeningHint}
-              thinkingHint={thinkingHint}
-              turnState={turnState}
-            />
+          <PresetControlPanel
+            connected={connected}
+            onApply={applyDevPreset}
+            onReset={resetDevState}
+          />
+          <ChatWindow
+            messages={messages}
+            sttPartialText={sttPartialText}
+            streamingText={streamingText}
+            listeningHint={listeningHint}
+            thinkingHint={thinkingHint}
+            turnState={turnState}
+          />
           <div className="shrink-0 border-t border-white/10 bg-transparent p-2 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:p-4 dark:border-white/5">
             <InputBar
               onSend={sendText}

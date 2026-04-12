@@ -43,6 +43,10 @@ export async function upsertMemory(
        ON CONFLICT (user_id, key)
        DO UPDATE SET
          value = EXCLUDED.value,
+         embedding = CASE
+           WHEN memories.value IS DISTINCT FROM EXCLUDED.value THEN NULL
+           ELSE memories.embedding
+         END,
          last_accessed_at = now()
        RETURNING id, user_id, key, value, importance, embedding, created_at, last_accessed_at`,
       [userId, key, value]

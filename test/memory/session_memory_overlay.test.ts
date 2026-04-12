@@ -159,4 +159,48 @@ describe("session memory overlay", () => {
     const hydrated = await overlay.getAll();
     assert.deepEqual(hydrated.map((entry) => [entry.key, entry.value]), [["名字", "小林"]]);
   });
+
+  it("clears only reserved system keys from persistent storage when includePersistent is enabled", async () => {
+    const overlay = new SessionMemoryOverlayRepository();
+    const persistent = createPersistentRepo([
+      {
+        key: "__rem_relationship_state_v1",
+        value: '{"version":"v1"}',
+        importance: 1,
+        accessCount: 0,
+        createdAt: 100,
+        lastAccessedAt: 900,
+      },
+      {
+        key: "名字",
+        value: "小林",
+        importance: 0.5,
+        accessCount: 0,
+        createdAt: 300,
+        lastAccessedAt: 800,
+      },
+    ]);
+    overlay.attachPersistent(persistent);
+
+    await overlay.upsert("临时", "会话内");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await overlay.clearAll(true);
+
+    const local = await overlay.getAll();
+    assert.equal(local.length, 0);
+
+    const persistentEntries = await persistent.getAll();
+    assert.equal(
+      persistentEntries.some((entry) => entry.key === "__rem_relationship_state_v1"),
+      false,
+    );
+    assert.equal(
+      persistentEntries.some((entry) => entry.key === "名字"),
+      true,
+    );
+    assert.equal(
+      persistentEntries.some((entry) => entry.key === "临时"),
+      true,
+    );
+  });
 });

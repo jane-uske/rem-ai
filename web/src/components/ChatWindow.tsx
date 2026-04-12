@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ChatMessage } from "@/types/chat";
 import type { RemTurnState } from "@/types/avatar";
 import { MessageBubble } from "@/components/MessageBubble";
@@ -47,7 +47,16 @@ export function ChatWindow({
   const prevStreamingRef = useRef("");
   const prevMessagesLenRef = useRef(messages.length);
   const shouldStickRef = useRef(true);
+  const didInitialScrollRef = useRef(false);
   const [streamStatus, setStreamStatus] = useState("");
+
+  useLayoutEffect(() => {
+    if (didInitialScrollRef.current) return;
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    scroller.scrollTop = scroller.scrollHeight;
+    didInitialScrollRef.current = true;
+  }, [messages.length]);
 
   useEffect(() => {
     const scroller = scrollerRef.current;
