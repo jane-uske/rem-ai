@@ -5,6 +5,8 @@ import {
   getMemoryByKey,
   touchMemory,
   deleteMemoryByKey,
+  findSimilarMemories,
+  updateMemoryEmbedding,
 } from "./memory_repository";
 import { createLogger } from "../../infra/logger";
 
@@ -23,11 +25,56 @@ export class PgMemoryRepository implements MemoryRepository {
 
   async upsert(key: string, value: string, _importance?: number): Promise<void> {
     try {
-      await upsertMemory(this._userId, key, value);
+      const row = await upsertMemory(this._userId, key, value);
       logger.debug("[Memory] upserted", { key, value: value.slice(0, 50) });
+      // Fire-and-forget: generate and store embedding without blocking the caller.
+      if (row.embedding === null) {
+        void this._storeEmbedding(row.id, `${key}: ${value}`);
+      }
     } catch (err) {
       logger.warn("[Memory] upsert failed", { key, error: err });
       throw err;
+    }
+  }
+
+  private async _storeEmbedding(id: string, text: string): Promise<void> {
+    try {
+      const { generateEmbedding } = await import("../../llm/embeddings");
+      const embedding = await generateEmbedding(text);
+      if (embedding) {
+        await updateMemoryEmbedding(id, embedding);
+        logger.debug("[Memory] embedding stored", { id });
+      }
+    } catch (err) {
+      logger.warn("[Memory] embedding generation skipped", {
+        id,
+        error: (err as Error).message,
+      });
+    }
+  }
+
+  /**
+   * Semantic nearest-neighbour search via pgvector.
+   * Returns up to topK entries ordered by cosine distance to queryText.
+   * Returns [] when embedding is disabled or on any error.
+   */
+  async findSimilar(queryText: string, topK: number): Promise<MemoryEntry[]> {
+    try {
+      const { generateEmbedding } = await import("../../llm/embeddings");
+      const embedding = await generateEmbedding(queryText);
+      if (!embedding) return [];
+      const rows = await findSimilarMemories(this._userId, embedding, topK);
+      return rows.map((m) => ({
+        key: m.key,
+        value: m.value,
+        importance: m.importance,
+        accessCount: 0,
+        createdAt: m.created_at.getTime(),
+        lastAccessedAt: m.last_accessed_at.getTime(),
+      }));
+    } catch (err) {
+      logger.warn("[Memory] findSimilar failed", { error: (err as Error).message });
+      return [];
     }
   }
 

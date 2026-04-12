@@ -132,6 +132,19 @@ export async function touchMemory(id: string): Promise<void> {
   }
 }
 
+export async function updateMemoryEmbedding(id: string, embedding: number[]): Promise<void> {
+  try {
+    const vectorLiteral = embeddingToVectorLiteral(embedding);
+    await query(
+      `UPDATE memories SET embedding = $1::vector WHERE id = $2`,
+      [vectorLiteral, id]
+    );
+  } catch (e) {
+    console.log('[Storage] updateMemoryEmbedding failed:', e);
+    throw e;
+  }
+}
+
 export async function deleteMemory(id: string): Promise<void> {
   try {
     await query(`DELETE FROM memories WHERE id = $1`, [id]);
