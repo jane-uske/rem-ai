@@ -1,18 +1,6 @@
 import { query } from '../database';
 import type { DbMemory } from '../types';
-
-function parseEmbedding(val: unknown): number[] | null {
-  if (val == null) {
-    return null;
-  }
-  if (Array.isArray(val)) {
-    return val as number[];
-  }
-  if (typeof val === 'string') {
-    return JSON.parse(val) as number[];
-  }
-  return null;
-}
+import { embeddingToVectorLiteral, parseEmbedding } from './vector_utils';
 
 function mapRow(row: Record<string, unknown>): DbMemory {
   return {
@@ -27,30 +15,44 @@ function mapRow(row: Record<string, unknown>): DbMemory {
   };
 }
 
-function embeddingToVectorLiteral(embedding: number[]): string {
-  return `[${embedding.join(',')}]`;
-}
-
 export async function upsertMemory(
   userId: string,
   key: string,
-  value: string
+  value: string,
+  embedding?: number[]
 ): Promise<DbMemory> {
   try {
-    const res = await query(
-      `INSERT INTO memories (user_id, key, value, importance)
-       VALUES ($1, $2, $3, 1.0)
+    const hasEmbedding = embedding !== undefined;
+    const params: unknown[] = [userId, key, value];
+    let sql = `INSERT INTO memories (user_id, key, value, importance`;
+    if (hasEmbedding) {
+      sql += `, embedding`;
+      params.push(embeddingToVectorLiteral(embedding));
+    }
+    sql += `)
+       VALUES ($1, $2, $3, 1.0`;
+    if (hasEmbedding) {
+      sql += `, $4::vector`;
+    }
+    sql += `)
        ON CONFLICT (user_id, key)
        DO UPDATE SET
-         value = EXCLUDED.value,
+         value = EXCLUDED.value,`;
+    if (hasEmbedding) {
+      sql += `
+         embedding = EXCLUDED.embedding,`;
+    } else {
+      sql += `
          embedding = CASE
            WHEN memories.value IS DISTINCT FROM EXCLUDED.value THEN NULL
            ELSE memories.embedding
-         END,
+         END,`;
+    }
+    sql += `
          last_accessed_at = now()
-       RETURNING id, user_id, key, value, importance, embedding, created_at, last_accessed_at`,
-      [userId, key, value]
-    );
+       RETURNING id, user_id, key, value, importance, embedding, created_at, last_accessed_at`;
+
+    const res = await query(sql, params);
     const row = res.rows[0] as Record<string, unknown>;
     return mapRow(row);
   } catch (e) {

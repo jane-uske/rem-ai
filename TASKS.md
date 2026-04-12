@@ -39,7 +39,7 @@
   - 已落地：prompt retrieval 已从 `getAll()` 升级为 relationship-aware relevant retrieval
   - 当前实现：`core facts -> core episode -> active episode -> recent shared moment/fallback facts`
   - 保留边界：未引入 embedding/索引改造，仍保留无向量回退
-  - 当前状态：memory v1 可用；后续若继续推进，应做更强的 semantic episode recall，而不是回退到全量平铺
+  - 当前状态：memory v1 可用；Memory V2 PR1 foundation 已落地 `episodes` schema / `embedding_client` / `episode_repository` / memory embedding 写入，后续进入 semantic episode recall 接线
 
 - [x] **R-005** 中断污染保护任务定义
   - 目标：明确 interrupted partial 的污染保护边界
@@ -136,7 +136,7 @@
 
 - [x] **T-014** 设计并创建核心数据表
   - `storage/schema.sql`：users / sessions / messages / memories 表
-  - pgvector 扩展，vector(1536) embedding 列
+  - pgvector 扩展，`memories.embedding` 已统一到 `vector(768)`，并新增 `episodes` 表
   - 索引 + UNIQUE 约束
 
 - [x] **T-015** 搭建 Redis 连接
