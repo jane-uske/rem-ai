@@ -4,7 +4,111 @@ import type { MemoryRepository } from "../memory/memory_repository";
 import type { PersistentRelationshipStateV1 } from "../memory/relationship_state";
 import { SessionMemoryOverlayRepository } from "../memory/session_memory_overlay";
 import { SlowBrainStore } from "./slow_brain_store";
-import { createDefaultPersona, type PersonaState } from "../persona";
+import {
+  createDefaultPersona,
+  type PersonaState,
+  type EnergyLevel,
+  type ClosenessLevel,
+  type AttentionState,
+  type ProactiveIntent,
+} from "../persona";
+
+// ── Layer 2 派生逻辑 ─────────────────────────────────────────────
+// 从 SlowBrainStore 已有数据推导 6 个角色状态字段，不引入额外计算。
+
+function deriveEnergy(slowBrain: SlowBrainStore): EnergyLevel {
+  const snapshot = slowBrain.getSnapshot();
+  // 最近4轮情绪轨迹中负面情绪占比决定精力
+  const recent = snapshot.moodTrajectory.slice(-4).map((e) => e.mood);
+  if (recent.length === 0) return "medium";
+  const negativeWords = ["委屈", "低落", "难过", "疲惫", "焦虑", "崩溃", "绷着", "烦躁"];
+  const negCount = recent.filter((m) =>
+    negativeWords.some((w) => m.includes(w)),
+  ).length;
+  if (negCount >= 3) return "low";
+  if (negCount === 0) return "high";
+  return "medium";
+}
+
+function deriveCloseness(slowBrain: SlowBrainStore): ClosenessLevel {
+  const { familiarity, emotionalBond } = slowBrain.getSnapshot().relationship;
+  const score = familiarity * 0.5 + emotionalBond * 0.5;
+  if (score >= 0.75) return "dependent";
+  if (score >= 0.55) return "relaxed";
+  if (score >= 0.3) return "familiar";
+  return "normal";
+}
+
+function deriveAttention(
+  slowBrain: SlowBrainStore,
+  topicPull: string,
+): AttentionState {
+  const snapshot = slowBrain.getSnapshot();
+  // 有强牵引话题 → hooked
+  if (topicPull) {
+    const topThread = (snapshot.topicThreads ?? [])[0];
+    if (topThread && topThread.unresolvedCount > 0 && topThread.salience >= 0.7) {
+      return "hooked";
+    }
+  }
+  // 最近话题情绪高度负面 → scattered（情绪分散注意力）
+  const lastMood = snapshot.moodTrajectory.slice(-1)[0]?.mood ?? "";
+  const scattered = ["焦虑", "崩溃", "烦躁"].some((w) => lastMood.includes(w));
+  if (scattered) return "scattered";
+  return "focused";
+}
+
+function deriveTopicPull(slowBrain: SlowBrainStore): string {
+  const snapshot = slowBrain.getSnapshot();
+  // 优先取有未解决计数的高权重话题线
+  const topThread = (snapshot.topicThreads ?? [])
+    .filter((t) => t.unresolvedCount > 0 && t.salience >= 0.6)
+    .sort((a, b) => b.salience - a.salience)[0];
+  if (topThread) return topThread.topic;
+  // 退而取慢脑主动话题列表的第一条
+  return snapshot.proactiveTopics[0] ?? "";
+}
+
+// ── Layer 4 派生逻辑 ─────────────────────────────────────────────
+// 每轮决定一个轻主动行为信号，避免随机或无意义地触发。
+
+const FOLLOWUP_TRIGGERS = [
+  "压力", "担心", "难受", "委屈", "烦", "焦虑", "没办法", "不知道怎么",
+  "想做", "打算", "计划", "想试试", "想去", "想改",
+  "最近", "一直", "好久", "每天", "今天",
+];
+
+function deriveProactiveIntent(
+  userMessage: string,
+  topicPull: string,
+  slowBrain: SlowBrainStore,
+): ProactiveIntent {
+  const snapshot = slowBrain.getSnapshot();
+  const turnCount = snapshot.relationship.turnCount;
+
+  // 追问：用户输入触发了情绪/计划/困难关键词
+  const msg = userMessage;
+  if (FOLLOWUP_TRIGGERS.some((w) => msg.includes(w))) {
+    return "followup";
+  }
+
+  // 回钩：有未完话题牵引，且距上次提起超过 3 轮
+  if (topicPull) {
+    const lastProactive = snapshot.continuityCueState?.lastProactiveTurn ?? -100;
+    if (turnCount - lastProactive >= 3) {
+      return "callback";
+    }
+  }
+
+  // 偏好表达：每 8 轮最多一次，关系足够熟（familiar 以上）
+  const closeness = deriveCloseness(slowBrain);
+  const isClose = closeness === "familiar" || closeness === "relaxed" || closeness === "dependent";
+  if (isClose && turnCount > 0 && turnCount % 8 === 0) {
+    return "preference";
+  }
+
+  return "none";
+}
 
 /**
  * 单条 WebSocket 连接上的 Rem 状态：情绪、慢脑、对话历史、会话内记忆（C1）。
@@ -46,9 +150,13 @@ export class RemSessionContext {
         .map((entry) => entry.topic)
         .join("、");
 
-    if (topicSummary) {
-      this.persona.liveState.lastTopicSummary = topicSummary;
-    }
+    // 初始化会话时用关系历史预热 Layer 2 状态
+    const topicPull = deriveTopicPull(this.slowBrain);
+    this.persona.liveState.topicPull = topicPull;
+    this.persona.liveState.lastTopicSummary = topicSummary || topicPull || "无最近话题";
+    this.persona.liveState.energy = deriveEnergy(this.slowBrain);
+    this.persona.liveState.closeness = deriveCloseness(this.slowBrain);
+    this.persona.liveState.attention = deriveAttention(this.slowBrain, topicPull);
   }
 
   attachPersistentRelationshipRepo(repo: MemoryRepository): void {
@@ -65,6 +173,7 @@ export class RemSessionContext {
    * 只在真实用户打断时调用，不能由后台慢脑取消来触发。
    */
   markInterrupted(): void {
+    this.persona.liveState.lastInterrupted = true;
     this.persona.liveState.wasInterrupted = true;
   }
 
@@ -83,132 +192,121 @@ export class RemSessionContext {
 
   /**
    * 从文本中提取关键词（轻量规则版）
-   * @param text 输入文本
-   * @returns 关键词数组
    */
   private extractKeywords(text: string): string[] {
-    // 去掉语气词、助词，提取名词、动词、形容词
-    const stopWords = new Set(["的", "了", "啊", "哦", "嗯", "呀", "呢", "吗", "吧", "我", "你", "他", "她", "它", "我们", "你们", "他们", "是", "有", "在", "要", "去", "哦", "嗯"]);
-    // 简单分词：按空格和标点分割，过滤短词和停用词
+    const stopWords = new Set([
+      "的", "了", "啊", "哦", "嗯", "呀", "呢", "吗", "吧",
+      "我", "你", "他", "她", "它", "我们", "你们", "他们",
+      "是", "有", "在", "要", "去", "哦", "嗯",
+    ]);
     return text
       .replace(/[\p{P}]/gu, " ")
       .split(/\s+/)
-      .filter(word => word.length > 1 && !stopWords.has(word))
-      .map(word => word.toLowerCase());
+      .filter((word) => word.length > 1 && !stopWords.has(word))
+      .map((word) => word.toLowerCase());
   }
 
   /**
-   * 自动生成最近话题摘要（轻量规则版，无模型依赖）
-   * @returns 话题摘要字符串
+   * 自动生成最近话题摘要（轻量规则版）
    */
   private generateTopicSummary(): string {
-    const recent = this.persona.liveState.recentInteractions.slice(-4); // 取最近4轮
+    const recent = this.persona.liveState.recentInteractions.slice(-4);
     if (recent.length === 0) return "无最近话题";
-    
-    // 提取所有内容
-    const content = recent.map(line => line.replace(/^(用户|你)：/, "")).join(" ");
+    const content = recent.map((line) => line.replace(/^(用户|你)：/, "")).join(" ");
     const keywords = this.extractKeywords(content);
-    
     if (keywords.length === 0) return "闲聊";
-    // 最多取5个关键词组成摘要
     return keywords.slice(0, 5).join("、");
   }
 
   /**
-   * 自动判断是否延续上一话题
-   * @param currentUserInput 当前用户输入
-   * @returns 是否延续上一话题
+   * 判断是否延续上一话题
    */
   private isContinuingPreviousTopic(currentUserInput?: string): boolean {
-    if (!currentUserInput) {
-      return false;
-    }
+    if (!currentUserInput) return false;
 
     const continuationPhrases = [
-      "继续说",
-      "刚才说到哪",
-      "接着说",
-      "然后呢",
-      "还有吗",
-      "之前说的",
-      "刚才的话题",
-      "继续刚才的",
-      "还是那个",
-      "上次那个",
-      "回到刚才",
+      "继续说", "刚才说到哪", "接着说", "然后呢", "还有吗",
+      "之前说的", "刚才的话题", "继续刚才的", "还是那个", "上次那个", "回到刚才",
     ];
-    const inputLower = currentUserInput.toLowerCase();
-    if (continuationPhrases.some(phrase => inputLower.includes(phrase))) {
+    if (continuationPhrases.some((phrase) => currentUserInput.toLowerCase().includes(phrase))) {
       return true;
     }
 
     const currentKeywords = this.extractKeywords(currentUserInput);
     if (currentKeywords.length === 0) return false;
 
-    const recentContent = this.persona.liveState.recentInteractions.slice(-3)
-      .map(line => line.replace(/^(用户|你)：/, ""))
+    const recentContent = this.persona.liveState.recentInteractions
+      .slice(-3)
+      .map((line) => line.replace(/^(用户|你)：/, ""))
       .join(" ");
     const slowBrainSnapshot = this.slowBrain.getSnapshot();
     const fallbackSummary = [
       this.persona.liveState.lastTopicSummary,
       slowBrainSnapshot.conversationSummary,
-      ...slowBrainSnapshot.sharedMoments.slice(0, 2).map((entry) => entry.summary),
+      ...slowBrainSnapshot.sharedMoments.slice(0, 2).map((e) => e.summary),
       ...slowBrainSnapshot.relationship.preferredTopics,
     ]
       .filter(Boolean)
       .join(" ");
     const sourceText = recentContent || fallbackSummary;
-    if (!sourceText || sourceText === "无最近话题") {
-      return false;
-    }
+    if (!sourceText || sourceText === "无最近话题") return false;
 
     const recentKeywords = this.extractKeywords(sourceText);
     const recentKeywordSet = new Set(recentKeywords);
-
-    const overlap = currentKeywords.filter(keyword => recentKeywordSet.has(keyword)).length;
+    const overlap = currentKeywords.filter((k) => recentKeywordSet.has(k)).length;
     return overlap / currentKeywords.length > 0.3;
   }
 
   /**
-   * Update live persona state after each interaction
-   * @param mood New current mood
-   * @param lastUserMessage Last user message to add to recent interactions
-   * @param lastAssistantReply Last assistant reply to add to recent interactions
+   * 每轮对话结束后更新 Layer 2 状态（6 字段全部重新派生）。
    */
   updateLiveState(
     mood?: string,
     lastUserMessage?: string,
     lastAssistantReply?: string,
   ): void {
-    // Update mood if provided
+    const liveState = this.persona.liveState;
+
+    // 心情
     if (mood) {
-      this.persona.liveState.currentMood = mood;
-      this.persona.liveState.emotionalState = mood === "neutral" ? "平静" : 
-        mood === "happy" ? "开心" : 
-        mood === "curious" ? "好奇" : 
-        mood === "shy" ? "害羞" : 
-        mood === "sad" ? "难过" : "平静";
+      liveState.mood = mood;
+      liveState.currentMood = mood;
+      liveState.emotionalState =
+        mood === "neutral" ? "平静" :
+        mood === "happy"   ? "开心" :
+        mood === "curious" ? "好奇" :
+        mood === "shy"     ? "害羞" :
+        mood === "sad"     ? "难过" : "平静";
     }
 
-    // Keep last 3 interactions in recentInteractions
+    // 最近交互记录（最多保留6条）
     if (lastUserMessage) {
-      this.persona.liveState.recentInteractions.push(`用户：${lastUserMessage}`);
-      if (this.persona.liveState.recentInteractions.length > 6) {
-        this.persona.liveState.recentInteractions.shift();
-      }
+      liveState.recentInteractions.push(`用户：${lastUserMessage}`);
+      if (liveState.recentInteractions.length > 6) liveState.recentInteractions.shift();
     }
     if (lastAssistantReply) {
-      this.persona.liveState.recentInteractions.push(`你：${lastAssistantReply}`);
-      if (this.persona.liveState.recentInteractions.length > 6) {
-        this.persona.liveState.recentInteractions.shift();
-      }
+      liveState.recentInteractions.push(`你：${lastAssistantReply}`);
+      if (liveState.recentInteractions.length > 6) liveState.recentInteractions.shift();
     }
 
-    // 自动更新话题延续标记
-    this.persona.liveState.isContinuingTopic = this.isContinuingPreviousTopic(lastUserMessage);
-    // 自动生成话题摘要
-    this.persona.liveState.lastTopicSummary = this.generateTopicSummary();
-    // 重置打断标记，打断状态仅生效一轮对话
-    this.persona.liveState.wasInterrupted = false;
+    // Layer 2：从 slowBrain 派生其余4个字段
+    const topicPull = deriveTopicPull(this.slowBrain);
+    liveState.topicPull = topicPull;
+    liveState.energy = deriveEnergy(this.slowBrain);
+    liveState.closeness = deriveCloseness(this.slowBrain);
+    liveState.attention = deriveAttention(this.slowBrain, topicPull);
+
+    // Layer 4：决定本轮主动意图
+    liveState.proactiveIntent = lastUserMessage
+      ? deriveProactiveIntent(lastUserMessage, topicPull, this.slowBrain)
+      : "none";
+
+    // 话题延续检测 & 摘要
+    liveState.isContinuingTopic = this.isContinuingPreviousTopic(lastUserMessage);
+    liveState.lastTopicSummary = this.generateTopicSummary();
+
+    // 打断标记仅生效一轮
+    liveState.lastInterrupted = false;
+    liveState.wasInterrupted = false;
   }
 }
